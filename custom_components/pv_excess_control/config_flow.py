@@ -319,6 +319,7 @@ def _appliance_current_schema(defaults: dict[str, Any] | None = None) -> vol.Sch
             ): BINARY_SENSOR_ENTITY_SELECTOR,
             vol.Optional(
                 CONF_EV_TARGET_SOC,
+                default=d.get(CONF_EV_TARGET_SOC, 100),
                 description={"suggested_value": d.get(CONF_EV_TARGET_SOC)},
             ): NumberSelector(
                 NumberSelectorConfig(
