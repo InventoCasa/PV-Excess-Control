@@ -503,16 +503,20 @@ class Optimizer:
 
         # on_only check: if the appliance is already ON and is on_only, keep it ON
         if appliance.on_only and state.is_on:
-            return (
-                ControlDecision(
-                    appliance_id=appliance.id,
-                    action=Action.ON,
-                    target_current=None,
-                    reason="on_only appliance - staying on",
-                    overrides_plan=False,
-                ),
-                0.0,  # Already consuming power, no new allocation needed
-            )
+            if appliance.dynamic_current and appliance.current_entity:
+                # Let allocation handle current adjustment; _shed already skips on_only
+                pass
+            else:
+                return (
+                    ControlDecision(
+                        appliance_id=appliance.id,
+                        action=Action.ON,
+                        target_current=None,
+                        reason="on_only appliance - staying on",
+                        overrides_plan=False,
+                    ),
+                    0.0,  # Already consuming power, no new allocation needed
+                )
 
         # Dependency availability check
         # Note: this site deliberately does NOT set bypasses_cooldown=True.
@@ -716,23 +720,27 @@ class Optimizer:
                 )
 
                 if target_amps < appliance.min_current and not override_active:
-                    # Not enough for minimum current and no override - SHED will handle turning off
-                    reason = _format_staying_on_dynamic(
-                        current_amperage=state.current_amperage,
-                        current_power=current_power,
-                        off_threshold=self._off_threshold,
-                        instant_budget=instant_budget,
-                    )
-                    return (
-                        ControlDecision(
-                            appliance_id=appliance.id,
-                            action=Action.ON,
-                            target_current=None,
-                            reason=reason,
-                            overrides_plan=False,
-                        ),
-                        0.0,
-                    )
+                    if appliance.on_only:
+                        # on_only: clamp to min_current instead of shedding
+                        target_amps = appliance.min_current
+                    else:
+                        # Not enough for minimum current and no override - SHED will handle turning off
+                        reason = _format_staying_on_dynamic(
+                            current_amperage=state.current_amperage,
+                            current_power=current_power,
+                            off_threshold=self._off_threshold,
+                            instant_budget=instant_budget,
+                        )
+                        return (
+                            ControlDecision(
+                                appliance_id=appliance.id,
+                                action=Action.ON,
+                                target_current=None,
+                                reason=reason,
+                                overrides_plan=False,
+                            ),
+                            0.0,
+                        )
 
                 target_amps = max(appliance.min_current, min(target_amps, appliance.max_current))
                 if override_active:
