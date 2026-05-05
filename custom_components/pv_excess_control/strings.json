@@ -132,7 +132,7 @@
         },
         "data_description": {
           "export_limit": "Maximum power allowed to export to the grid (0 = no limit).",
-          "off_threshold": "Grid draw (negative watts) tolerated before the optimizer starts shedding appliances. Default: -50 W.",
+          "off_threshold": "Export buffer before shedding appliances. Negative = tolerate some grid import (e.g. -50 W = shed only when importing more than 50 W). Positive = maintain a minimum export (e.g. 100 W = shed when grid export drops below 100 W). Default: -50 W.",
           "controller_interval": "How often the controller evaluates and adjusts appliances.",
           "planner_interval": "How often the planner recalculates the daily schedule.",
           "plan_influence": "Controls how the 24-hour planner influences real-time decisions. 'Light' lowers activation thresholds when the plan expects excess. 'Plan follows' actively schedules appliances based on forecast and tariff predictions. 'None' disables plan influence (pure reactive control).",
@@ -497,7 +497,7 @@
         },
         "data_description": {
           "export_limit": "Maximum power allowed to export to the grid (0 = no limit).",
-          "off_threshold": "Grid draw (negative watts) tolerated before the optimizer starts shedding appliances. Default: -50 W.",
+          "off_threshold": "Export buffer before shedding appliances. Negative = tolerate some grid import (e.g. -50 W = shed only when importing more than 50 W). Positive = maintain a minimum export (e.g. 100 W = shed when grid export drops below 100 W). Default: -50 W.",
           "controller_interval": "How often the controller evaluates and adjusts appliances.",
           "planner_interval": "How often the planner recalculates the daily schedule.",
           "plan_influence": "Controls how the 24-hour planner influences real-time decisions. 'Light' lowers activation thresholds when the plan expects excess. 'Plan follows' actively schedules appliances based on forecast and tariff predictions. 'None' disables plan influence (pure reactive control).",

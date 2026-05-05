@@ -833,7 +833,7 @@ def _settings_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 default=d.get(CONF_OFF_THRESHOLD, DEFAULT_OFF_THRESHOLD),
             ): NumberSelector(
                 NumberSelectorConfig(
-                    min=-500, max=0, step=10, unit_of_measurement="W",
+                    min=-500, max=500, step=10, unit_of_measurement="W",
                     mode=NumberSelectorMode.BOX,
                 )
             ),
