@@ -108,7 +108,7 @@ template:
   - sensor:
       - name: "PV Grid Export"
         unit_of_measurement: W
-        state: "{{ -states('sensor.inverter_grid_power') | float(0) }}"
+        state: {{ -(states('sensor.p1_meter_power') | float(0))}}
 ```
 
 ---
