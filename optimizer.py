@@ -359,6 +359,7 @@ class Optimizer:
         if battery_target.target_soc is None:
             return None
 
+        from datetime import datetime
         now = datetime.now(self._tz) if self._tz else datetime.now()
         now_time = now.time()
 
