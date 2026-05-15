@@ -212,6 +212,7 @@ class Plan:
     entries: list[PlanEntry]
     battery_target: BatteryTarget
     confidence: float  # 0.0-1.0
+    grid_charge_recommended: bool = False  # True if solar forecast alone is insufficient to reach battery target
 
 
 @dataclass(frozen=True)

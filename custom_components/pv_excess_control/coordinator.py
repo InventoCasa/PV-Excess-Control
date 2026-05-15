@@ -505,7 +505,18 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         soc = getattr(power_state, "battery_soc", None) if power_state is not None else None
         soc_below_target = soc is None or soc < target_soc
 
-        auto_should_engage = auto_flag and cheap_now and soc_below_target
+        auto_should_engage = (
+            auto_flag
+            and cheap_now
+            and soc_below_target
+            and (
+                # If the planner has run, only grid-charge when it says solar
+                # forecast alone is insufficient to reach the battery target.
+                # This prevents unnecessary grid imports on sunny days.
+                self.current_plan is None
+                or self.current_plan.grid_charge_recommended
+            )
+        )
         should_engage = self.force_charge or auto_should_engage
 
         force_off_edge = self._force_charge_prev and not self.force_charge
@@ -957,6 +968,13 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 excess_power = None
             else:
                 excess_power = grid_export - grid_import
+                # For hybrid inverters with battery configured, add battery
+                # power back so excess reflects total solar above house load
+                # rather than just grid export. Equivalent to pv - load.
+                # battery_power is positive when charging (adds to excess),
+                # negative when discharging (removes battery contribution).
+                if has_battery and battery_power is not None:
+                    excess_power += battery_power
         elif has_battery and load_power is not None and load_power > 0:
             # Hybrid branch: requires pv_production; load_power is guaranteed
             # non-None by the predicate.

@@ -1101,6 +1101,18 @@ class Planner:
         )
 
         # 6. Calculate confidence and build plan
+
+        # Check whether solar forecast alone covers the battery need, without
+        # any grid charging. If not, grid charging is recommended. This flag
+        # lets the coordinator avoid unnecessary grid imports on sunny days.
+        grid_charge_recommended = False
+        if battery_config is not None and battery_config.allow_grid_charging:
+            solar_only_remaining = battery_allocation.charging_needed_kwh
+            for slot in timeline:
+                if solar_only_remaining <= 0:
+                    break
+                solar_only_remaining -= max(self._slot_excess_kwh(slot), 0.0)
+            grid_charge_recommended = solar_only_remaining > 0.1  # 100 Wh buffer avoids noise
         confidence = self._calculate_confidence(forecast, timeline, entries)
 
         # Calculate horizon
@@ -1117,6 +1129,7 @@ class Planner:
             entries=entries,
             battery_target=battery_target,
             confidence=confidence,
+            grid_charge_recommended=grid_charge_recommended,
         )
         _LOGGER.debug(
             "Planner: %d timeline slots, %d plan entries, confidence=%.1f%%",
