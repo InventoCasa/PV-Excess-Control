@@ -288,6 +288,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Master switch & startup
         self._was_enabled = True  # Track master-switch transitions (M11)
         self._startup_time = datetime.now()
+        self._startup_runtime_recovered: bool = False  # Set True after first-run history recovery
         _LOGGER.info(
             "Startup grace period active for %ds (optimization paused while history buffer fills)",
             DEFAULT_STARTUP_GRACE_PERIOD,
@@ -570,6 +571,95 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         hours_to_fill = kwh_needed / (battery_power_w / 1000.0)
         return hours_to_fill <= hours_remaining
 
+    async def _async_recover_runtime_today(
+        self, appliance_configs: list[ApplianceConfig]
+    ) -> None:
+        """Seed today's runtime from HA recorder history after a restart.
+
+        Queries the recorder for each appliance's switch entity state since
+        midnight and calculates total ON time. Injects the result into
+        self.appliance_states so that _get_appliance_states() picks it up
+        as the 'previous' state, preserving the runtime counter across
+        HA or integration restarts.
+
+        Silently no-ops if the recorder is unavailable or returns no data.
+        """
+        from homeassistant.util import dt as dt_util
+
+        try:
+            from homeassistant.components.recorder import get_instance
+            from homeassistant.components.recorder.history import get_significant_states
+        except ImportError:
+            _LOGGER.debug("Recorder not available — skipping runtime recovery")
+            return
+
+        now_local = dt_util.now()
+        start_of_day = dt_util.start_of_local_day(now_local)
+        entity_ids = [c.entity_id for c in appliance_configs]
+
+        try:
+            instance = get_instance(self.hass)
+            states_dict: dict = await instance.async_add_executor_job(
+                lambda: get_significant_states(
+                    self.hass,
+                    start_of_day,
+                    now_local,
+                    entity_ids,
+                    filters=None,
+                    include_start_time_state=True,
+                )
+            )
+        except Exception as err:
+            _LOGGER.warning("Runtime recovery: recorder query failed — %s", err)
+            return
+
+        for config in appliance_configs:
+            states = states_dict.get(config.entity_id, [])
+            if not states:
+                continue
+
+            runtime = timedelta()
+            prev_on = False
+            prev_time = start_of_day
+
+            for s in states:
+                t = s.last_changed
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=dt_util.UTC)
+                if prev_on:
+                    runtime += t - prev_time
+                prev_on = (s.state == "on")
+                prev_time = t
+
+            # Account for current ON state running up to now
+            if prev_on:
+                runtime += now_local - prev_time
+
+            if runtime.total_seconds() <= 0:
+                continue
+
+            # Pre-populate appliance_states so _get_appliance_states picks
+            # up the recovered runtime as 'previous.runtime_today'.
+            existing = self.appliance_states.get(config.id)
+            recovered = ApplianceState(
+                appliance_id=config.id,
+                is_on=existing.is_on if existing else False,
+                current_power=existing.current_power if existing else 0.0,
+                current_amperage=existing.current_amperage if existing else None,
+                runtime_today=runtime,
+                energy_today=existing.energy_today if existing else 0.0,
+                last_state_change=existing.last_state_change if existing else None,
+                ev_connected=existing.ev_connected if existing else None,
+                ev_soc=existing.ev_soc if existing else None,
+                activations_today=existing.activations_today if existing else 0,
+            )
+            self.appliance_states[config.id] = recovered
+            _LOGGER.info(
+                "Runtime recovery: %s — restored %.1f min from today's history",
+                config.name,
+                runtime.total_seconds() / 60,
+            )
+
     def _build_inverter_controller(self) -> InverterGridChargeController | None:
         """Construct the inverter controller from config_entry.data, or return None."""
         d = self.config_entry.data
@@ -791,6 +881,13 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # works even during the startup grace period (M20)
         appliance_configs = self._get_appliance_configs()
         self._last_appliance_configs = appliance_configs
+
+        # On the first cycle after restart, recover today's accumulated runtime
+        # from HA recorder so the counter isn't incorrectly reset to zero mid-day.
+        if not self._startup_runtime_recovered:
+            await self._async_recover_runtime_today(appliance_configs)
+            self._startup_runtime_recovered = True
+
         appliance_states = self._get_appliance_states(appliance_configs)
 
         elapsed = (datetime.now() - self._startup_time).total_seconds()
