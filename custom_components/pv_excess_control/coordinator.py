@@ -484,7 +484,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (ValueError, TypeError):
             return True
 
-        now = datetime.now()
+        now = datetime.now().astimezone()
         target_dt = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
         if target_dt <= now:
             return True  # Past target time — never engage grid charging here
