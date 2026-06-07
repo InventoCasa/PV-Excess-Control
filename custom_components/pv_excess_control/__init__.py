@@ -6,6 +6,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_change
 
 from .const import CONF_BATTERY_STRATEGY, DOMAIN
@@ -97,6 +98,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(
         async_track_time_change(hass, _midnight_reset, hour=0, minute=0, second=0)
     )
+
+    # Clean up orphaned entities from deleted subentries (appliances).
+    # Unique IDs have the form "<entry_id>_<subentry_id>_<suffix>"; both IDs are
+    # 26-char ULIDs, so we skip the entry_id itself to avoid deleting system entities.
+    ent_reg = er.async_get(hass)
+    active_subentry_ids = set(getattr(entry, "subentries", {}).keys())
+    for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        parts = reg_entry.unique_id.split("_")
+        for part in parts:
+            if len(part) == 26 and part != entry.entry_id and part not in active_subentry_ids:
+                _LOGGER.info("Removing orphaned entity %s", reg_entry.entity_id)
+                ent_reg.async_remove(reg_entry.entity_id)
+                break
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 

@@ -44,24 +44,23 @@ async def async_setup_entry(
     """Set up PV Excess Control sensor entities from a config entry."""
     coordinator: PvExcessCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    entities: list[SensorEntity] = [
+    # System-level sensors (no subentry association)
+    async_add_entities([
         PvExcessPowerSensor(coordinator),
         PvPlanConfidenceSensor(coordinator),
-    ]
+    ])
 
     # Per-appliance sensors from subentries
     subentries = getattr(config_entry, "subentries", {})
     for subentry_id, subentry in subentries.items():
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
-        entities.extend([
+        async_add_entities([
             PvAppliancePowerSensor(coordinator, subentry_id, appliance_name),
             PvApplianceRuntimeSensor(coordinator, subentry_id, appliance_name),
             PvApplianceEnergySensor(coordinator, subentry_id, appliance_name),
             PvApplianceActivationsSensor(coordinator, subentry_id, appliance_name),
             PvApplianceStatusSensor(coordinator, subentry_id, appliance_name),
-        ])
-
-    async_add_entities(entities)
+        ], config_subentry_id=subentry_id)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +192,7 @@ class PvApplianceBaseSensor(PvExcessBaseSensor):
         name = f"{appliance_name} {sensor_label}"
         super().__init__(coordinator, unique_id_suffix, name)
         self._appliance_id = appliance_id
+        self._attr_config_subentry_id = appliance_id
 
     def _appliance_state(self):
         """Return the ApplianceState for this appliance, or None."""

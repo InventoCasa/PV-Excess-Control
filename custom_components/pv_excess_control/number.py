@@ -38,11 +38,11 @@ async def async_setup_entry(
     subentries = getattr(config_entry, "subentries", {})
     for subentry_id, subentry in subentries.items():
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
-        entities.append(AppliancePriorityNumber(coordinator, subentry_id, appliance_name))
-        entities.append(ApplianceMinDailyRuntimeNumber(coordinator, subentry_id, appliance_name))
-        entities.append(ApplianceMaxDailyRuntimeNumber(coordinator, subentry_id, appliance_name))
-
-    async_add_entities(entities)
+        async_add_entities([
+            AppliancePriorityNumber(coordinator, subentry_id, appliance_name),
+            ApplianceMinDailyRuntimeNumber(coordinator, subentry_id, appliance_name),
+            ApplianceMaxDailyRuntimeNumber(coordinator, subentry_id, appliance_name),
+        ], config_subentry_id=subentry_id)
 
 
 class AppliancePriorityNumber(CoordinatorEntity[PvExcessCoordinator], NumberEntity):
@@ -68,6 +68,7 @@ class AppliancePriorityNumber(CoordinatorEntity[PvExcessCoordinator], NumberEnti
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_priority"
         )
+        self._attr_config_subentry_id = appliance_id
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -133,6 +134,7 @@ class ApplianceMinDailyRuntimeNumber(CoordinatorEntity[PvExcessCoordinator], Num
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_min_daily_runtime"
         )
+        self._attr_config_subentry_id = appliance_id
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -220,6 +222,7 @@ class ApplianceMaxDailyRuntimeNumber(CoordinatorEntity[PvExcessCoordinator], Num
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_max_daily_runtime"
         )
+        self._attr_config_subentry_id = appliance_id
 
     @property
     def device_info(self) -> DeviceInfo:

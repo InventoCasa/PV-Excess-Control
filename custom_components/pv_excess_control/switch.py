@@ -25,19 +25,20 @@ async def async_setup_entry(
     """Set up PV Excess Control switch entities."""
     coordinator: PvExcessCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    entities: list[SwitchEntity] = [
+    # System-level switches (no subentry association)
+    async_add_entities([
         ControlEnabledSwitch(coordinator),
         ForceChargeSwitch(coordinator),
-    ]
+    ])
 
     # Per-appliance switches
     subentries = getattr(config_entry, "subentries", {})
     for subentry_id, subentry in subentries.items():
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
-        entities.append(ApplianceEnabledSwitch(coordinator, subentry_id, appliance_name))
-        entities.append(ApplianceOverrideSwitch(coordinator, subentry_id, appliance_name))
-
-    async_add_entities(entities)
+        async_add_entities([
+            ApplianceEnabledSwitch(coordinator, subentry_id, appliance_name),
+            ApplianceOverrideSwitch(coordinator, subentry_id, appliance_name),
+        ], config_subentry_id=subentry_id)
 
 
 class _PvExcessSwitchBase(CoordinatorEntity[PvExcessCoordinator], SwitchEntity):
@@ -155,6 +156,7 @@ class ApplianceEnabledSwitch(_PvExcessSwitchBase):
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_enabled"
         )
+        self._attr_config_subentry_id = appliance_id
 
     @property
     def is_on(self) -> bool:
@@ -208,6 +210,7 @@ class ApplianceOverrideSwitch(_PvExcessSwitchBase):
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_override"
         )
+        self._attr_config_subentry_id = appliance_id
 
     @property
     def is_on(self) -> bool:

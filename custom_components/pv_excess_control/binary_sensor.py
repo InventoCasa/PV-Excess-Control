@@ -29,17 +29,18 @@ async def async_setup_entry(
     """Set up PV Excess Control binary sensor entities."""
     coordinator: PvExcessCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    entities: list[BinarySensorEntity] = [
+    # System-level binary sensors (no subentry association)
+    async_add_entities([
         ExcessAvailableBinarySensor(coordinator),
-    ]
+    ])
 
     # Per-appliance active sensors
     subentries = getattr(config_entry, "subentries", {})
     for subentry_id, subentry in subentries.items():
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
-        entities.append(ApplianceActiveBinarySensor(coordinator, subentry_id, appliance_name))
-
-    async_add_entities(entities)
+        async_add_entities([
+            ApplianceActiveBinarySensor(coordinator, subentry_id, appliance_name),
+        ], config_subentry_id=subentry_id)
 
 
 class _PvExcessBinarySensorBase(
@@ -118,6 +119,7 @@ class ApplianceActiveBinarySensor(_PvExcessBinarySensorBase):
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_active"
         )
+        self._attr_config_subentry_id = appliance_id
 
     @property
     def is_on(self) -> bool:

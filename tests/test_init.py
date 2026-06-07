@@ -1583,6 +1583,89 @@ class TestSetupAndUnload:
 
 
 # ---------------------------------------------------------------------------
+# Tests: orphaned entity cleanup on setup
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanedEntityCleanup:
+    """async_setup_entry must remove entities whose subentry no longer exists
+    without touching system-level entities or active-subentry entities.
+
+    Uses a fully-mocked hass + coordinator to isolate the registry logic from
+    HA infrastructure (storage, event loop timers, etc.).
+    """
+
+    def _make_reg_entry(self, unique_id: str) -> MagicMock:
+        e = MagicMock()
+        e.unique_id = unique_id
+        e.entity_id = f"sensor.{unique_id}"
+        return e
+
+    async def _run_setup(self, entry_id, subentries, reg_entries):
+        """Call async_setup_entry with everything mocked except the er cleanup."""
+        from custom_components.pv_excess_control import async_setup_entry
+        from homeassistant.helpers import entity_registry as er
+
+        entry = MagicMock()
+        entry.entry_id = entry_id
+        entry.subentries = subentries
+        entry.data = {}
+        entry.add_update_listener = MagicMock(return_value=MagicMock())
+        entry.async_on_unload = MagicMock()
+
+        hass = MagicMock()
+        hass.data = {}
+
+        mock_coord = MagicMock()
+        mock_coord.async_config_entry_first_refresh = AsyncMock()
+        mock_ent_reg = MagicMock()
+
+        with patch("custom_components.pv_excess_control.PvExcessCoordinator", return_value=mock_coord), \
+             patch("custom_components.pv_excess_control.async_track_time_change", return_value=MagicMock()), \
+             patch.object(hass.config_entries, "async_forward_entry_setups", new_callable=AsyncMock), \
+             patch.object(er, "async_get", return_value=mock_ent_reg), \
+             patch.object(er, "async_entries_for_config_entry", return_value=reg_entries):
+            await async_setup_entry(hass, entry)
+
+        return mock_ent_reg
+
+    @pytest.mark.asyncio
+    async def test_orphaned_appliance_entity_is_removed(self):
+        """Entity whose unique_id contains a stale subentry ID is removed."""
+        entry_id = "a" * 26
+        stale_reg = self._make_reg_entry(f"{'a'*26}_{'b'*26}_priority")
+        mock_ent_reg = await self._run_setup(entry_id, subentries={}, reg_entries=[stale_reg])
+        mock_ent_reg.async_remove.assert_called_once_with(stale_reg.entity_id)
+
+    @pytest.mark.asyncio
+    async def test_system_entity_is_not_removed(self):
+        """System entity unique_id = '<entry_id>_battery_strategy' is preserved.
+
+        entry_id is also 26 chars, so the old check (len == 26) would have
+        incorrectly matched it. The fix adds `part != entry.entry_id`.
+        """
+        entry_id = "a" * 26
+        system_reg = self._make_reg_entry(f"{'a'*26}_battery_strategy")
+        mock_ent_reg = await self._run_setup(entry_id, subentries={}, reg_entries=[system_reg])
+        mock_ent_reg.async_remove.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_active_appliance_entity_is_not_removed(self):
+        """Entity whose subentry_id is still active is preserved."""
+        entry_id = "a" * 26
+        active_subentry_id = "c" * 26
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Pump"}
+        active_reg = self._make_reg_entry(f"{'a'*26}_{'c'*26}_enabled")
+        mock_ent_reg = await self._run_setup(
+            entry_id,
+            subentries={active_subentry_id: subentry},
+            reg_entries=[active_reg],
+        )
+        mock_ent_reg.async_remove.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Tests: full update cycle (integration-style)
 # ---------------------------------------------------------------------------
 

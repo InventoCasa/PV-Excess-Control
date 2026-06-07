@@ -890,9 +890,9 @@ class TestNumberEntities:
             async_setup_entry,
         )
 
-        added: list = []
-        def _add(entities, update_before_add=False):
-            added.extend(entities)
+        added: list[tuple] = []  # (entities, subentry_id)
+        def _add(entities, update_before_add=False, config_subentry_id=None):
+            added.append((list(entities), config_subentry_id))
 
         hass = MagicMock()
         coord = _make_coordinator()
@@ -906,11 +906,16 @@ class TestNumberEntities:
 
         await async_setup_entry(hass, config_entry, _add)
 
-        classes = {type(e) for e in added}
+        all_entities = [e for entities, _ in added for e in entities]
+        classes = {type(e) for e in all_entities}
         assert AppliancePriorityNumber in classes
         assert ApplianceMinDailyRuntimeNumber in classes
         assert ApplianceMaxDailyRuntimeNumber in classes
-        assert len(added) == 3
+        assert len(all_entities) == 3
+        # Per-appliance entities must be registered under their subentry
+        subentry_calls = [(entities, sid) for entities, sid in added if sid == "app_1"]
+        assert len(subentry_calls) == 1
+        assert len(subentry_calls[0][0]) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1075,3 +1080,60 @@ class TestSelectEntities:
         coord = _make_coordinator()
         sel = BatteryStrategySelect(coord)
         assert sel.name == "Battery Strategy"
+
+
+# ---------------------------------------------------------------------------
+# Subentry association tests
+# ---------------------------------------------------------------------------
+
+class TestSubentryAssociation:
+    """Per-appliance entities must carry _attr_config_subentry_id so HA ties
+    them to the correct subentry (and removes them when it is deleted)."""
+
+    def test_appliance_switch_has_config_subentry_id(self):
+        from custom_components.pv_excess_control.switch import ApplianceEnabledSwitch
+        coord = _make_coordinator()
+        sw = ApplianceEnabledSwitch(coord, "sub_abc", "Pump")
+        assert sw._attr_config_subentry_id == "sub_abc"
+
+    def test_appliance_override_switch_has_config_subentry_id(self):
+        from custom_components.pv_excess_control.switch import ApplianceOverrideSwitch
+        coord = _make_coordinator()
+        sw = ApplianceOverrideSwitch(coord, "sub_abc", "Pump")
+        assert sw._attr_config_subentry_id == "sub_abc"
+
+    def test_system_switch_has_no_config_subentry_id(self):
+        from custom_components.pv_excess_control.switch import ControlEnabledSwitch
+        coord = _make_coordinator()
+        sw = ControlEnabledSwitch(coord)
+        assert getattr(sw, "_attr_config_subentry_id", None) is None
+
+    def test_priority_number_has_config_subentry_id(self):
+        from custom_components.pv_excess_control.number import AppliancePriorityNumber
+        coord = _make_coordinator()
+        n = AppliancePriorityNumber(coord, "sub_abc", "Pump")
+        assert n._attr_config_subentry_id == "sub_abc"
+
+    def test_min_runtime_number_has_config_subentry_id(self):
+        from custom_components.pv_excess_control.number import ApplianceMinDailyRuntimeNumber
+        coord = _make_coordinator()
+        n = ApplianceMinDailyRuntimeNumber(coord, "sub_abc", "Pump")
+        assert n._attr_config_subentry_id == "sub_abc"
+
+    def test_max_runtime_number_has_config_subentry_id(self):
+        from custom_components.pv_excess_control.number import ApplianceMaxDailyRuntimeNumber
+        coord = _make_coordinator()
+        n = ApplianceMaxDailyRuntimeNumber(coord, "sub_abc", "Pump")
+        assert n._attr_config_subentry_id == "sub_abc"
+
+    def test_appliance_active_sensor_has_config_subentry_id(self):
+        from custom_components.pv_excess_control.binary_sensor import ApplianceActiveBinarySensor
+        coord = _make_coordinator()
+        bs = ApplianceActiveBinarySensor(coord, "sub_abc", "Pump")
+        assert bs._attr_config_subentry_id == "sub_abc"
+
+    def test_excess_binary_sensor_has_no_config_subentry_id(self):
+        from custom_components.pv_excess_control.binary_sensor import ExcessAvailableBinarySensor
+        coord = _make_coordinator()
+        bs = ExcessAvailableBinarySensor(coord)
+        assert getattr(bs, "_attr_config_subentry_id", None) is None
