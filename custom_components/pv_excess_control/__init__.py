@@ -59,6 +59,11 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
             # Update the snapshot so future comparisons are correct
             domain_data[snapshot_key] = new_data
             domain_data[subentry_count_key] = new_subentry_count
+
+            # Sync the runtime cached values to pick up priority/runtime changes instantly
+            coordinator = domain_data.get(entry.entry_id)
+            if coordinator:
+                coordinator.update_from_subentries()
             return
 
     _LOGGER.info("Config entry updated (structural change), reloading integration")

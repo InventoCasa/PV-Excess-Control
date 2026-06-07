@@ -1490,6 +1490,114 @@ class TestPlannerInterval:
 
 
 # ---------------------------------------------------------------------------
+# Tests: update_from_subentries (sync UI changes without reload)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateFromSubentries:
+    """update_from_subentries() must sync priority and runtime dicts from
+    subentry data so UI changes take effect without a full reload."""
+
+    def _make_entry_with_subentries(self, subentries_data: dict) -> MagicMock:
+        """Build a mock config entry whose subentries map matches subentries_data."""
+        entry = _make_config_entry()
+        subentries = {}
+        for sub_id, data in subentries_data.items():
+            sub = MagicMock()
+            sub.data = data
+            subentries[sub_id] = sub
+        entry.subentries = subentries
+        return entry
+
+    def test_priority_updated_from_subentry(self):
+        """update_from_subentries refreshes appliance_priorities from subentry data."""
+        from custom_components.pv_excess_control.const import CONF_APPLIANCE_PRIORITY
+
+        entry = self._make_entry_with_subentries({"sub1": {CONF_APPLIANCE_PRIORITY: 200}})
+        coord = _make_coordinator(entry=entry)
+        coord.appliance_priorities = {"sub1": 500}  # stale value
+
+        coord.update_from_subentries()
+
+        assert coord.appliance_priorities["sub1"] == 200
+
+    def test_min_daily_runtime_updated_from_subentry(self):
+        """update_from_subentries refreshes appliance_min_daily_runtime."""
+        from custom_components.pv_excess_control.const import (
+            CONF_APPLIANCE_PRIORITY,
+            CONF_MIN_DAILY_RUNTIME,
+        )
+
+        entry = self._make_entry_with_subentries(
+            {"sub1": {CONF_APPLIANCE_PRIORITY: 300, CONF_MIN_DAILY_RUNTIME: 90}}
+        )
+        coord = _make_coordinator(entry=entry)
+        coord.appliance_priorities = {"sub1": 300}
+        coord.appliance_min_daily_runtime = {}
+
+        coord.update_from_subentries()
+
+        assert coord.appliance_min_daily_runtime["sub1"] == 90
+
+    def test_min_daily_runtime_removed_when_absent(self):
+        """update_from_subentries pops min_daily_runtime when key is not in subentry."""
+        from custom_components.pv_excess_control.const import CONF_APPLIANCE_PRIORITY
+
+        entry = self._make_entry_with_subentries({"sub1": {CONF_APPLIANCE_PRIORITY: 300}})
+        coord = _make_coordinator(entry=entry)
+        coord.appliance_min_daily_runtime = {"sub1": 60}  # stale
+
+        coord.update_from_subentries()
+
+        assert "sub1" not in coord.appliance_min_daily_runtime
+
+    def test_max_daily_runtime_updated_from_subentry(self):
+        """update_from_subentries refreshes appliance_max_daily_runtime."""
+        from custom_components.pv_excess_control.const import (
+            CONF_APPLIANCE_PRIORITY,
+            CONF_MAX_DAILY_RUNTIME,
+        )
+
+        entry = self._make_entry_with_subentries(
+            {"sub1": {CONF_APPLIANCE_PRIORITY: 300, CONF_MAX_DAILY_RUNTIME: 240}}
+        )
+        coord = _make_coordinator(entry=entry)
+        coord.appliance_max_daily_runtime = {}
+
+        coord.update_from_subentries()
+
+        assert coord.appliance_max_daily_runtime["sub1"] == 240
+
+    def test_max_daily_runtime_removed_when_absent(self):
+        """update_from_subentries pops max_daily_runtime when key is not in subentry."""
+        from custom_components.pv_excess_control.const import CONF_APPLIANCE_PRIORITY
+
+        entry = self._make_entry_with_subentries({"sub1": {CONF_APPLIANCE_PRIORITY: 300}})
+        coord = _make_coordinator(entry=entry)
+        coord.appliance_max_daily_runtime = {"sub1": 120}  # stale
+
+        coord.update_from_subentries()
+
+        assert "sub1" not in coord.appliance_max_daily_runtime
+
+    def test_multiple_subentries_all_updated(self):
+        """update_from_subentries processes every subentry."""
+        from custom_components.pv_excess_control.const import CONF_APPLIANCE_PRIORITY
+
+        entry = self._make_entry_with_subentries({
+            "sub1": {CONF_APPLIANCE_PRIORITY: 100},
+            "sub2": {CONF_APPLIANCE_PRIORITY: 800},
+        })
+        coord = _make_coordinator(entry=entry)
+        coord.appliance_priorities = {}
+
+        coord.update_from_subentries()
+
+        assert coord.appliance_priorities["sub1"] == 100
+        assert coord.appliance_priorities["sub2"] == 800
+
+
+# ---------------------------------------------------------------------------
 # Tests: async_setup_entry / async_unload_entry
 # ---------------------------------------------------------------------------
 
