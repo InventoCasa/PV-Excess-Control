@@ -1001,6 +1001,21 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             timestamp=datetime.now(),
         )
 
+    def update_from_subentries(self) -> None:
+        """Update runtime priorities and limits from subentries to reflect UI updates without reloading."""
+        subentries = getattr(self.config_entry, "subentries", {})
+        for subentry_id, subentry in subentries.items():
+            d = subentry.data
+            self.appliance_priorities[subentry_id] = d.get(CONF_APPLIANCE_PRIORITY, 500)
+            if CONF_MIN_DAILY_RUNTIME in d:
+                self.appliance_min_daily_runtime[subentry_id] = d[CONF_MIN_DAILY_RUNTIME]
+            else:
+                self.appliance_min_daily_runtime.pop(subentry_id, None)
+            if CONF_MAX_DAILY_RUNTIME in d:
+                self.appliance_max_daily_runtime[subentry_id] = d[CONF_MAX_DAILY_RUNTIME]
+            else:
+                self.appliance_max_daily_runtime.pop(subentry_id, None)
+
     # ------------------------------------------------------------------
     # Appliance configuration
     # ------------------------------------------------------------------
