@@ -523,53 +523,36 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             grid_kwh_needed = max(kwh_needed - net_solar_kwh, 0.0)
 
             if grid_kwh_needed <= 0:
-                # Forecast says solar alone is sufficient — check real-time agrees
-                # (guards against Solcast overestimating on a dull day)
-                # GoodWe convention: negative battery_power = charging
                 battery_power_w = getattr(power_state, "battery_power", None)
                 if battery_power_w is not None and battery_power_w > 50:
-                    # Battery is actively charging — trust the forecast
-                    return True
+                    return True  # Charging — trust the forecast
                 if battery_power_w is not None and battery_power_w <= 50:
-                    # Not charging despite forecast saying enough solar — be cautious
-                    # Only trust forecast if we have plenty of headroom (>30 min spare)
                     spare_hours = hours_remaining - (kwh_needed / max(grid_charge_kw, 0.1))
                     if spare_hours > 0.5:
-                        return True  # Still plenty of buffer time
-                    # Marginal case — fall through to real-time path below
+                        return True
                 else:
-                    return True  # battery_power unavailable — trust forecast
+                    return True
 
-            # Grid charging is needed; calculate latest safe start
-            # (mirror of sensor.battery_latest_safe_start_time logic)
             grid_hours_needed = grid_kwh_needed / max(grid_charge_kw, 0.1)
             latest_start_hours_from_now = hours_remaining - grid_hours_needed
-            buffer_hours = 10.0 / 60.0  # 10-minute buffer matching original automation
+            buffer_hours = 10.0 / 60.0
 
             if latest_start_hours_from_now > buffer_hours:
-                # ── 2. REAL-TIME CROSS-CHECK ──────────────────────────────────
-                # Forecast says we can wait, but verify current rate isn't
-                # so far behind that Solcast must be wrong.
-                # GoodWe: negative = charging, positive = discharging
                 battery_power_w = getattr(power_state, "battery_power", None)
                 if battery_power_w is not None and battery_power_w > 0:
-                    # Charging — check rate is sufficient
                     realtime_hours = kwh_needed / (battery_power_w / 1000.0)
                     if realtime_hours > hours_remaining * 1.5:
                         return False
                 elif battery_power_w is not None and battery_power_w <= 0:
-                    # Not charging — grid charge if within last hour
                     if latest_start_hours_from_now < 1.0:
                         return False
-                return True  # Within time — let solar do its job
+                return True
 
-            return False  # Past latest safe start — engage grid charging
+            return False
 
-        # ── FALLBACK: no forecast data — real-time projection only ────────────
-        # GoodWe: negative battery_power = charging
         battery_power_w = getattr(power_state, "battery_power", None)
         if battery_power_w is None or battery_power_w <= 0:
-            return False  # Not charging at all
+            return False
         hours_to_fill = kwh_needed / (battery_power_w / 1000.0)
         return hours_to_fill <= hours_remaining
 
@@ -740,6 +723,52 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current_soc=soc,
             target_soc=target_soc,
         )
+
+        # Before engaging grid charge, check whether shedding running appliances
+        # would free enough solar to fill the battery without grid import.
+        # Priority: shed pool first → reassess → only grid charge if still needed.
+        # Skip this check if we're within 30 minutes of the latest safe start
+        # (no time to wait for a shed to take effect).
+        if not solar_covers_target and cheap_now and soc_below_target:
+            d = self.config_entry.data
+            capacity_kwh = d.get(CONF_BATTERY_CAPACITY)
+            target_time_str = d.get(CONF_BATTERY_TARGET_TIME)
+            grid_charge_kw = (d.get(CONF_BATTERY_GRID_CHARGE_POWER_W) or 3500) / 1000
+            try:
+                from datetime import datetime as _dt
+                t = _dt.strptime(target_time_str, "%H:%M:%S").time()
+                now_local = _dt.now().astimezone()
+                target_dt = now_local.replace(hour=t.hour, minute=t.minute, second=0)
+                hrs_left = max((target_dt - now_local).total_seconds() / 3600, 0)
+                kwh_needed = max((target_soc - (soc or 0)) / 100 * (capacity_kwh or 0), 0)
+                grid_hrs = kwh_needed / max(grid_charge_kw, 0.1)
+                latest_start_hrs = hrs_left - grid_hrs
+                # Only attempt shed-first if we have >30 min before latest safe start
+                if latest_start_hrs > 0.5:
+                    running_kw = sum(
+                        (st.current_power or 0) / 1000
+                        for st in self.appliance_states.values()
+                        if st.is_on and (st.current_power or 0) > 500
+                    )
+                    if running_kw > 0:
+                        # Would shedding running appliances allow solar to fill battery?
+                        batt_w = getattr(power_state, "battery_power", None) or 0
+                        projected_charge_kw = (batt_w + running_kw * 1000) / 1000
+                        if projected_charge_kw > 0.1:
+                            rt_if_shed = kwh_needed / projected_charge_kw
+                            if rt_if_shed <= hrs_left:
+                                # Shedding alone is sufficient — suppress grid charge.
+                                # The optimizer will shed the appliance naturally when
+                                # excess drops; this just prevents premature grid import.
+                                solar_covers_target = True
+                                _LOGGER.debug(
+                                    "Grid charge suppressed: shedding %.1f kW of "
+                                    "appliances would allow solar to fill battery "
+                                    "(rt_if_shed=%.1fh, hrs_left=%.1fh)",
+                                    running_kw, rt_if_shed, hrs_left,
+                                )
+            except Exception:
+                pass  # Fallback: let original logic proceed
 
         auto_should_engage = (
             auto_flag
@@ -1205,10 +1234,10 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 excess_power = None
             else:
                 excess_power = grid_export - grid_import
-                # Hybrid inverter adjustment: subtract battery_power to get pv - load.
-                # GoodWe convention: negative = charging, positive = discharging.
-                # Subtracting a negative (charging) adds it back → correct excess.
-                # Subtracting a positive (discharging) removes battery contribution.
+                # Hybrid inverter adjustment: add battery_power to get pv - load.
+                # HA GoodWe sensor convention: positive = charging (absorbing solar),
+                # negative = discharging. Adding a positive (charging) gives back
+                # the solar going into battery as available excess.
                 if has_battery and battery_power is not None:
                     excess_power += battery_power
         elif has_battery and load_power is not None and load_power > 0:
