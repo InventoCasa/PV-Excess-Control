@@ -541,7 +541,13 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 battery_power_w = getattr(power_state, "battery_power", None)
                 if battery_power_w is not None and battery_power_w > 0:
                     realtime_hours = kwh_needed / (battery_power_w / 1000.0)
-                    if realtime_hours > hours_remaining * 1.5:
+                    # Only let a slow RT rate override the forecast when we are
+                    # genuinely close to the latest safe start (within 2h).
+                    # Earlier than that, trust Solcast — a transient high load
+                    # (hot water heater, pool) can make the rate look slow even
+                    # when afternoon solar will comfortably cover the shortfall.
+                    if (realtime_hours > hours_remaining * 1.5
+                            and latest_start_hours_from_now < 2.0):
                         return False
                 elif battery_power_w is not None and battery_power_w <= 0:
                     if latest_start_hours_from_now < 1.0:
