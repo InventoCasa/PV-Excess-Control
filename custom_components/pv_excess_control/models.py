@@ -128,6 +128,7 @@ class ApplianceState:
     ev_connected: bool | None  # None if not EV
     ev_soc: float | None = None  # EV state of charge percentage
     activations_today: int = 0
+    battery_priority_shed: bool = False  # True when coordinator requests shed to free solar for battery
 
 
 @dataclass(frozen=True)

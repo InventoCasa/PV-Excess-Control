@@ -745,6 +745,23 @@ class Optimizer:
         if battery_deadline_result is not None:
             return battery_deadline_result
 
+        # Battery-priority shed: coordinator flagged this appliance because it
+        # has met its minimum runtime and shedding it would free enough solar
+        # to fill the battery without grid import.
+        if state.battery_priority_shed and state.is_on:
+            _LOGGER.info(
+                "%s: battery-priority shed — minimum runtime met, "
+                "freeing solar for battery charging",
+                appliance.name,
+            )
+            return ControlDecision(
+                action=Action.OFF,
+                power_delta=-(state.current_power or 0),
+                reason=f"Battery priority: min runtime met, freeing solar for battery",
+                switch_entity=appliance.entity_id,
+                target_current=None,
+            )
+
         # --- Already-ON appliances ---
         # Note: instant_budget (from measured grid power) already reflects
         # these appliances' consumption. For non-dynamic appliances we

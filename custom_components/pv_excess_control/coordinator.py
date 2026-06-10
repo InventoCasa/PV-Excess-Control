@@ -732,9 +732,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Before engaging grid charge, check whether shedding running appliances
         # would free enough solar to fill the battery without grid import.
-        # Priority: shed pool first → reassess → only grid charge if still needed.
-        # Skip this check if we're within 30 minutes of the latest safe start
-        # (no time to wait for a shed to take effect).
+        # If an appliance has already met its minimum runtime, actively flag it
+        # for a battery-priority shed rather than just suppressing grid charge.
+        # Skip this check if we're within 30 minutes of the latest safe start.
         if not solar_covers_target and cheap_now and soc_below_target:
             d = self.config_entry.data
             capacity_kwh = d.get(CONF_BATTERY_CAPACITY)
@@ -742,6 +742,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             grid_charge_kw = (d.get(CONF_BATTERY_GRID_CHARGE_POWER_W) or 3500) / 1000
             try:
                 from datetime import datetime as _dt
+                import dataclasses as _dc
                 t = _dt.strptime(target_time_str, "%H:%M:%S").time()
                 now_local = _dt.now().astimezone()
                 target_dt = now_local.replace(hour=t.hour, minute=t.minute, second=0)
@@ -749,30 +750,61 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 kwh_needed = max((target_soc - (soc or 0)) / 100 * (capacity_kwh or 0), 0)
                 grid_hrs = kwh_needed / max(grid_charge_kw, 0.1)
                 latest_start_hrs = hrs_left - grid_hrs
-                # Only attempt shed-first if we have >30 min before latest safe start
+
                 if latest_start_hrs > 0.5:
-                    running_kw = sum(
-                        (st.current_power or 0) / 1000
-                        for st in self.appliance_states.values()
-                        if st.is_on and (st.current_power or 0) > 500
-                    )
+                    # Build config lookup for min_daily_runtime checks
+                    cfg_by_id = {c.id: c for c in appliance_configs}
+                    running_kw = 0.0
+                    shed_candidates = []   # ids that have met minimum runtime
+                    non_shed_running = []  # ids still working toward minimum
+
+                    for aid, st in appliance_states.items():
+                        if not (st.is_on and (st.current_power or 0) > 500):
+                            continue
+                        kw = (st.current_power or 0) / 1000
+                        running_kw += kw
+                        cfg = cfg_by_id.get(aid)
+                        min_rt = cfg.min_daily_runtime if cfg else None
+                        if min_rt and st.runtime_today >= min_rt:
+                            shed_candidates.append((aid, kw))
+                        else:
+                            non_shed_running.append((aid, kw))
+
                     if running_kw > 0:
-                        # Would shedding running appliances allow solar to fill battery?
                         batt_w = getattr(power_state, "battery_power", None) or 0
                         projected_charge_kw = (batt_w + running_kw * 1000) / 1000
                         if projected_charge_kw > 0.1:
                             rt_if_shed = kwh_needed / projected_charge_kw
                             if rt_if_shed <= hrs_left:
-                                # Shedding alone is sufficient — suppress grid charge.
-                                # The optimizer will shed the appliance naturally when
-                                # excess drops; this just prevents premature grid import.
                                 solar_covers_target = True
-                                _LOGGER.debug(
-                                    "Grid charge suppressed: shedding %.1f kW of "
-                                    "appliances would allow solar to fill battery "
-                                    "(rt_if_shed=%.1fh, hrs_left=%.1fh)",
-                                    running_kw, rt_if_shed, hrs_left,
-                                )
+
+                                if shed_candidates:
+                                    # Appliances that have met minimum runtime:
+                                    # flag them for battery-priority shed so the
+                                    # optimizer actively stops them this cycle.
+                                    for aid, _ in shed_candidates:
+                                        if aid in appliance_states:
+                                            appliance_states[aid] = _dc.replace(
+                                                appliance_states[aid],
+                                                battery_priority_shed=True,
+                                            )
+                                    _LOGGER.info(
+                                        "Battery priority shed requested for %s "
+                                        "(min runtime met): shedding would allow "
+                                        "solar to fill battery "
+                                        "(rt_if_shed=%.1fh, hrs_left=%.1fh)",
+                                        [a for a, _ in shed_candidates],
+                                        rt_if_shed, hrs_left,
+                                    )
+                                else:
+                                    _LOGGER.debug(
+                                        "Grid charge suppressed: shedding %.1fkW "
+                                        "would allow solar to fill battery — "
+                                        "appliances still working toward minimum "
+                                        "runtime, letting them continue "
+                                        "(rt_if_shed=%.1fh, hrs_left=%.1fh)",
+                                        running_kw, rt_if_shed, hrs_left,
+                                    )
             except Exception:
                 pass  # Fallback: let original logic proceed
 
