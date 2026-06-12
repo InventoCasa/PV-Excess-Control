@@ -691,8 +691,14 @@ class Planner:
             )
             return []
 
-        # Sort eligible slots by price ascending (cheapest first)
-        eligible_slots.sort(key=lambda x: x[1].price)
+        # Sort eligible slots by start time — schedule pool from the earliest
+        # solar opportunity rather than just peak midday. This starts the pool
+        # at ~9am when solar first provides meaningful excess, running forward
+        # through midday, which both avoids export curtailment and maximises
+        # total solar absorbed. Price is a secondary tiebreaker for equal times.
+        eligible_slots.sort(
+            key=lambda x: (x[1].start, x[1].price)
+        )
 
         for idx, slot in eligible_slots:
             if remaining_energy <= 0:

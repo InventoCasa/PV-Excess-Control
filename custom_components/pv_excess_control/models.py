@@ -128,6 +128,7 @@ class ApplianceState:
     ev_connected: bool | None  # None if not EV
     ev_soc: float | None = None  # EV state of charge percentage
     activations_today: int = 0
+    battery_priority_shed: bool = False  # True when coordinator requests shed to free solar for battery
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,7 @@ class Plan:
     entries: list[PlanEntry]
     battery_target: BatteryTarget
     confidence: float  # 0.0-1.0
+    grid_charge_recommended: bool = False  # True if solar forecast alone is insufficient to reach battery target
 
 
 @dataclass(frozen=True)

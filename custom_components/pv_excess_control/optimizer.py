@@ -65,6 +65,8 @@ class Optimizer:
         # Initialised here for safety; optimize() overwrites both on every cycle.
         self._plan_influence: str = "none"
         self._grid_supplement_count: int = 0
+        self._current_battery_soc: float | None = None
+        self._current_plan: Plan | None = None
 
     def optimize(
         self,
@@ -89,6 +91,8 @@ class Optimizer:
         """
         self._plan_influence = plan_influence
         self._grid_supplement_count = 0
+        self._current_battery_soc = power_state.battery_soc
+        self._current_plan = plan
 
         # Build lookup of appliance states by ID
         state_by_id: dict[str, ApplianceState] = {
@@ -331,6 +335,63 @@ class Optimizer:
             if dep_state is not None and dep_state.is_on:
                 return True
         return False
+
+    def _check_post_deadline_battery(
+        self,
+        appliance: ApplianceConfig,
+        state: ApplianceState,
+    ) -> tuple[ControlDecision, float] | None:
+        """Block appliance after schedule_deadline if battery target not met.
+
+        After schedule_deadline has passed AND after battery target_time, only
+        allow the appliance to run if the battery has reached its target SOC.
+        Prevents the pool (or any deadline-constrained appliance) from draining
+        the battery during peak tariff once the solar charging window has closed.
+
+        Returns a blocking ControlDecision if the condition fires, else None.
+        """
+        if appliance.schedule_deadline is None:
+            return None
+        if self._current_plan is None:
+            return None
+
+        battery_target = self._current_plan.battery_target
+        if battery_target.target_soc is None:
+            return None
+
+        from datetime import datetime
+        now = datetime.now(self._tz) if self._tz else datetime.now()
+        now_time = now.time()
+
+        # Only applies after the appliance's schedule deadline
+        if now_time < appliance.schedule_deadline:
+            return None
+
+        # Only applies after the battery target time
+        battery_target_time = battery_target.target_time.time()
+        if now_time < battery_target_time:
+            return None
+
+        # Allow operation if battery has met or exceeded its target
+        battery_soc = self._current_battery_soc
+        if battery_soc is None or battery_soc >= battery_target.target_soc:
+            return None
+
+        action = Action.OFF if state.is_on else Action.IDLE
+        return (
+            ControlDecision(
+                appliance_id=appliance.id,
+                action=action,
+                target_current=None,
+                reason=(
+                    f"Post-deadline: battery target not met "
+                    f"({battery_soc:.0f}% < {battery_target.target_soc:.0f}%)"
+                ),
+                overrides_plan=False,
+                bypasses_cooldown=True,
+            ),
+            0.0,
+        )
 
     def _apply_safety_rules(
         self,
@@ -604,17 +665,22 @@ class Optimizer:
             if safety_result is not None:
                 decision, _ = safety_result
                 decisions.append(decision)
-            elif state.is_on and appliance.is_big_consumer:
-                # Emit a hold-ON decision so Phase 4 can see this big consumer
-                # and apply battery discharge limits. Without a decision entry
-                # _battery_discharge_protection would not detect it as active.
-                decisions.append(ControlDecision(
-                    appliance_id=appliance.id,
-                    action=Action.ON,
-                    target_current=None,
-                    reason="Excess unavailable - holding state",
-                    overrides_plan=False,
-                ))
+            else:
+                battery_result = self._check_post_deadline_battery(appliance, state)
+                if battery_result is not None:
+                    decision, _ = battery_result
+                    decisions.append(decision)
+                elif state.is_on and appliance.is_big_consumer:
+                    # Emit a hold-ON decision so Phase 4 can see this big consumer
+                    # and apply battery discharge limits. Without a decision entry
+                    # _battery_discharge_protection would not detect it as active.
+                    decisions.append(ControlDecision(
+                        appliance_id=appliance.id,
+                        action=Action.ON,
+                        target_current=None,
+                        reason="Excess unavailable - holding state",
+                        overrides_plan=False,
+                    ))
 
         battery_action = self._battery_discharge_protection(
             decisions, sorted_appliances,
@@ -674,6 +740,27 @@ class Optimizer:
         )
         if safety_result is not None:
             return safety_result
+
+        battery_deadline_result = self._check_post_deadline_battery(appliance, state)
+        if battery_deadline_result is not None:
+            return battery_deadline_result
+
+        # Battery-priority shed: coordinator flagged this appliance because it
+        # has met its minimum runtime and shedding it would free enough solar
+        # to fill the battery without grid import.
+        if state.battery_priority_shed and state.is_on:
+            _LOGGER.info(
+                "%s: battery-priority shed — minimum runtime met, "
+                "freeing solar for battery charging",
+                appliance.name,
+            )
+            return ControlDecision(
+                action=Action.OFF,
+                power_delta=-(state.current_power or 0),
+                reason=f"Battery priority: min runtime met, freeing solar for battery",
+                switch_entity=appliance.entity_id,
+                target_current=None,
+            )
 
         # --- Already-ON appliances ---
         # Note: instant_budget (from measured grid power) already reflects

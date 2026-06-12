@@ -269,6 +269,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_sensor_available: dict[str, bool] = {}
         self._last_appliance_configs: list[ApplianceConfig] = []
         self.current_plan: Plan | None = None
+        self._last_forecast_data: Any = None  # ForecastData | None, cached from last planner run
         self.appliance_states: dict[str, ApplianceState] = {}
         self.control_decisions: list[ControlDecision] = []
         self.battery_discharge_action: BatteryDischargeAction | None = None
@@ -287,6 +288,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Master switch & startup
         self._was_enabled = True  # Track master-switch transitions (M11)
         self._startup_time = datetime.now()
+        self._startup_runtime_recovered: bool = False  # Set True after first-run history recovery
         _LOGGER.info(
             "Startup grace period active for %ds (optimization paused while history buffer fills)",
             DEFAULT_STARTUP_GRACE_PERIOD,
@@ -436,6 +438,219 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Inverter grid-charge helpers (Task 10 plumbing)
     # ------------------------------------------------------------------
 
+    def _solar_can_fill_battery(
+        self,
+        power_state: Any,
+        current_soc: float | None,
+        target_soc: float,
+    ) -> bool:
+        """Return True if solar alone can fill the battery to target_soc by target_time.
+
+        Merges two signals, matching the intent of the original
+        sensor.battery_latest_safe_start_time / sensor.should_fast_charge_now logic:
+
+        1. FORECAST PATH (primary): Uses cached Solcast hourly breakdown to
+           calculate net solar energy expected between now and target_time.
+           Derives the *latest safe start time* for grid charging — the last
+           moment at which grid charging can begin and still guarantee the
+           battery reaches target_soc. Only returns False once we are within
+           a 10-minute buffer of that start time. This maximises solar
+           charging and minimises unnecessary grid imports.
+
+        2. REAL-TIME PATH (cross-check): Uses the current net battery charge
+           rate to project forward. If the forecast path says we still have
+           time but the real-time rate implies we are already too far behind
+           (e.g. Solcast is overoptimistic on a dull afternoon), this path
+           overrides and triggers grid charging immediately.
+
+        Returns True  → solar is on track, do not grid charge yet.
+        Returns False → solar cannot fill battery in time, grid charge needed.
+        """
+        from datetime import datetime
+
+        d = self.config_entry.data
+        capacity_kwh = d.get(CONF_BATTERY_CAPACITY)
+        target_time_str = d.get(CONF_BATTERY_TARGET_TIME)
+        grid_charge_kw = (d.get(CONF_BATTERY_GRID_CHARGE_POWER_W) or 3500) / 1000
+
+        if not capacity_kwh or not target_time_str or current_soc is None:
+            return True  # Cannot assess — do not trigger unnecessarily
+
+        try:
+            if isinstance(target_time_str, str):
+                t = datetime.strptime(target_time_str, "%H:%M:%S").time()
+            else:
+                t = target_time_str
+        except (ValueError, TypeError):
+            return True
+
+        now = datetime.now().astimezone()
+        target_dt = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        if target_dt <= now:
+            return True  # Past target time — never engage grid charging here
+
+        hours_remaining = (target_dt - now).total_seconds() / 3600.0
+        kwh_needed = max((target_soc - current_soc) / 100.0 * capacity_kwh, 0.0)
+        if kwh_needed <= 0:
+            return True  # Already at or above target
+
+        # ── 1. FORECAST PATH ──────────────────────────────────────────────────
+        forecast_data = self._last_forecast_data
+        if forecast_data is not None:
+            # Estimate house load from current power state; fall back to 1 kW
+            load_w = getattr(power_state, "load_power", None)
+            house_load_kw = (load_w / 1000.0) if (load_w and load_w > 0) else 1.0
+
+            net_solar_kwh = 0.0
+            for slot in forecast_data.hourly_breakdown:
+                slot_start = slot.start
+                slot_end = slot.end
+
+                # Only count slots that overlap with the remaining window
+                if slot_end <= now or slot_start >= target_dt:
+                    continue
+
+                # Clip slot to [now, target_dt] for partial hours
+                effective_start = max(slot_start, now)
+                effective_end = min(slot_end, target_dt)
+                fraction = (effective_end - effective_start).total_seconds() / 3600.0
+
+                net_kw = slot.expected_watts / 1000.0 - house_load_kw
+                if net_kw > 0:
+                    net_solar_kwh += net_kw * fraction
+
+            # How much must grid supply after solar contribution?
+            grid_kwh_needed = max(kwh_needed - net_solar_kwh, 0.0)
+
+            if grid_kwh_needed <= 0:
+                battery_power_w = getattr(power_state, "battery_power", None)
+                if battery_power_w is not None and battery_power_w > 50:
+                    return True  # Charging — trust the forecast
+                if battery_power_w is not None and battery_power_w <= 50:
+                    spare_hours = hours_remaining - (kwh_needed / max(grid_charge_kw, 0.1))
+                    if spare_hours > 0.5:
+                        return True
+                else:
+                    return True
+
+            grid_hours_needed = grid_kwh_needed / max(grid_charge_kw, 0.1)
+            latest_start_hours_from_now = hours_remaining - grid_hours_needed
+            buffer_hours = 10.0 / 60.0
+
+            if latest_start_hours_from_now > buffer_hours:
+                battery_power_w = getattr(power_state, "battery_power", None)
+                if battery_power_w is not None and battery_power_w > 0:
+                    realtime_hours = kwh_needed / (battery_power_w / 1000.0)
+                    # Only let a slow RT rate override the forecast when we are
+                    # genuinely close to the latest safe start (within 2h).
+                    # Earlier than that, trust Solcast — a transient high load
+                    # (hot water heater, pool) can make the rate look slow even
+                    # when afternoon solar will comfortably cover the shortfall.
+                    if (realtime_hours > hours_remaining * 1.5
+                            and latest_start_hours_from_now < 2.0):
+                        return False
+                elif battery_power_w is not None and battery_power_w <= 0:
+                    if latest_start_hours_from_now < 1.0:
+                        return False
+                return True
+
+            return False
+
+        battery_power_w = getattr(power_state, "battery_power", None)
+        if battery_power_w is None or battery_power_w <= 0:
+            return False
+        hours_to_fill = kwh_needed / (battery_power_w / 1000.0)
+        return hours_to_fill <= hours_remaining
+
+    async def _async_recover_runtime_today(
+        self, appliance_configs: list[ApplianceConfig]
+    ) -> None:
+        """Seed today's runtime from HA recorder history after a restart.
+
+        Queries the recorder for each appliance's switch entity state since
+        midnight and calculates total ON time. Injects the result into
+        self.appliance_states so that _get_appliance_states() picks it up
+        as the 'previous' state, preserving the runtime counter across
+        HA or integration restarts.
+
+        Silently no-ops if the recorder is unavailable or returns no data.
+        """
+        from homeassistant.util import dt as dt_util
+
+        try:
+            from homeassistant.components.recorder import get_instance
+            from homeassistant.components.recorder.history import get_significant_states
+        except ImportError:
+            _LOGGER.debug("Recorder not available — skipping runtime recovery")
+            return
+
+        now_local = dt_util.now()
+        start_of_day = dt_util.start_of_local_day(now_local)
+        entity_ids = [c.entity_id for c in appliance_configs]
+
+        try:
+            instance = get_instance(self.hass)
+            states_dict: dict = await instance.async_add_executor_job(
+                lambda: get_significant_states(
+                    self.hass,
+                    start_of_day,
+                    now_local,
+                    entity_ids,
+                    filters=None,
+                    include_start_time_state=True,
+                )
+            )
+        except Exception as err:
+            _LOGGER.warning("Runtime recovery: recorder query failed — %s", err)
+            return
+
+        for config in appliance_configs:
+            states = states_dict.get(config.entity_id, [])
+            if not states:
+                continue
+
+            runtime = timedelta()
+            prev_on = False
+            prev_time = start_of_day
+
+            for s in states:
+                t = s.last_changed
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=dt_util.UTC)
+                if prev_on:
+                    runtime += t - prev_time
+                prev_on = (s.state == "on")
+                prev_time = t
+
+            # Account for current ON state running up to now
+            if prev_on:
+                runtime += now_local - prev_time
+
+            if runtime.total_seconds() <= 0:
+                continue
+
+            # Pre-populate appliance_states so _get_appliance_states picks
+            # up the recovered runtime as 'previous.runtime_today'.
+            existing = self.appliance_states.get(config.id)
+            recovered = ApplianceState(
+                appliance_id=config.id,
+                is_on=existing.is_on if existing else False,
+                current_power=existing.current_power if existing else 0.0,
+                current_amperage=existing.current_amperage if existing else None,
+                runtime_today=runtime,
+                energy_today=existing.energy_today if existing else 0.0,
+                last_state_change=existing.last_state_change if existing else None,
+                ev_connected=existing.ev_connected if existing else None,
+                ev_soc=existing.ev_soc if existing else None,
+                activations_today=existing.activations_today if existing else 0,
+            )
+            self.appliance_states[config.id] = recovered
+            _LOGGER.info(
+                "Runtime recovery: %s — restored %.1f min from today's history",
+                config.name,
+                runtime.total_seconds() / 60,
+            )
+
     def _build_inverter_controller(self) -> InverterGridChargeController | None:
         """Construct the inverter controller from config_entry.data, or return None."""
         d = self.config_entry.data
@@ -505,7 +720,100 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         soc = getattr(power_state, "battery_soc", None) if power_state is not None else None
         soc_below_target = soc is None or soc < target_soc
 
-        auto_should_engage = auto_flag and cheap_now and soc_below_target
+        # Real-time solar sufficiency check: project whether the battery can
+        # reach target_soc by target_time at the current net charging rate.
+        # This replaces the stale Solcast-based plan flag, which can be
+        # optimistic on dull days when Solcast hasn't updated yet.
+        solar_covers_target = self._solar_can_fill_battery(
+            power_state=power_state,
+            current_soc=soc,
+            target_soc=target_soc,
+        )
+
+        # Before engaging grid charge, check whether shedding running appliances
+        # would free enough solar to fill the battery without grid import.
+        # If an appliance has already met its minimum runtime, actively flag it
+        # for a battery-priority shed rather than just suppressing grid charge.
+        # Skip this check if we're within 30 minutes of the latest safe start.
+        if not solar_covers_target and cheap_now and soc_below_target:
+            d = self.config_entry.data
+            capacity_kwh = d.get(CONF_BATTERY_CAPACITY)
+            target_time_str = d.get(CONF_BATTERY_TARGET_TIME)
+            grid_charge_kw = (d.get(CONF_BATTERY_GRID_CHARGE_POWER_W) or 3500) / 1000
+            try:
+                from datetime import datetime as _dt
+                import dataclasses as _dc
+                t = _dt.strptime(target_time_str, "%H:%M:%S").time()
+                now_local = _dt.now().astimezone()
+                target_dt = now_local.replace(hour=t.hour, minute=t.minute, second=0)
+                hrs_left = max((target_dt - now_local).total_seconds() / 3600, 0)
+                kwh_needed = max((target_soc - (soc or 0)) / 100 * (capacity_kwh or 0), 0)
+                grid_hrs = kwh_needed / max(grid_charge_kw, 0.1)
+                latest_start_hrs = hrs_left - grid_hrs
+
+                if latest_start_hrs > 0.5:
+                    # Build config lookup for min_daily_runtime checks
+                    cfg_by_id = {c.id: c for c in appliance_configs}
+                    running_kw = 0.0
+                    shed_candidates = []   # ids that have met minimum runtime
+                    non_shed_running = []  # ids still working toward minimum
+
+                    for aid, st in appliance_states.items():
+                        if not (st.is_on and (st.current_power or 0) > 500):
+                            continue
+                        kw = (st.current_power or 0) / 1000
+                        running_kw += kw
+                        cfg = cfg_by_id.get(aid)
+                        min_rt = cfg.min_daily_runtime if cfg else None
+                        if min_rt and st.runtime_today >= min_rt:
+                            shed_candidates.append((aid, kw))
+                        else:
+                            non_shed_running.append((aid, kw))
+
+                    if running_kw > 0:
+                        batt_w = getattr(power_state, "battery_power", None) or 0
+                        projected_charge_kw = (batt_w + running_kw * 1000) / 1000
+                        if projected_charge_kw > 0.1:
+                            rt_if_shed = kwh_needed / projected_charge_kw
+                            if rt_if_shed <= hrs_left:
+                                solar_covers_target = True
+
+                                if shed_candidates:
+                                    # Appliances that have met minimum runtime:
+                                    # flag them for battery-priority shed so the
+                                    # optimizer actively stops them this cycle.
+                                    for aid, _ in shed_candidates:
+                                        if aid in appliance_states:
+                                            appliance_states[aid] = _dc.replace(
+                                                appliance_states[aid],
+                                                battery_priority_shed=True,
+                                            )
+                                    _LOGGER.info(
+                                        "Battery priority shed requested for %s "
+                                        "(min runtime met): shedding would allow "
+                                        "solar to fill battery "
+                                        "(rt_if_shed=%.1fh, hrs_left=%.1fh)",
+                                        [a for a, _ in shed_candidates],
+                                        rt_if_shed, hrs_left,
+                                    )
+                                else:
+                                    _LOGGER.debug(
+                                        "Grid charge suppressed: shedding %.1fkW "
+                                        "would allow solar to fill battery — "
+                                        "appliances still working toward minimum "
+                                        "runtime, letting them continue "
+                                        "(rt_if_shed=%.1fh, hrs_left=%.1fh)",
+                                        running_kw, rt_if_shed, hrs_left,
+                                    )
+            except Exception:
+                pass  # Fallback: let original logic proceed
+
+        auto_should_engage = (
+            auto_flag
+            and cheap_now
+            and soc_below_target
+            and not solar_covers_target
+        )
         should_engage = self.force_charge or auto_should_engage
 
         force_off_edge = self._force_charge_prev and not self.force_charge
@@ -642,6 +950,13 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # works even during the startup grace period (M20)
         appliance_configs = self._get_appliance_configs()
         self._last_appliance_configs = appliance_configs
+
+        # On the first cycle after restart, recover today's accumulated runtime
+        # from HA recorder so the counter isn't incorrectly reset to zero mid-day.
+        if not self._startup_runtime_recovered:
+            await self._async_recover_runtime_today(appliance_configs)
+            self._startup_runtime_recovered = True
+
         appliance_states = self._get_appliance_states(appliance_configs)
 
         elapsed = (datetime.now() - self._startup_time).total_seconds()
@@ -957,6 +1272,12 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 excess_power = None
             else:
                 excess_power = grid_export - grid_import
+                # Hybrid inverter adjustment: add battery_power to get pv - load.
+                # HA GoodWe sensor convention: positive = charging (absorbing solar),
+                # negative = discharging. Adding a positive (charging) gives back
+                # the solar going into battery as available excess.
+                if has_battery and battery_power is not None:
+                    excess_power += battery_power
         elif has_battery and load_power is not None and load_power > 0:
             # Hybrid branch: requires pv_production; load_power is guaranteed
             # non-None by the predicate.
@@ -1343,6 +1664,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         battery_config = self._get_battery_config()
         battery_soc = _parse_sensor_float(self.hass, data.get(CONF_BATTERY_SOC))
         export_limit = data.get(CONF_EXPORT_LIMIT)
+        self._last_forecast_data = forecast_data  # Cache for _solar_can_fill_battery
 
         try:
             self.current_plan = self.planner.create_plan(
