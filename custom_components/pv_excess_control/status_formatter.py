@@ -8,7 +8,7 @@ and optional Plan, and returns a FormattedStatus containing:
   for switch cooldown, battery soft-limit, and plan deviation).
 - Structured attributes for a Lovelace card.
 
-See docs/specs/2026-04-06-status-sensor-enhancements-design.md.
+See docs/stabilization.md.
 """
 from __future__ import annotations
 

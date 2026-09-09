@@ -1,6 +1,7 @@
 """Data models for PV Excess Control. Pure Python - no HA dependencies."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
@@ -98,6 +99,8 @@ class ApplianceConfig:
 
     # Dynamic current step size (default 0.1A)
     current_step: float = 0.1
+    current_update_interval: float = 0.0  # Minimum seconds between automatic increases
+    current_min_change: float = 0.0  # Minimum automatic increase in amps
 
     # Max daily activations (None = unlimited)
     max_daily_activations: int | None = None
@@ -113,6 +116,12 @@ class ApplianceConfig:
     # the optimizer drives the appliance to this amperage instead of the conservative
     # min_current. Capped by max_grid_power and max_current.
     cheap_grid_target_current: float | None = None
+    enable_condition_entity: str | None = None
+    enable_condition_mode: str = "start_only"
+    start_delay: float = 0.0
+    phase_count_entity: str | None = None
+    remaining_runtime_entity: str | None = None
+    require_contiguous_runtime: bool = False
 
 
 @dataclass
@@ -128,6 +137,39 @@ class ApplianceState:
     ev_connected: bool | None  # None if not EV
     ev_soc: float | None = None  # EV state of charge percentage
     activations_today: int = 0
+    current_power_available: bool = True  # False when a configured power sensor is unavailable
+    seconds_since_current_change: float | None = None
+    enable_condition: bool | None = True
+    solar_start_elapsed: float = 0.0
+    remaining_runtime_minutes: float | None = None
+
+
+def runtime_demand_seconds(config: ApplianceConfig, state: ApplianceState) -> float | None:
+    """Remaining demand; an external sensor reports remaining minutes, not a daily total."""
+    if config.remaining_runtime_entity:
+        value = state.remaining_runtime_minutes
+        if value is None or not math.isfinite(value) or value < 0:
+            return None
+        demand = value * 60
+    elif config.min_daily_runtime is not None:
+        demand = max(0.0, (config.min_daily_runtime - state.runtime_today).total_seconds())
+    else:
+        return None
+    if config.max_daily_runtime is not None:
+        demand = min(demand, max(0.0, (config.max_daily_runtime - state.runtime_today).total_seconds()))
+    return demand
+
+
+def runtime_protected(config: ApplianceConfig, state: ApplianceState) -> bool:
+    """Whether an already running cycle has bounded runtime protection."""
+    demand = runtime_demand_seconds(config, state)
+    if config.remaining_runtime_entity:
+        # Unknown is not completion. The hard daily limit still bounds a cycle.
+        return (state.is_on and config.require_contiguous_runtime
+                and config.max_daily_runtime is not None
+                and state.runtime_today < config.max_daily_runtime
+                and (demand is None or demand > 0))
+    return demand is not None and demand > 0
 
 
 @dataclass(frozen=True)
@@ -174,6 +216,32 @@ class BatteryConfig:
     allow_grid_charging: bool
 
 
+@dataclass(frozen=True)
+class BatteryChargeSetpoint:
+    """One slot in the battery max-charge-power curve."""
+    start: datetime
+    end: datetime
+    max_charge_w: int
+
+
+@dataclass(frozen=True)
+class BatteryChargeCurve:
+    """24-hour charge-power plan produced by the planner.
+
+    Frozen — produced once per planner cycle and consumed by the
+    coordinator without mutation. The backfill step in the planner
+    constructs a new curve via ``dataclasses.replace`` rather than
+    mutating in place. ``fallback_reason`` is non-None when the
+    curve is degenerate (forecast/SoC unavailable, or already at
+    target SoC).
+    """
+    created_at: datetime
+    setpoints: tuple[BatteryChargeSetpoint, ...]
+    expected_curtailment_kwh: float
+    headroom_kwh: float
+    fallback_reason: str | None
+
+
 @dataclass
 class TimeSlot:
     """A planning time slot with expected conditions."""
@@ -212,6 +280,7 @@ class Plan:
     entries: list[PlanEntry]
     battery_target: BatteryTarget
     confidence: float  # 0.0-1.0
+    battery_charge_curve: BatteryChargeCurve | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +292,9 @@ class ControlDecision:
     reason: str
     overrides_plan: bool
     bypasses_cooldown: bool = False
+    uses_grid_supplement: bool = False
+    grid_supplement_watts: float = 0.0
+    solar_start_qualified: bool = False
 
 
 @dataclass(frozen=True)

@@ -9,13 +9,19 @@ Pure Python - no HA dependencies.
 from __future__ import annotations
 
 import logging
+import math
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .models import (
     Action,
     ApplianceConfig,
+    ApplianceState,
+    runtime_demand_seconds,
     BatteryAllocation,
+    BatteryChargeCurve,
+    BatteryChargeSetpoint,
     BatteryConfig,
     BatteryStrategy,
     BatteryTarget,
@@ -31,6 +37,15 @@ from .models import (
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _HourPlan:
+    """Internal planner intermediate — one forecast hour with its
+    residual curtailment after appliance absorption."""
+    start: datetime
+    end: datetime
+    net_curt: float
 
 
 class Planner:
@@ -458,6 +473,162 @@ class Planner:
             )
             entries.extend(app_entries)
 
+        return entries
+
+    def _schedule_runtime_appliance(
+        self, timeline: list[TimeSlot], remaining_excess: dict[int, float],
+        app: ApplianceConfig, cheap_threshold: float, now: datetime,
+        *, solar_only: bool = False, reason_override: PlanReason | None = None,
+        excluded_windows: list[TariffWindow] | None = None,
+        export_limit_w: float | None = None, must_continue: bool = False,
+    ) -> list[PlanEntry]:
+        """Schedule the remaining wall-clock demand with precise partial windows.
+
+        Runtime state was normalized once by create_plan. Continuous requests
+        select a whole adjacent block before allocating any budget.
+        """
+        seconds = app.min_daily_runtime.total_seconds() if app.min_daily_runtime is not None else 3600.0
+        if app.max_daily_runtime is not None:
+            seconds = min(seconds, app.max_daily_runtime.total_seconds())
+        if seconds <= 0:
+            return []
+        deadline = None
+        if app.schedule_deadline is not None:
+            deadline = datetime.combine(now.astimezone(self.tz).date(), app.schedule_deadline, tzinfo=self.tz)
+            if deadline <= now:
+                deadline += timedelta(days=1)
+            deadline = deadline.astimezone(timezone.utc)
+        threshold = app.cheap_price_threshold if app.cheap_price_threshold is not None else cheap_threshold
+        power = app.nominal_power
+        if app.dynamic_current:
+            power = max(app.min_current * self.grid_voltage * app.phases,
+                        min(power, app.max_current * self.grid_voltage * app.phases))
+        if power <= 0:
+            return []
+        slots = []
+        for idx, original in enumerate(timeline):
+            slot = replace(original, end=min(original.end, deadline)) if deadline else original
+            if slot.end <= slot.start:
+                continue
+            # Split at local operating-window boundaries, preserving overnight windows.
+            boundaries = {slot.start, slot.end}
+            day = slot.start.astimezone(self.tz).date() - timedelta(days=1)
+            last_day = slot.end.astimezone(self.tz).date()
+            while day <= last_day:
+                for bound in (app.start_after, app.end_before):
+                    if bound is not None:
+                        dt = datetime.combine(day, bound, tzinfo=self.tz).astimezone(timezone.utc)
+                        if slot.start < dt < slot.end:
+                            boundaries.add(dt)
+                day += timedelta(days=1)
+            points = sorted(boundaries)
+            for start, end in zip(points, points[1:]):
+                local_time = start.astimezone(self.tz).time()
+                if app.start_after is not None and app.end_before is not None:
+                    allowed = (app.start_after <= local_time < app.end_before if app.start_after < app.end_before
+                               else local_time >= app.start_after or local_time < app.end_before)
+                else:
+                    allowed = ((app.start_after is None or local_time >= app.start_after)
+                               and (app.end_before is None or local_time < app.end_before))
+                if not allowed:
+                    continue
+                if any(window.start < end and window.end > start for window in (excluded_windows or [])):
+                    continue
+                if export_limit_w is not None and original.expected_excess_watts <= export_limit_w:
+                    continue
+                span = (original.end - original.start).total_seconds()
+                solar_watts = remaining_excess.get(idx, 0) * 3600000 / span if span else 0
+                cheap = not solar_only and app.allow_grid_supplement and slot.price <= threshold
+                required = app.min_daily_runtime is not None and app.min_daily_runtime.total_seconds() > 0
+                slot_power = power
+                if app.dynamic_current:
+                    watts_per_amp = self.grid_voltage * max(app.phases, 1)
+                    step = max(app.current_step, 0.001)
+                    amps = math.floor((solar_watts / watts_per_amp + 1e-9) / step) * step
+                    amps = max(app.min_current, min(amps, app.max_current))
+                    if cheap and app.cheap_grid_target_current is not None:
+                        amps = max(amps, min(app.cheap_grid_target_current, app.max_current))
+                    if cheap and app.max_grid_power is not None:
+                        funded_amps = math.floor(((solar_watts + app.max_grid_power) / watts_per_amp + 1e-9) / step) * step
+                        if funded_amps < app.min_current:
+                            cheap = False
+                        else:
+                            amps = min(amps, funded_amps)
+                    # A minimum not aligned with the step needs the next valid step.
+                    amps = max(math.ceil((app.min_current - 1e-9) / step) * step,
+                               math.floor((amps + 1e-9) / step) * step)
+                    if amps > app.max_current + 1e-9:
+                        continue
+                    slot_power = amps * watts_per_amp
+                deficit = max(0.0, slot_power - solar_watts)
+                if cheap and app.max_grid_power is not None and deficit > app.max_grid_power + 1e-6:
+                    cheap = False
+                if deficit > 0 and (solar_only or (not cheap and not required)):
+                    continue
+                tier = 0 if deficit <= 0 else 1 if cheap else 2
+                slots.append((idx, replace(slot, start=start, end=end), tier, deficit, slot_power))
+        if app.require_contiguous_runtime:
+            candidates = []
+            for start in range(len(slots)):
+                if must_continue and slots[start][1].start != now.astimezone(timezone.utc):
+                    continue
+                need = seconds
+                selected = []
+                previous_end = None
+                score = 0.0
+                for item in slots[start:]:
+                    idx, slot, tier, deficit, slot_power = item
+                    if previous_end is not None and slot.start != previous_end:
+                        break
+                    take = min(need, (slot.end - slot.start).total_seconds())
+                    selected.append((idx, replace(slot, end=slot.start + timedelta(seconds=take)), tier, deficit, slot_power))
+                    score += (tier * 1000000 + deficit + slot.price) * take
+                    need -= take
+                    previous_end = slot.end
+                    if need <= 0:
+                        candidates.append((score, selected))
+                        break
+            if not candidates:
+                return []
+            slots = min(candidates, key=lambda candidate: candidate[0])[1]
+        else:
+            slots.sort(key=lambda item: (item[2], item[1].price, item[3], item[1].start))
+        entries = []
+        for idx, slot, tier, deficit, slot_power in slots:
+            if seconds <= 0:
+                break
+            take = min(seconds, (slot.end - slot.start).total_seconds())
+            end = slot.start + timedelta(seconds=take)
+            reason = PlanReason.EXCESS_AVAILABLE if tier == 0 else PlanReason.CHEAP_TARIFF if tier == 1 else PlanReason.DEADLINE
+            entries.append(PlanEntry(
+                appliance_id=app.id, action=Action.SET_CURRENT if app.dynamic_current else Action.ON,
+                target_current=slot_power / (self.grid_voltage * app.phases) if app.dynamic_current else None,
+                window=TariffWindow(slot.start, end, slot.price, slot.is_cheap),
+                reason=reason_override or reason, priority=app.priority,
+            ))
+            seconds -= take
+        # Preserve the actual time span of each allocation. Averaging a half-hour
+        # load over a whole hour would falsely make its first half available again.
+        residual_timeline = []
+        residual_excess = {}
+        for idx, slot in enumerate(timeline):
+            span = (slot.end - slot.start).total_seconds()
+            solar_watts = remaining_excess.get(idx, 0) * 3600000 / span if span else 0
+            bounds = {slot.start, slot.end}
+            for entry in entries:
+                if entry.window is not None:
+                    bounds.update(t for t in (entry.window.start, entry.window.end) if slot.start < t < slot.end)
+            points = sorted(bounds)
+            for start, end in zip(points, points[1:]):
+                drawn = sum((entry.target_current * self.grid_voltage * app.phases
+                             if entry.target_current is not None else app.nominal_power)
+                            for entry in entries if entry.window is not None
+                            and entry.window.start <= start < entry.window.end)
+                residual_excess[len(residual_timeline)] = max(0, solar_watts - drawn) * (end - start).total_seconds() / 3600000
+                residual_timeline.append(replace(slot, start=start, end=end))
+        timeline[:] = residual_timeline
+        remaining_excess.clear()
+        remaining_excess.update(residual_excess)
         return entries
 
     def _schedule_single_appliance(
@@ -1017,6 +1188,7 @@ class Planner:
 
     def create_plan(
         self,
+        *,
         forecast: ForecastData,
         tariff: TariffInfo,
         appliances: list[ApplianceConfig],
@@ -1024,6 +1196,11 @@ class Planner:
         current_soc: float | None,
         export_limit: float | None,
         base_load_watts: float = 500.0,
+        now: datetime | None = None,
+        dynamic_battery_charge_enabled: bool = False,
+        battery_max_charge_power_w: int = 0,
+        battery_trickle_charge_power_w: int = 100,
+        appliance_states: dict[str, ApplianceState] | None = None,
     ) -> Plan:
         """Create a complete plan for the next 24 hours.
 
@@ -1033,7 +1210,8 @@ class Planner:
         3. Schedule appliances (greedy, priority-ordered)
         4. Apply weather pre-planning
         5. Apply export limit management
-        6. Return Plan with entries, battery target, and confidence
+        6. Plan battery charge curve (if dynamic battery charge enabled)
+        7. Return Plan with entries, battery target, and confidence
 
         Args:
             forecast: Solar forecast data.
@@ -1043,14 +1221,47 @@ class Planner:
             current_soc: Current battery SoC (0-100), or None if no battery.
             export_limit: Feed-in limit in watts, or None.
             base_load_watts: Household base load in watts.
+            now: Current time (defaults to datetime.now(self.tz) if not provided).
+            dynamic_battery_charge_enabled: Enable dynamic battery charge curve.
+            battery_max_charge_power_w: Max battery charge power in watts.
+            battery_trickle_charge_power_w: Trickle charge power in watts.
 
         Returns:
             A complete Plan for the planning horizon.
         """
-        now = datetime.now(self.tz)
+        now = now if now is not None else datetime.now(self.tz)
 
         # 1. Build timeline
         timeline = self.build_timeline(forecast, tariff.windows, base_load_watts)
+        # Compare in UTC so DST folds and gaps retain their actual duration.
+        horizon_start = now.astimezone(timezone.utc)
+        horizon_end = horizon_start + timedelta(hours=24)
+        timeline = [replace(slot, start=max(slot.start.astimezone(timezone.utc), horizon_start),
+                            end=min(slot.end.astimezone(timezone.utc), horizon_end))
+                    for slot in timeline if slot.end.astimezone(timezone.utc) > horizon_start
+                    and slot.start.astimezone(timezone.utc) < horizon_end]
+        if appliance_states is not None:
+            normalized = []
+            for app in appliances:
+                state = appliance_states.get(app.id)
+                if state is None:
+                    continue
+                demand = runtime_demand_seconds(app, state)
+                if app.remaining_runtime_entity and (demand is None or demand <= 0):
+                    continue
+                if (app.enable_condition_entity and state.enable_condition is not True
+                        and not app.override_active
+                        and (not state.is_on or app.enable_condition_mode == "while_running")):
+                    continue
+                maximum = (max(0.0, (app.max_daily_runtime - state.runtime_today).total_seconds())
+                           if app.max_daily_runtime is not None else None)
+                if maximum == 0:
+                    continue
+                normalized.append(replace(app,
+                    min_daily_runtime=timedelta(seconds=demand) if demand is not None else None,
+                    max_daily_runtime=timedelta(seconds=maximum) if maximum is not None else None))
+            appliances = normalized
+
 
         # 2. Calculate battery strategy
         if battery_config is not None and current_soc is not None:
@@ -1081,26 +1292,90 @@ class Planner:
             )
 
         # 3. Schedule appliances
-        entries = self.schedule_appliances(
-            timeline, battery_allocation, appliances,
-            cheap_price_threshold=tariff.cheap_price_threshold,
-        )
+        if appliance_states is None:
+            entries = self.schedule_appliances(
+                timeline, battery_allocation, appliances,
+                cheap_price_threshold=tariff.cheap_price_threshold,
+            )
+        else:
+            entries = []
+            runtime_excess = dict(battery_allocation.excess_after_battery)
+            runtime_timeline = list(timeline)
+            for app in sorted(appliances, key=lambda app: app.priority):
+                entries.extend(self._schedule_runtime_appliance(
+                    runtime_timeline, runtime_excess, app, tariff.cheap_price_threshold, now,
+                    must_continue=app.require_contiguous_runtime and appliance_states[app.id].is_on,
+                ))
 
         # Rebuild remaining excess from battery allocation and subtract scheduled
         remaining_excess = dict(battery_allocation.excess_after_battery)
         self._deduct_scheduled_entries(entries, timeline, remaining_excess, appliances)
 
-        # 4. Apply weather pre-planning
-        entries = self.apply_weather_preplanning(
-            entries, timeline, remaining_excess, appliances, forecast
-        )
+        # 4/5. Weather/export extensions share the real residual timeline and
+        # exclude the appliance's occupied spans; live/continuous/capped demand
+        # never receives opportunistic extra runtime.
+        extensible = [a for a in appliances if not a.remaining_runtime_entity
+                      and not a.require_contiguous_runtime and a.max_daily_runtime is None]
+        if appliance_states is None:
+            entries = self.apply_weather_preplanning(
+                entries, timeline, remaining_excess, extensible, forecast,
+            )
+            entries = self.apply_export_limit(
+                entries, timeline, remaining_excess, extensible, export_limit, base_load_watts,
+            )
+        else:
+            ratio = (forecast.tomorrow_total_kwh / forecast.remaining_today_kwh
+                     if forecast.tomorrow_total_kwh is not None and forecast.remaining_today_kwh > 0 else 1)
+            for reason in (PlanReason.WEATHER_PREPLANNING, PlanReason.EXPORT_LIMIT):
+                for app in sorted(extensible, key=lambda app: app.priority):
+                    if reason == PlanReason.WEATHER_PREPLANNING:
+                        extra = ((app.min_daily_runtime.total_seconds() if app.min_daily_runtime else 0)
+                                 * max(0, 1 - 2 * ratio) * 0.5)
+                        if extra < 1800:
+                            continue
+                    else:
+                        if export_limit is None or export_limit <= 0:
+                            continue
+                        extra = 86400
+                    occupied = [entry.window for entry in entries
+                                if entry.appliance_id == app.id and entry.window is not None]
+                    entries.extend(self._schedule_runtime_appliance(
+                        runtime_timeline, runtime_excess,
+                        replace(app, min_daily_runtime=timedelta(seconds=extra)),
+                        tariff.cheap_price_threshold, now, solar_only=True,
+                        reason_override=reason, excluded_windows=occupied,
+                        export_limit_w=export_limit if reason == PlanReason.EXPORT_LIMIT else None,
+                    ))
 
-        # 5. Apply export limit management
-        entries = self.apply_export_limit(
-            entries, timeline, remaining_excess, appliances, export_limit, base_load_watts
-        )
+        # 6. Plan battery charge curve
+        absorption: list[tuple[datetime, datetime, float]] = []
+        battery_charge_curve = None
+        if dynamic_battery_charge_enabled and battery_config is not None:
+            for e in entries:
+                if e.reason != PlanReason.EXPORT_LIMIT or e.window is None:
+                    continue
+                appliance = next((a for a in appliances if a.id == e.appliance_id), None)
+                if appliance is None:
+                    continue
+                watts = (e.target_current * self.grid_voltage * max(appliance.phases, 1)
+                         if e.target_current is not None else appliance.nominal_power)
+                absorption.append((e.window.start, e.window.end, watts))
 
-        # 6. Calculate confidence and build plan
+            battery_charge_curve = self.plan_battery_charge_curve(
+                forecast=forecast,
+                now=now,
+                current_soc=current_soc,
+                battery_capacity_kwh=battery_config.capacity_kwh,
+                battery_max_charge_power_w=battery_max_charge_power_w,
+                battery_trickle_charge_power_w=battery_trickle_charge_power_w,
+                export_soft_ceiling_w=int(export_limit or 0),
+                target_soc=battery_config.target_soc,
+                target_time=battery_config.target_time,
+                base_load_watts=base_load_watts,
+                appliance_absorption_intervals=absorption,
+            )
+
+        # 7. Calculate confidence and build plan
         confidence = self._calculate_confidence(forecast, timeline, entries)
 
         # Calculate horizon
@@ -1117,6 +1392,7 @@ class Planner:
             entries=entries,
             battery_target=battery_target,
             confidence=confidence,
+            battery_charge_curve=battery_charge_curve,
         )
         _LOGGER.debug(
             "Planner: %d timeline slots, %d plan entries, confidence=%.1f%%",
@@ -1132,25 +1408,17 @@ class Planner:
         appliances: list[ApplianceConfig],
     ) -> None:
         """Deduct energy consumed by scheduled entries from remaining excess."""
-        # Build a lookup for appliance power
-        app_power: dict[str, float] = {a.id: a.nominal_power for a in appliances}
-
-        # Deduct scheduled entries, but only from slots that have solar excess.
-        # Grid-only slots (remaining_excess == 0) don't consume solar, so
-        # deducting from them would incorrectly drive remaining_excess negative
-        # (clamped to 0) and misrepresent available solar for later steps.
+        config_by_id = {a.id: a for a in appliances}
         for entry in entries:
-            if entry.window is None:
+            if entry.window is None or entry.appliance_id not in config_by_id:
                 continue
+            app = config_by_id[entry.appliance_id]
+            power = (entry.target_current * self.grid_voltage * app.phases
+                     if entry.target_current is not None else app.nominal_power)
             for i, slot in enumerate(timeline):
-                if slot.start == entry.window.start and slot.end == entry.window.end:
-                    current = remaining_excess.get(i, 0.0)
-                    if current > 0:
-                        duration_hours = (slot.end - slot.start).total_seconds() / 3600.0
-                        power = app_power.get(entry.appliance_id, 0.0)
-                        consumed_kwh = power / 1000.0 * duration_hours
-                        remaining_excess[i] = max(current - consumed_kwh, 0.0)
-                    break
+                overlap = (min(slot.end, entry.window.end) - max(slot.start, entry.window.start)).total_seconds()
+                if overlap > 0:
+                    remaining_excess[i] = max(remaining_excess.get(i, 0) - power * overlap / 3600000, 0)
 
     def _calculate_confidence(
         self,
@@ -1189,3 +1457,202 @@ class Planner:
             confidence -= forecast_dependency * 0.1
 
         return max(0.0, min(1.0, confidence))
+
+    # ------------------------------------------------------------------
+    # Battery charge curve generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_target_dt(now: datetime, target_time: time) -> datetime:
+        """Combine ``now``'s date with ``target_time``.
+
+        If the result is already in the past relative to *now*, roll it
+        forward by one day so the target is always in the future.
+        """
+        candidate = datetime.combine(now.date(), target_time, tzinfo=now.tzinfo)
+        if candidate <= now:
+            candidate = candidate + timedelta(days=1)
+        return candidate
+
+    def plan_battery_charge_curve(
+        self,
+        *,
+        forecast: ForecastData,
+        now: datetime,
+        current_soc: float | None,
+        battery_capacity_kwh: float,
+        battery_max_charge_power_w: int,
+        battery_trickle_charge_power_w: int,
+        export_soft_ceiling_w: int,
+        target_soc: float,
+        target_time: time,
+        base_load_watts: float,
+        appliance_absorption_per_slot: dict[datetime, float] | None = None,
+        appliance_absorption_intervals: list[tuple[datetime, datetime, float]] | None = None,
+    ) -> BatteryChargeCurve:
+        """Compute a 24h max-charge-power curve for the battery.
+
+        See docs/dynamic-battery-charging.md
+        section "Curve generation algorithm (planner)" for full rationale.
+
+        The algorithm defers morning charging when forecast curtailment can
+        fill the battery by the target time, emitting ``trickle_w`` outside
+        curtailment slots and the full ``battery_max_charge_power_w`` inside
+        them.  A sanity backfill step ensures the projected integral at
+        ``target_dt`` is always ≥ ``target_kwh``.
+        """
+        appliance_absorption_per_slot = appliance_absorption_per_slot or {}
+        absorption = [(start.astimezone(timezone.utc), end.astimezone(timezone.utc), watts)
+                      for start, end, watts in (appliance_absorption_intervals or [])]
+        horizon_start = now.astimezone(timezone.utc)
+        horizon_end = horizon_start + timedelta(hours=24)
+        forecast_intervals = sorted(
+            [(hf, max(hf.start.astimezone(timezone.utc), horizon_start),
+              min(hf.end.astimezone(timezone.utc), horizon_end))
+             for hf in forecast.hourly_breakdown
+             if hf.end.astimezone(timezone.utc) > horizon_start
+             and hf.start.astimezone(timezone.utc) < horizon_end],
+            key=lambda item: item[1],
+        )
+
+        # Fallback: empty or fully expired forecast.
+        if not forecast_intervals:
+            end = now + timedelta(hours=24)
+            return BatteryChargeCurve(
+                created_at=now,
+                setpoints=(BatteryChargeSetpoint(now, end, battery_max_charge_power_w),),
+                expected_curtailment_kwh=0.0,
+                headroom_kwh=0.0,
+                fallback_reason="forecast_unavailable",
+            )
+
+        # Fallback: SoC unavailable.
+        if current_soc is None:
+            end = now + timedelta(hours=24)
+            return BatteryChargeCurve(
+                created_at=now,
+                setpoints=(BatteryChargeSetpoint(now, end, battery_max_charge_power_w),),
+                expected_curtailment_kwh=0.0,
+                headroom_kwh=0.0,
+                fallback_reason="soc_unavailable",
+            )
+
+        target_kwh = max(0.0, (target_soc - current_soc) * battery_capacity_kwh / 100.0)
+
+        # Already at / above target.
+        if target_kwh <= 0.0:
+            setpoints = tuple(
+                BatteryChargeSetpoint(start, end, battery_trickle_charge_power_w)
+                for _, start, end in forecast_intervals
+            )
+            return BatteryChargeCurve(
+                created_at=now,
+                setpoints=setpoints,
+                expected_curtailment_kwh=0.0,
+                headroom_kwh=0.0,
+                fallback_reason="already_at_target",
+            )
+
+        target_dt = self._resolve_target_dt(now, target_time)
+
+        # Build per-hour residual curtailment view.
+        # net_curt = max(0, excess_w - export_soft_ceiling_w - appliance_absorption)
+        hours: list[_HourPlan] = []
+        for hf, start, end in forecast_intervals:
+            excess_w = hf.expected_watts - base_load_watts
+            gross_curt = max(0.0, excess_w - export_soft_ceiling_w)
+            legacy_absorbed = float(appliance_absorption_per_slot.get(hf.start, 0.0))
+            bounds = {start, end}
+            for app_start, app_end, _ in absorption:
+                bounds.update(bound for bound in (app_start, app_end) if start < bound < end)
+            points = sorted(bounds)
+            for left, right in zip(points, points[1:]):
+                absorbed = legacy_absorbed + sum(
+                    watts for app_start, app_end, watts in absorption
+                    if app_start <= left < app_end
+                )
+                net_curt = max(0.0, gross_curt - absorbed)
+                hours.append(_HourPlan(left, right, net_curt))
+
+        curtailment_kwh = sum(
+            h.net_curt * (h.end - h.start).total_seconds() / 3600.0
+            for h in hours
+        ) / 1000.0
+
+        # Deferrable iff total curtailment covers target AND at least one
+        # curtailment slot falls at or before target_dt.
+        deferrable = curtailment_kwh >= target_kwh and any(
+            h.start <= target_dt and h.net_curt > 0 for h in hours
+        )
+
+        setpoints_list: list[BatteryChargeSetpoint] = []
+        accumulated_kwh = 0.0
+        for h in hours:
+            if h.net_curt > 0:
+                w = min(int(h.net_curt), battery_max_charge_power_w)
+            elif accumulated_kwh < target_kwh:
+                w = battery_trickle_charge_power_w if deferrable else battery_max_charge_power_w
+            else:
+                w = battery_trickle_charge_power_w
+            setpoints_list.append(BatteryChargeSetpoint(h.start, h.end, w))
+            accumulated_kwh += w * (h.end - h.start).total_seconds() / 3600.0 / 1000.0
+
+        # Sanity guard: if deferrable but projected energy by target_dt is
+        # insufficient, backfill the latest pre-target trickle slots to max.
+        if deferrable:
+            projected = self._projected_kwh_by(target_dt, setpoints_list)
+            if projected < target_kwh:
+                setpoints_list = self._backfill_trickles(
+                    setpoints_list, target_dt, target_kwh, battery_max_charge_power_w
+                )
+
+        return BatteryChargeCurve(
+            created_at=now,
+            setpoints=tuple(setpoints_list),
+            expected_curtailment_kwh=curtailment_kwh,
+            headroom_kwh=target_kwh,
+            fallback_reason=None,
+        )
+
+    @staticmethod
+    def _projected_kwh_by(
+        target_dt: datetime,
+        setpoints: list[BatteryChargeSetpoint],
+    ) -> float:
+        """Integrate setpoints up to (but not including) ``target_dt``."""
+        total = 0.0
+        for sp in setpoints:
+            if sp.start >= target_dt:
+                break
+            end = min(sp.end, target_dt)
+            hours = (end - sp.start).total_seconds() / 3600.0
+            if hours <= 0:
+                continue
+            total += sp.max_charge_w * hours / 1000.0
+        return total
+
+    @staticmethod
+    def _backfill_trickles(
+        setpoints: list[BatteryChargeSetpoint],
+        target_dt: datetime,
+        target_kwh: float,
+        max_w: int,
+    ) -> list[BatteryChargeSetpoint]:
+        """Promote trickle slots before ``target_dt`` to ``max_w`` until the
+        projected integral meets ``target_kwh``.
+
+        Walks candidate slots in reverse (latest first) so we backfill the
+        minimum number of slots.  Returns a **new** list — the input is never
+        mutated.
+        """
+        out = list(setpoints)
+        candidates = [
+            i for i, sp in enumerate(out)
+            if sp.end <= target_dt and sp.max_charge_w < max_w
+        ]
+        candidates.reverse()
+        for i in candidates:
+            out[i] = BatteryChargeSetpoint(out[i].start, out[i].end, max_w)
+            if Planner._projected_kwh_by(target_dt, out) >= target_kwh:
+                break
+        return out

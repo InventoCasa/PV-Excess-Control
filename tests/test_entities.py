@@ -36,6 +36,7 @@ def _make_coordinator(
 ) -> MagicMock:
     """Return a mock PvExcessCoordinator."""
     coord = MagicMock()
+    coord.async_stop_appliance = AsyncMock()
     coord.config_entry = MagicMock()
     coord.config_entry.entry_id = "test_entry_id"
 
@@ -326,7 +327,7 @@ class TestNumberEntities:
 
         coord = _make_coordinator()
         num = AppliancePriorityNumber(coord, "app_1", "Washing Machine")
-        assert num.name == "Washing Machine Priority"
+        assert num.name == "Priority"
 
     def test_min_daily_runtime_resolution_prefers_runtime_dict(self):
         """When runtime dict has an override, it wins over sub_data."""
@@ -461,7 +462,7 @@ class TestNumberEntities:
 
         coord = _make_coordinator()
         num = ApplianceMinDailyRuntimeNumber(coord, "app_1", "Pool Pump")
-        assert num.name == "Pool Pump Min Daily Runtime"
+        assert num.name == "Min Daily Runtime"
 
     def test_min_daily_runtime_number_icon(self):
         """ApplianceMinDailyRuntimeNumber uses the timer-sand icon."""
@@ -522,11 +523,11 @@ class TestNumberEntities:
         num = ApplianceMinDailyRuntimeNumber(coord, "app_1", "Pool Pump")
         num.async_write_ha_state = MagicMock()
         num.hass = MagicMock()
-        num.hass.config_entries.async_update_subentry = AsyncMock()
+        num.hass.config_entries.async_update_subentry = MagicMock()
 
         await num.async_set_native_value(45.0)
 
-        num.hass.config_entries.async_update_subentry.assert_awaited_once()
+        num.hass.config_entries.async_update_subentry.assert_called_once()
         _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
         assert call_kwargs["data"]["min_daily_runtime"] == 45
 
@@ -544,11 +545,11 @@ class TestNumberEntities:
         num = ApplianceMinDailyRuntimeNumber(coord, "app_1", "Pool Pump")
         num.async_write_ha_state = MagicMock()
         num.hass = MagicMock()
-        num.hass.config_entries.async_update_subentry = AsyncMock()
+        num.hass.config_entries.async_update_subentry = MagicMock()
 
         await num.async_set_native_value(0.0)
 
-        num.hass.config_entries.async_update_subentry.assert_awaited_once()
+        num.hass.config_entries.async_update_subentry.assert_called_once()
         _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
         assert "min_daily_runtime" not in call_kwargs["data"]
 
@@ -607,7 +608,7 @@ class TestNumberEntities:
 
         coord = _make_coordinator()
         num = ApplianceMaxDailyRuntimeNumber(coord, "app_1", "Pool Pump")
-        assert num.name == "Pool Pump Max Daily Runtime"
+        assert num.name == "Max Daily Runtime"
 
     def test_max_daily_runtime_number_icon(self):
         """ApplianceMaxDailyRuntimeNumber uses the timer-alert icon (not the min one)."""
@@ -665,11 +666,11 @@ class TestNumberEntities:
         num = ApplianceMaxDailyRuntimeNumber(coord, "app_1", "Pool Pump")
         num.async_write_ha_state = MagicMock()
         num.hass = MagicMock()
-        num.hass.config_entries.async_update_subentry = AsyncMock()
+        num.hass.config_entries.async_update_subentry = MagicMock()
 
         await num.async_set_native_value(240.0)
 
-        num.hass.config_entries.async_update_subentry.assert_awaited_once()
+        num.hass.config_entries.async_update_subentry.assert_called_once()
         _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
         assert call_kwargs["data"]["max_daily_runtime"] == 240
 
@@ -686,11 +687,11 @@ class TestNumberEntities:
         num = ApplianceMaxDailyRuntimeNumber(coord, "app_1", "Pool Pump")
         num.async_write_ha_state = MagicMock()
         num.hass = MagicMock()
-        num.hass.config_entries.async_update_subentry = AsyncMock()
+        num.hass.config_entries.async_update_subentry = MagicMock()
 
         await num.async_set_native_value(0.0)
 
-        num.hass.config_entries.async_update_subentry.assert_awaited_once()
+        num.hass.config_entries.async_update_subentry.assert_called_once()
         _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
         assert "max_daily_runtime" not in call_kwargs["data"]
 
@@ -862,15 +863,15 @@ class TestNumberEntities:
 
         # Simulate HA mutating subentry.data in place after each persist so
         # the second persist reads the lowered min, mirroring real behaviour.
-        async def _fake_update(entry, sub, *, data):
+        def _fake_update(entry, sub, *, data):
             sub.data = data
 
-        num.hass.config_entries.async_update_subentry = AsyncMock(side_effect=_fake_update)
+        num.hass.config_entries.async_update_subentry = MagicMock(side_effect=_fake_update)
 
         await num.async_set_native_value(60.0)
 
         # Called twice: once for min sibling, once for max self
-        assert num.hass.config_entries.async_update_subentry.await_count == 2
+        assert num.hass.config_entries.async_update_subentry.call_count == 2
         # The two calls, in order: min first, then max
         min_call_kwargs = num.hass.config_entries.async_update_subentry.call_args_list[0].kwargs
         max_call_kwargs = num.hass.config_entries.async_update_subentry.call_args_list[1].kwargs
@@ -881,9 +882,10 @@ class TestNumberEntities:
         assert max_call_kwargs["data"]["max_daily_runtime"] == 60
 
     @pytest.mark.asyncio
-    async def test_async_setup_entry_adds_three_entities_per_subentry(self):
-        """async_setup_entry adds priority, min, and max entities for each subentry."""
+    async def test_async_setup_entry_adds_global_and_appliance_numbers(self):
+        """async_setup_entry adds priority, min, max, and cheap-threshold entities for each subentry."""
         from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
             ApplianceMaxDailyRuntimeNumber,
             ApplianceMinDailyRuntimeNumber,
             AppliancePriorityNumber,
@@ -891,7 +893,7 @@ class TestNumberEntities:
         )
 
         added: list = []
-        def _add(entities, update_before_add=False):
+        def _add(entities, update_before_add=False, config_subentry_id=None):
             added.extend(entities)
 
         hass = MagicMock()
@@ -910,7 +912,98 @@ class TestNumberEntities:
         assert AppliancePriorityNumber in classes
         assert ApplianceMinDailyRuntimeNumber in classes
         assert ApplianceMaxDailyRuntimeNumber in classes
-        assert len(added) == 3
+        assert ApplianceCheapPriceThresholdNumber in classes
+        assert len(added) == 6
+
+    # ----- ApplianceCheapPriceThresholdNumber -----
+
+    def test_cheap_price_threshold_number_range(self):
+        """ApplianceCheapPriceThresholdNumber has range -1.0 to 1.0 step 0.001."""
+        from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
+        )
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"cheap_price_threshold": 0.10}
+        coord.config_entry.subentries = {}
+        num = ApplianceCheapPriceThresholdNumber(coord, "app_1", "Kona")
+        assert num.native_min_value == -1000.0
+        assert num.native_max_value == 1000.0
+        assert num.native_step == 0.001
+
+    def test_cheap_price_threshold_falls_back_to_global_when_unset(self):
+        """native_value returns global threshold when subentry has no override."""
+        from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
+        )
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"cheap_price_threshold": 0.15}
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Kona"}  # no override
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceCheapPriceThresholdNumber(coord, "app_1", "Kona")
+        assert num.native_value == 0.15
+
+    def test_cheap_price_threshold_returns_per_appliance_override(self):
+        """native_value returns the per-appliance override when set on the subentry."""
+        from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
+        )
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"cheap_price_threshold": 0.15}
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Kona", "cheap_price_threshold": 0.05}
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceCheapPriceThresholdNumber(coord, "app_1", "Kona")
+        assert num.native_value == 0.05
+
+    def test_cheap_price_threshold_unique_id(self):
+        from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
+        )
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {}
+        coord.config_entry.subentries = {}
+        num = ApplianceCheapPriceThresholdNumber(coord, "app_1", "Kona")
+        assert num.unique_id == "test_entry_id_app_1_cheap_price_threshold"
+
+    def test_cheap_price_threshold_name(self):
+        from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
+        )
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {}
+        coord.config_entry.subentries = {}
+        num = ApplianceCheapPriceThresholdNumber(coord, "app_1", "Kona")
+        assert num.name == "Cheap Price Threshold"
+
+    @pytest.mark.asyncio
+    async def test_set_cheap_price_threshold_persists_to_subentry(self):
+        """Setting a value calls async_update_subentry with cheap_price_threshold set."""
+        from custom_components.pv_excess_control.number import (
+            ApplianceCheapPriceThresholdNumber,
+        )
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"cheap_price_threshold": 0.15}
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Kona"}
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceCheapPriceThresholdNumber(coord, "app_1", "Kona")
+        num.async_write_ha_state = MagicMock()
+        num.hass = MagicMock()
+        num.hass.config_entries.async_update_subentry = MagicMock()
+
+        await num.async_set_native_value(0.05)
+
+        num.hass.config_entries.async_update_subentry.assert_called_once()
+        _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
+        assert call_kwargs["data"]["cheap_price_threshold"] == 0.05
+        num.async_write_ha_state.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1075,3 +1168,74 @@ class TestSelectEntities:
         coord = _make_coordinator()
         sel = BatteryStrategySelect(coord)
         assert sel.name == "Battery Strategy"
+
+    # ----- PlanInfluenceSelect -----
+
+    def test_plan_influence_options(self):
+        """PlanInfluenceSelect has the three documented options."""
+        from custom_components.pv_excess_control.const import PlanInfluence
+        from custom_components.pv_excess_control.select import PlanInfluenceSelect
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"plan_influence": PlanInfluence.LIGHT}
+        sel = PlanInfluenceSelect(coord)
+        assert len(sel.options) == 3
+        assert PlanInfluence.NONE in sel.options
+        assert PlanInfluence.LIGHT in sel.options
+        assert PlanInfluence.PLAN_FOLLOWS in sel.options
+
+    def test_plan_influence_current_option_reads_entry_data(self):
+        """current_option reflects config_entry.data[plan_influence]."""
+        from custom_components.pv_excess_control.const import PlanInfluence
+        from custom_components.pv_excess_control.select import PlanInfluenceSelect
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"plan_influence": PlanInfluence.PLAN_FOLLOWS}
+        sel = PlanInfluenceSelect(coord)
+        assert sel.current_option == PlanInfluence.PLAN_FOLLOWS
+
+    def test_plan_influence_defaults_to_light_when_unset(self):
+        """current_option falls back to LIGHT when entry.data has no value."""
+        from custom_components.pv_excess_control.const import PlanInfluence
+        from custom_components.pv_excess_control.select import PlanInfluenceSelect
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {}
+        sel = PlanInfluenceSelect(coord)
+        assert sel.current_option == PlanInfluence.LIGHT
+
+    @pytest.mark.asyncio
+    async def test_plan_influence_select_persists_to_entry_data(self):
+        """Selecting an option calls async_update_entry with plan_influence set."""
+        from custom_components.pv_excess_control.const import PlanInfluence
+        from custom_components.pv_excess_control.select import PlanInfluenceSelect
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {"plan_influence": PlanInfluence.LIGHT}
+        sel = PlanInfluenceSelect(coord)
+        sel.async_write_ha_state = MagicMock()
+        sel.hass = MagicMock()
+        sel.hass.config_entries.async_update_entry = MagicMock()
+
+        await sel.async_select_option(PlanInfluence.PLAN_FOLLOWS)
+
+        sel.hass.config_entries.async_update_entry.assert_called_once()
+        _, call_kwargs = sel.hass.config_entries.async_update_entry.call_args
+        assert call_kwargs["data"]["plan_influence"] == PlanInfluence.PLAN_FOLLOWS
+        sel.async_write_ha_state.assert_called_once()
+
+    def test_plan_influence_unique_id(self):
+        from custom_components.pv_excess_control.select import PlanInfluenceSelect
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {}
+        sel = PlanInfluenceSelect(coord)
+        assert sel.unique_id == "test_entry_id_plan_influence"
+
+    def test_plan_influence_name(self):
+        from custom_components.pv_excess_control.select import PlanInfluenceSelect
+
+        coord = _make_coordinator()
+        coord.config_entry.data = {}
+        sel = PlanInfluenceSelect(coord)
+        assert sel.name == "Plan Influence"

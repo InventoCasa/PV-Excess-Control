@@ -27,22 +27,22 @@ class TestGenericForecastProvider:
         assert data.remaining_today_kwh == 12.5
         assert data.hourly_breakdown == []
 
-    def test_unavailable_returns_zero(self):
+    def test_unavailable_raises_unavailable(self):
         provider = GenericForecastProvider("sensor.solar_forecast")
         states = {"sensor.solar_forecast": {"state": "unavailable", "attributes": {}}}
-        data = provider.get_forecast(states)
-        assert data.remaining_today_kwh == 0.0
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast(states)
 
-    def test_missing_sensor_returns_zero(self):
+    def test_missing_sensor_raises_unavailable(self):
         provider = GenericForecastProvider("sensor.solar_forecast")
-        data = provider.get_forecast({})
-        assert data.remaining_today_kwh == 0.0
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast({})
 
-    def test_unknown_state_returns_zero(self):
+    def test_unknown_state_raises_unavailable(self):
         provider = GenericForecastProvider("sensor.solar_forecast")
         states = {"sensor.solar_forecast": {"state": "unknown", "attributes": {}}}
-        data = provider.get_forecast(states)
-        assert data.remaining_today_kwh == 0.0
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast(states)
 
     def test_zero_value(self):
         provider = GenericForecastProvider("sensor.solar_forecast")
@@ -100,8 +100,8 @@ class TestSolcastProvider:
         assert len(data.hourly_breakdown) >= 1
         assert data.tomorrow_total_kwh == 18.5
 
-    def test_two_half_hour_slots_combine_into_one_hour(self):
-        """Two 30-min Solcast slots for the same hour merge into one HourlyForecast."""
+    def test_two_half_hour_slots_preserve_intervals(self):
+        """Half-hour forecasts preserve their exact coverage."""
         provider = SolcastProvider("sensor.solcast_remaining")
         now = datetime(2026, 3, 22, 10, 0, 0, tzinfo=timezone.utc)
         states = {
@@ -117,11 +117,11 @@ class TestSolcastProvider:
             },
         }
         data = provider.get_forecast(states)
-        # Both slots are in hour 10 -> one HourlyForecast
-        assert len(data.hourly_breakdown) == 1
+        # Both half-hour intervals remain independently usable.
+        assert len(data.hourly_breakdown) == 2
         hf = data.hourly_breakdown[0]
         # Each 30-min slot at 2 kW (average) contributes 1 kWh -> total 2 kWh
-        assert pytest.approx(hf.expected_kwh) == 2.0 * 0.5 + 2.0 * 0.5  # 2 kWh
+        assert sum(h.expected_kwh for h in data.hourly_breakdown) == 2.0
         assert isinstance(hf, HourlyForecast)
 
     def test_no_forecasts_attribute_returns_empty_breakdown(self):
@@ -136,17 +136,16 @@ class TestSolcastProvider:
         assert data.remaining_today_kwh == 5.0
         assert data.hourly_breakdown == []
 
-    def test_unavailable_returns_zero(self):
+    def test_unavailable_raises_unavailable(self):
         provider = SolcastProvider("sensor.solcast_remaining")
         states = {"sensor.solcast_remaining": {"state": "unavailable", "attributes": {}}}
-        data = provider.get_forecast(states)
-        assert data.remaining_today_kwh == 0.0
-        assert data.hourly_breakdown == []
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast(states)
 
-    def test_missing_sensor_returns_zero(self):
+    def test_missing_sensor_raises_unavailable(self):
         provider = SolcastProvider("sensor.solcast_remaining")
-        data = provider.get_forecast({})
-        assert data.remaining_today_kwh == 0.0
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast({})
 
     def test_forecast_tomorrow_absent_gives_none(self):
         provider = SolcastProvider("sensor.solcast_remaining")
@@ -175,11 +174,11 @@ class TestSolcastProvider:
             },
         }
         data = provider.get_forecast(states)
-        assert len(data.hourly_breakdown) == 1
+        assert len(data.hourly_breakdown) == 2
         hf = data.hourly_breakdown[0]
-        # start is the beginning of the hour, end is start + 1h
+        # Each interval keeps its actual half-hour duration
         assert hf.start.hour == 14
-        assert hf.end.hour == 15
+        assert hf.end.hour == 14 and hf.end.minute == 30
         # expected_watts is average kW * 1000
         assert pytest.approx(hf.expected_watts) == 3000.0
 
@@ -212,11 +211,11 @@ class TestSolcastProvider:
         }
         data = provider.get_forecast(states)
         assert data.remaining_today_kwh == 30.0
-        assert len(data.hourly_breakdown) == 2
+        assert len(data.hourly_breakdown) == 4
         # Hour 10: avg 2.5kW, each 30-min slot contributes kW*0.5
-        assert pytest.approx(data.hourly_breakdown[0].expected_kwh) == 2.0 * 0.5 + 3.0 * 0.5
+        assert pytest.approx(sum(h.expected_kwh for h in data.hourly_breakdown[:2])) == 2.0 * 0.5 + 3.0 * 0.5
         # Hour 11: avg 4.5kW
-        assert pytest.approx(data.hourly_breakdown[1].expected_kwh) == 4.0 * 0.5 + 5.0 * 0.5
+        assert pytest.approx(sum(h.expected_kwh for h in data.hourly_breakdown[2:])) == 4.0 * 0.5 + 5.0 * 0.5
 
     def test_detailedForecast_attribute_used(self):
         """Solcast HACS integration uses 'detailedForecast' not 'forecasts'."""
@@ -234,7 +233,7 @@ class TestSolcastProvider:
             },
         }
         data = provider.get_forecast(states)
-        assert len(data.hourly_breakdown) == 1
+        assert len(data.hourly_breakdown) == 2
         assert data.hourly_breakdown[0].expected_watts == 3000.0
 
     def test_detailedHourly_attribute_fallback(self):
@@ -330,16 +329,16 @@ class TestForecastSolarProvider:
         assert data.remaining_today_kwh == 5.0
         assert data.hourly_breakdown == []
 
-    def test_unavailable_returns_zero(self):
+    def test_unavailable_raises_unavailable(self):
         provider = ForecastSolarProvider("sensor.forecast_solar")
         states = {"sensor.forecast_solar": {"state": "unavailable", "attributes": {}}}
-        data = provider.get_forecast(states)
-        assert data.remaining_today_kwh == 0.0
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast(states)
 
-    def test_missing_sensor_returns_zero(self):
+    def test_missing_sensor_raises_unavailable(self):
         provider = ForecastSolarProvider("sensor.forecast_solar")
-        data = provider.get_forecast({})
-        assert data.remaining_today_kwh == 0.0
+        with pytest.raises(ValueError, match="Forecast unavailable"):
+            provider.get_forecast({})
 
     def test_tomorrow_total_kwh_is_none(self):
         """ForecastSolarProvider does not provide tomorrow total."""

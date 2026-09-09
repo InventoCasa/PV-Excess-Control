@@ -11,8 +11,9 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_APPLIANCE_NAME, CONF_BATTERY_GRID_CHARGE_POWER_W, DOMAIN, MANUFACTURER
+from .const import CONF_APPLIANCE_NAME, CONF_BATTERY_GRID_CHARGE_POWER_W, DOMAIN
 from .coordinator import PvExcessCoordinator
+from .entity_lifecycle import add_entities_by_subentry, device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,8 +37,10 @@ async def async_setup_entry(
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
         entities.append(ApplianceEnabledSwitch(coordinator, subentry_id, appliance_name))
         entities.append(ApplianceOverrideSwitch(coordinator, subentry_id, appliance_name))
+        entities.append(AppliancePausedSwitch(coordinator, subentry_id, appliance_name))
+        entities.append(ApplianceGridSupplementSwitch(coordinator, subentry_id, appliance_name))
 
-    async_add_entities(entities)
+    add_entities_by_subentry(async_add_entities, entities)
 
 
 class _PvExcessSwitchBase(CoordinatorEntity[PvExcessCoordinator], SwitchEntity):
@@ -50,17 +53,18 @@ class _PvExcessSwitchBase(CoordinatorEntity[PvExcessCoordinator], SwitchEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.config_entry.entry_id)},
-            name="PV Excess Control",
-            manufacturer=MANUFACTURER,
+        return device_info(
+            self.coordinator.config_entry,
+            getattr(self, "_appliance_id", None),
+            getattr(self, "_appliance_name", None),
         )
 
-    def _persist(self, key: str, value) -> None:
+    def _persist(self, key: str, value, **updates) -> None:
         """Persist state to config_entry.data so it survives restarts."""
         try:
             new_data = dict(self.coordinator.config_entry.data)
             new_data[key] = value
+            new_data.update(updates)
             self.hass.config_entries.async_update_entry(
                 self.coordinator.config_entry, data=new_data
             )
@@ -151,7 +155,7 @@ class ApplianceEnabledSwitch(_PvExcessSwitchBase):
         super().__init__(coordinator)
         self._appliance_id = appliance_id
         self._appliance_name = appliance_name
-        self._attr_name = f"{appliance_name} Enabled"
+        self._attr_name = "Enabled"
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_enabled"
         )
@@ -166,27 +170,21 @@ class ApplianceEnabledSwitch(_PvExcessSwitchBase):
             aid for aid, enabled in self.coordinator.appliance_enabled.items()
             if not enabled
         ]
-        self._persist("disabled_appliances", disabled)
+        self._persist("disabled_appliances", disabled, overridden_appliances=[
+            aid for aid, overridden in self.coordinator.appliance_overrides.items() if overridden
+        ])
 
     async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.cancel_pending_stop(self._appliance_id)
         self.coordinator.appliance_enabled[self._appliance_id] = True
         self._persist_disabled_list()
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.appliance_enabled[self._appliance_id] = False
+        self.coordinator.appliance_overrides[self._appliance_id] = False
         self._persist_disabled_list()
-        # Turn off the physical appliance when disabled
-        config = self.coordinator._get_appliance_config_by_id(self._appliance_id)
-        if config and config.entity_id:
-            entity_id = config.entity_id
-            domain = entity_id.split(".")[0] if "." in entity_id else "switch"
-            try:
-                await self.hass.services.async_call(
-                    domain, "turn_off", {"entity_id": entity_id}, blocking=True,
-                )
-            except Exception:
-                pass  # Best effort
+        await self.coordinator.async_stop_appliance(self._appliance_id)
         self.async_write_ha_state()
 
 
@@ -204,7 +202,7 @@ class ApplianceOverrideSwitch(_PvExcessSwitchBase):
         super().__init__(coordinator)
         self._appliance_id = appliance_id
         self._appliance_name = appliance_name
-        self._attr_name = f"{appliance_name} Override"
+        self._attr_name = "Override"
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_override"
         )
@@ -222,6 +220,7 @@ class ApplianceOverrideSwitch(_PvExcessSwitchBase):
         self._persist("overridden_appliances", overridden)
 
     async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.cancel_pending_stop(self._appliance_id)
         self.coordinator.appliance_overrides[self._appliance_id] = True
         self._persist_overridden_list()
         self.async_write_ha_state()
@@ -229,4 +228,71 @@ class ApplianceOverrideSwitch(_PvExcessSwitchBase):
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.appliance_overrides[self._appliance_id] = False
         self._persist_overridden_list()
+        if not self.coordinator.appliance_enabled.get(self._appliance_id, True):
+            await self.coordinator.async_stop_appliance(self._appliance_id)
         self.async_write_ha_state()
+
+
+class AppliancePausedSwitch(_PvExcessSwitchBase):
+    """Suspend automatic control without changing the physical appliance."""
+
+    _attr_icon = "mdi:pause-circle-outline"
+    _attr_translation_key = "appliance_paused"
+
+    def __init__(self, coordinator, appliance_id: str, appliance_name: str) -> None:
+        super().__init__(coordinator)
+        self._appliance_id = appliance_id
+        self._appliance_name = appliance_name
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_{appliance_id}_paused"
+
+    @property
+    def is_on(self) -> bool:
+        return getattr(self.coordinator, "appliance_paused", {}).get(self._appliance_id, False)
+
+    async def _set_paused(self, paused: bool) -> None:
+        if not hasattr(self.coordinator, "appliance_paused"):
+            self.coordinator.appliance_paused = {}
+        self.coordinator.appliance_paused[self._appliance_id] = paused
+        self._persist("paused_appliances", [
+            aid for aid, value in self.coordinator.appliance_paused.items() if value
+        ])
+        self.coordinator.current_plan = None
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._set_paused(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._set_paused(False)
+
+
+class ApplianceGridSupplementSwitch(_PvExcessSwitchBase):
+    """Allow this consumer to use explicitly priced grid supplementation."""
+
+    _attr_translation_key = "allow_grid_supplement"
+    _attr_icon = "mdi:transmission-tower-import"
+
+    def __init__(self, coordinator, appliance_id: str, appliance_name: str) -> None:
+        super().__init__(coordinator)
+        self._appliance_id = appliance_id
+        self._appliance_name = appliance_name
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_{appliance_id}_allow_grid_supplement"
+
+    @property
+    def is_on(self) -> bool:
+        subentry = self.coordinator.config_entry.subentries.get(self._appliance_id)
+        return bool(subentry and subentry.data.get("allow_grid_supplement", False))
+
+    async def _set_allowed(self, allowed: bool) -> None:
+        entry = self.coordinator.config_entry
+        subentry = entry.subentries[self._appliance_id]
+        data = {**subentry.data, "allow_grid_supplement": allowed}
+        self.hass.config_entries.async_update_subentry(entry, subentry, data=data)
+        self.coordinator.current_plan = None
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._set_allowed(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._set_allowed(False)

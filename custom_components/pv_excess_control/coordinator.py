@@ -13,12 +13,18 @@ import asyncio
 import logging
 import math
 import time as _time
-from datetime import datetime, time, timedelta
+from dataclasses import replace
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
+from .daily_state import nonnegative_number
+from .power_policy import battery_first_budget
+
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -45,6 +51,9 @@ from .const import (
     CONF_CHEAP_PRICE_THRESHOLD,
     CONF_CONTROLLER_INTERVAL,
     CONF_CURRENT_ENTITY,
+    CONF_CURRENT_UPDATE_INTERVAL,
+    CONF_CURRENT_MIN_CHANGE,
+    MAX_AVERAGING_WINDOW,
     CONF_CURRENT_STEP,
     CONF_DYNAMIC_CURRENT,
     CONF_ENABLE_PREEMPTION,
@@ -116,17 +125,22 @@ from .const import (
     CONF_INVERTER_FORCE_CHARGE_MODE_DISENGAGE_VALUE,
     CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY,
     DEFAULT_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES,
+    CONF_DYNAMIC_BATTERY_CHARGE_ENABLED,
+    CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY,
+    CONF_BATTERY_MAX_CHARGE_POWER_W,
+    CONF_BATTERY_TRICKLE_CHARGE_POWER_W,
+    DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W,
 )
 from .energy import create_tariff_provider
-from .forecast import create_forecast_provider
+from .forecast import AggregatingForecastProvider
 from .models import (
     Action,
     ApplianceConfig,
     ApplianceState,
+    BatteryChargeCurve,
     BatteryConfig,
     BatteryDischargeAction,
     ControlDecision,
-    ForecastData,
     InverterGridChargeConfig,
     OptimizerResult,
     Plan,
@@ -136,7 +150,7 @@ from .models import (
 from .analytics import AnalyticsTracker
 from .inverter_control import InverterGridChargeController
 from .notifications import NotificationManager
-from .optimizer import Optimizer
+from .optimizer import Optimizer, recent_power_history
 from .planner import Planner
 
 _LOGGER = logging.getLogger(__name__)
@@ -145,7 +159,7 @@ _OFF_STATES = {"off", "false", "False", "0"}
 _UNAVAILABLE_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, "none", ""}
 
 # Maximum number of power history entries to keep (~30 min at 30s intervals)
-MAX_HISTORY_SIZE = 60
+MAX_HISTORY_SIZE = 3600
 
 # Multipliers to normalise power values to watts.
 _POWER_UNIT_MULTIPLIERS: dict[str, float] = {
@@ -221,6 +235,60 @@ def _parse_time_string(value: str | None) -> time | None:
         return None
 
 
+def compute_battery_charge_setpoint(
+    *,
+    now: datetime,
+    excess_w: float | None,
+    curve: BatteryChargeCurve | None,
+    export_soft_ceiling_w: int,
+    battery_max_charge_power_w: int,
+    battery_trickle_charge_power_w: int,
+) -> int:
+    """Compute the battery max-charge-power setpoint for this cycle.
+
+    Combines the planner's curve (the floor) with a reactive lift driven
+    by measured PV excess overshooting the soft ceiling. See
+    docs/dynamic-battery-charging.md
+    section "Coordinator reactive loop".
+    """
+    planned_w = battery_trickle_charge_power_w
+    if curve is not None:
+        for sp in curve.setpoints:
+            if sp.start <= now < sp.end:
+                planned_w = sp.max_charge_w
+                break
+
+    reactive_w = 0
+    if excess_w is not None and excess_w > export_soft_ceiling_w:
+        reactive_w = int(excess_w - export_soft_ceiling_w)
+
+    target_w = max(planned_w, reactive_w)
+    return max(
+        battery_trickle_charge_power_w,
+        min(target_w, battery_max_charge_power_w),
+    )
+
+
+def _dyn_charge_should_run(coordinator) -> bool:
+    """True when the dynamic-battery-charge loop should produce a normal write."""
+    if not coordinator.config_entry.data.get(CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False):
+        return False
+    if getattr(coordinator, "_dyn_charge_self_disabled_reason", None):
+        return False
+    startup_time = getattr(coordinator, "_startup_time", None)
+    if startup_time is not None:
+        elapsed = (datetime.now() - startup_time).total_seconds()
+        if elapsed < DEFAULT_STARTUP_GRACE_PERIOD:
+            return False
+    if getattr(coordinator, "_forecast_status", "not_configured") in ("unavailable", "pending", "planner_error"):
+        return False
+    if getattr(coordinator, "force_charge", False):
+        return False
+    if getattr(coordinator, "_grid_charge_engaged", False):
+        return False
+    return True
+
+
 class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator for PV Excess Control.
 
@@ -229,6 +297,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """
 
     config_entry: ConfigEntry
+    _daily_state_store: Store | None = None
+    _daily_save_pending = False
+    _pending_daily_summary: tuple[float, float, float] | None = None
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry) -> None:
         """Initialize the coordinator."""
@@ -270,6 +341,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_appliance_configs: list[ApplianceConfig] = []
         self.current_plan: Plan | None = None
         self.appliance_states: dict[str, ApplianceState] = {}
+        self._daily_state_date = dt_util.now().date()
+        self._restored_appliance_ids: set[str] = set()
         self.control_decisions: list[ControlDecision] = []
         self.battery_discharge_action: BatteryDischargeAction | None = None
 
@@ -306,6 +379,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._latest_power_state = None
 
         # Restore persisted enabled/override state from config_entry.data
+        self.appliance_paused = {aid: True for aid in config_entry.data.get("paused_appliances", [])}
+        self._pending_stop_appliances = set(config_entry.data.get("_pending_stop_appliances", []))
         disabled_ids = set(config_entry.data.get("disabled_appliances", []))
         overridden_ids = set(config_entry.data.get("overridden_appliances", []))
         self.appliance_enabled: dict[str, bool] = {
@@ -339,6 +414,17 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current_val = _parse_sensor_float(hass, discharge_entity, power=True)
             if current_val is not None:
                 self._last_discharge_limit = current_val
+
+        # Dynamic battery charging (#17)
+        self._dyn_charge_loop_active: bool = False
+        self._dyn_charge_release_pending: bool = False
+        self._dyn_charge_pause_released: bool = False
+        self._dyn_charge_last_written_w: int | None = None
+        self._dyn_charge_last_write_time: datetime | None = None
+        self._dyn_charge_last_warn_time: datetime | None = None
+        self._dyn_charge_self_disabled_reason: str | None = None
+        self._dyn_charge_planned_w: int = 0
+        self._dyn_charge_reactive_w: int = 0
 
         # Track last state change time per appliance for switch interval enforcement
         self._last_state_change: dict[str, datetime] = {}
@@ -410,16 +496,25 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         forecast_type = config_entry.data.get(
             CONF_FORECAST_PROVIDER, ForecastProviderEnum.NONE
         )
-        forecast_entity = config_entry.data.get(CONF_FORECAST_SENSOR, "")
-        if forecast_type != ForecastProviderEnum.NONE and forecast_entity:
-            self._forecast_provider = create_forecast_provider(
-                forecast_type, forecast_entity
-            )
-        elif forecast_type != ForecastProviderEnum.NONE and not forecast_entity:
-            _LOGGER.warning("Forecast provider '%s' configured but no forecast_sensor entity set", forecast_type)
-            self._forecast_provider = None
-        else:
-            self._forecast_provider = None
+        self._forecast_entities = list(dict.fromkeys(filter(None, [
+            config_entry.data.get(CONF_FORECAST_SENSOR),
+            *config_entry.data.get("additional_forecast_sensors", []),
+        ])))
+        self._forecast_tomorrow_entities = list(dict.fromkeys(filter(None, [
+            config_entry.data.get(CONF_FORECAST_TOMORROW_SENSOR),
+            *config_entry.data.get("additional_forecast_tomorrow_sensors", []),
+        ])))
+        self._forecast_provider = (
+            AggregatingForecastProvider(forecast_type, self._forecast_entities, self._forecast_tomorrow_entities)
+            if forecast_type != ForecastProviderEnum.NONE else None
+        )
+        self._forecast_status = "pending" if self._forecast_provider else "not_configured"
+        self._forecast_error: str | None = None
+        self._forecast_data = None
+
+        # Validate dynamic battery charge config at startup; sets
+        # _dyn_charge_self_disabled_reason if any dependency is missing.
+        self._validate_dynamic_battery_charge_config()
 
         _LOGGER.info(
             "PV Excess Control initialized: inverter=%s, voltage=%sV, "
@@ -431,6 +526,163 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             controller_interval,
             self._planner_interval,
         )
+
+    def update_from_subentries(self) -> None:
+        """Keep entity controls and configuration forms on the same values."""
+        subentries = self.config_entry.subentries
+        self.appliance_priorities = {
+            sid: sub.data.get(CONF_APPLIANCE_PRIORITY, 500)
+            for sid, sub in subentries.items()
+        }
+        for key, attr in ((CONF_MIN_DAILY_RUNTIME, "appliance_min_daily_runtime"),
+                          (CONF_MAX_DAILY_RUNTIME, "appliance_max_daily_runtime")):
+            setattr(self, attr, {sid: sub.data[key] for sid, sub in subentries.items() if key in sub.data})
+
+    def _persist_pending_stops(self) -> None:
+        """Keep an unfinished explicit stop retryable across reloads."""
+        try:
+            data = dict(self.config_entry.data)
+            data["_pending_stop_appliances"] = sorted(self._pending_stop_appliances)
+            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+        except Exception:
+            _LOGGER.exception("Could not persist pending appliance shutdowns")
+
+    def cancel_pending_stop(self, appliance_id: str) -> None:
+        """A new explicit start/resume supersedes an unfinished stop."""
+        if appliance_id in getattr(self, "_pending_stop_appliances", set()):
+            self._pending_stop_appliances.discard(appliance_id)
+            self._persist_pending_stops()
+
+    async def async_stop_appliance(self, appliance_id: str) -> None:
+        """Stop explicitly even when the appliance has left automatic control."""
+        if not hasattr(self, "_pending_stop_appliances"):
+            self._pending_stop_appliances = set()
+        if appliance_id not in self._pending_stop_appliances:
+            self._pending_stop_appliances.add(appliance_id)
+            self._persist_pending_stops()
+        config = self._get_appliance_config_by_id(appliance_id)
+        if config is None or not config.entity_id:
+            self.cancel_pending_stop(appliance_id)
+            return
+        state = self.hass.states.get(config.entity_id)
+        if state is not None and state.state in _OFF_STATES:
+            self.cancel_pending_stop(appliance_id)
+            return
+        try:
+            async with asyncio.timeout(10):
+                await self.hass.services.async_call(
+                    config.entity_id.split(".")[0], "turn_off",
+                    {"entity_id": config.entity_id}, blocking=True,
+                )
+        except Exception as err:
+            _LOGGER.warning("Shutdown pending for %s; will retry: %s", config.name, err)
+        # Keep the request until a subsequent physical OFF observation confirms it.
+
+    async def _retry_pending_stops(self) -> None:
+        for appliance_id in tuple(getattr(self, "_pending_stop_appliances", ())):
+            # Another explicit action may cancel this request while a previous
+            # appliance's service call yields to the event loop.
+            if appliance_id in self._pending_stop_appliances:
+                await self.async_stop_appliance(appliance_id)
+
+    async def async_restore_daily_state(self) -> None:
+        """Restore only today's counters before the first sensor refresh."""
+        if self._daily_state_store is None:
+            self._daily_state_store = Store(
+                self.hass, 1, f"{DOMAIN}.{self.config_entry.entry_id}.daily_state",
+            )
+        self._daily_state_date = dt_util.now().date()
+        self._restored_appliance_ids = set()
+        try:
+            data = await self._daily_state_store.async_load()
+        except (OSError, ValueError, TypeError):
+            _LOGGER.exception("Could not restore daily counters; storage disabled until reload")
+            # Do not overwrite unread counters after a transient read failure.
+            self._daily_state_store = None
+            return
+        if not isinstance(data, dict) or data.get("date") != self._daily_state_date.isoformat():
+            return
+        rows = data.get("appliances")
+        if not isinstance(rows, dict):
+            return
+        for appliance_id in self.config_entry.subentries:
+            row = rows.get(appliance_id)
+            if not isinstance(row, dict):
+                continue
+            activations = int(nonnegative_number(row.get("activations", 0)))
+            self.appliance_states[appliance_id] = ApplianceState(
+                appliance_id=appliance_id, is_on=False, current_power=0.0,
+                current_amperage=None,
+                runtime_today=timedelta(seconds=nonnegative_number(row.get("runtime_seconds"), 86400)),
+                energy_today=nonnegative_number(row.get("energy_kwh")),
+                last_state_change=None, ev_connected=None, ev_soc=None,
+                activations_today=activations,
+            )
+            self._activations_today[appliance_id] = activations
+            self._restored_appliance_ids.add(appliance_id)
+        self.analytics.restore_daily(data.get("analytics"), set(self.config_entry.subentries))
+
+    def _ensure_daily_date(self) -> None:
+        """Recover the local day boundary even if HA missed the midnight event."""
+        if getattr(self, "_daily_state_date", dt_util.now().date()) != dt_util.now().date():
+            self._pending_daily_summary = (
+                self.analytics.self_consumption_ratio,
+                self.analytics.savings_today,
+                self.analytics.solar_consumed_kwh,
+            )
+            self.reset_daily()
+
+    async def async_handle_midnight(self) -> None:
+        """Roll over once before awaiting I/O; keep the previous day's summary."""
+        self._ensure_daily_date()
+        summary = self._pending_daily_summary
+        self._pending_daily_summary = None
+        await self.async_save_daily_state()
+        if summary is not None:
+            try:
+                await self.notifications.notify_daily_summary(*summary)
+            except Exception:
+                _LOGGER.exception("Failed to send daily summary notification")
+        await self.async_request_refresh()
+
+    def _daily_state_data(self) -> dict[str, Any]:
+        """Take the latest snapshot at write time, never label yesterday as today."""
+        self._ensure_daily_date()
+        return {
+            "date": dt_util.now().date().isoformat(),
+            "appliances": {
+                appliance_id: {
+                    "runtime_seconds": state.runtime_today.total_seconds(),
+                    "energy_kwh": state.energy_today,
+                    "activations": self._activations_today.get(appliance_id, state.activations_today),
+                }
+                for appliance_id, state in self.appliance_states.items()
+                if appliance_id in self.config_entry.subentries
+            },
+            "analytics": self.analytics.snapshot_daily(),
+        }
+
+    def _schedule_daily_state_save(self) -> None:
+        """Arm one write; frequent updates must not postpone it indefinitely."""
+        if self._daily_state_store is None or self._daily_save_pending:
+            return
+        self._daily_save_pending = True
+
+        def snapshot() -> dict[str, Any]:
+            self._daily_save_pending = False
+            return self._daily_state_data()
+
+        self._daily_state_store.async_delay_save(snapshot, 60)
+
+    async def async_save_daily_state(self) -> None:
+        """Flush counters on unload; Store also flushes queued writes at HA stop."""
+        if self._daily_state_store is not None:
+            try:
+                await self._daily_state_store.async_save(self._daily_state_data())
+            except (OSError, ValueError, TypeError):
+                _LOGGER.exception("Could not save daily counters")
+            finally:
+                self._daily_save_pending = False
 
     # ------------------------------------------------------------------
     # Inverter grid-charge helpers (Task 10 plumbing)
@@ -456,6 +708,67 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except ValueError as err:
             _LOGGER.error("Inverter grid-charge controller misconfigured: %s", err)
             return None
+
+    def _validate_dynamic_battery_charge_config(self) -> None:
+        """Set _dyn_charge_self_disabled_reason if config is invalid.
+
+        Called once during __init__. The dispatcher's _dyn_charge_should_run
+        predicate respects the disabled reason and skips writes for the
+        rest of the session.
+        """
+        data = self.config_entry.data
+        if not data.get(CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False):
+            return  # not enabled; no validation needed
+
+        entity_id = data.get(CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY)
+        if not entity_id:
+            self._dyn_charge_self_disabled_reason = "entity_not_configured"
+            _LOGGER.warning(
+                "Dynamic battery charge enabled but no inverter entity configured"
+            )
+            return
+
+        domain = entity_id.split(".")[0]
+        if domain not in {"number", "input_number"}:
+            self._dyn_charge_self_disabled_reason = "entity_wrong_domain"
+            _LOGGER.warning(
+                "Dynamic battery charge entity %s domain '%s' not supported",
+                entity_id, domain,
+            )
+            return
+
+        max_w = data.get(CONF_BATTERY_MAX_CHARGE_POWER_W, 0) or 0
+        if max_w <= 0:
+            self._dyn_charge_self_disabled_reason = "invalid_max_power"
+            _LOGGER.warning(
+                "Dynamic battery charge: invalid max charge power %s", max_w
+            )
+            return
+
+        export_limit = data.get(CONF_EXPORT_LIMIT)
+        if not export_limit or export_limit <= 0:
+            self._dyn_charge_self_disabled_reason = "invalid_export_limit"
+            _LOGGER.warning(
+                "Dynamic battery charge: invalid export_limit"
+            )
+            return
+
+        battery_config = self._get_battery_config()
+        capacity = battery_config.capacity_kwh if battery_config is not None else 0
+        if capacity <= 0:
+            self._dyn_charge_self_disabled_reason = "invalid_battery_capacity"
+            _LOGGER.warning(
+                "Dynamic battery charge: invalid battery capacity"
+            )
+            return
+
+        # HA may set up the inverter after this integration. Availability is a
+        # runtime condition handled by the retryable writer, not invalid config.
+        if self.hass.states.get(entity_id) is None:
+            _LOGGER.debug(
+                "Dynamic battery charge entity %s not available yet; writes will retry",
+                entity_id,
+            )
 
     def _persist_grid_charge_state(self, engaged: bool) -> None:
         """Persist the engagement flag to config_entry.data via async_update_entry.
@@ -558,6 +871,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         in-place to avoid RuntimeError if _async_update_data is iterating the
         dict concurrently.
         """
+        self._daily_state_date = dt_util.now().date()
+        self._restored_appliance_ids = set()
         new_states: dict[str, ApplianceState] = {}
         for key, state in self.appliance_states.items():
             new_states[key] = ApplianceState(
@@ -571,6 +886,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ev_connected=state.ev_connected,
                 ev_soc=state.ev_soc,
                 activations_today=0,
+                current_power_available=state.current_power_available,
             )
         self.appliance_states = new_states  # Atomic replacement
         # Only clear switch interval for OFF appliances; ON appliances keep protection
@@ -595,6 +911,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         handle force charge -> run optimizer -> record analytics -> apply decisions ->
         send notifications.
         """
+        self.battery_strategy = self.config_entry.data.get(CONF_BATTERY_STRATEGY, self.battery_strategy)
+        await self._retry_pending_stops()
         # 1. Collect power state from sensors
         power_state = self._collect_power_state()
         def _fmt(val: float | None, suffix: str = "W") -> str:
@@ -612,23 +930,45 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _fmt(power_state.excess_power),
         )
 
-        # 2. Append to history (keep last MAX_HISTORY_SIZE entries)
+        # 2. Retain the maximum supported time window, with a sample safety cap.
         self.power_history.append(power_state)
-        if len(self.power_history) > MAX_HISTORY_SIZE:
-            self.power_history.pop(0)
+        self.power_history = recent_power_history(
+            self.power_history, MAX_AVERAGING_WINDOW, power_state.timestamp,
+        )[-MAX_HISTORY_SIZE:]
 
+        forecast_fingerprint = tuple(
+            (entity, state.state if (state := self.hass.states.get(entity)) else None,
+             repr(state.attributes) if state else None)
+            for entity in [*getattr(self, "_forecast_entities", []), *getattr(self, "_forecast_tomorrow_entities", [])]
+        )
+        forecast_changed = forecast_fingerprint != getattr(self, "_forecast_input_fingerprint", forecast_fingerprint)
+        self._forecast_input_fingerprint = forecast_fingerprint
         # 3. Run planner on its interval
         self._planner_counter += 1
         planner_ratio = max(
             1,
             int(self._planner_interval // self.update_interval.total_seconds()),
         )
-        if self._planner_counter >= planner_ratio:
+        if self._planner_counter >= planner_ratio or forecast_changed or getattr(self, "_forecast_status", None) == "pending":
             self._planner_counter = 0
             await self._run_planner()
 
+        # 5. Get appliance configs and states early so runtime/energy tracking
+        # works even during the startup grace period (M20)
+        appliance_configs = self._get_appliance_configs()
+        self._last_appliance_configs = appliance_configs
+        appliance_states = self._get_appliance_states(appliance_configs)
+        fingerprint = tuple((c.id, c.phases, appliance_states[c.id].is_on, appliance_states[c.id].enable_condition, appliance_states[c.id].remaining_runtime_minutes) for c in appliance_configs)
+        previous_fingerprint = getattr(self, "_control_input_fingerprint", None)
+        self._control_input_fingerprint = fingerprint
+        if previous_fingerprint is not None and fingerprint != previous_fingerprint:
+            self.current_plan = None
+            await self._run_planner()
+        policy_power, policy_history = self._power_for_optimizer(power_state, appliance_configs, appliance_states)
+
         # 4. Skip optimizer if disabled or in startup grace period
         if not self._enabled:
+            self._solar_start_since = {}
             _LOGGER.debug("Controller disabled, skipping optimization")
             # M11: Turn off all managed appliances on the transition to disabled
             if self._was_enabled:
@@ -637,12 +977,6 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return self._build_coordinator_data()
 
         self._was_enabled = True  # Mark as enabled for M11 transition detection
-
-        # 5. Get appliance configs and states early so runtime/energy tracking
-        # works even during the startup grace period (M20)
-        appliance_configs = self._get_appliance_configs()
-        self._last_appliance_configs = appliance_configs
-        appliance_states = self._get_appliance_states(appliance_configs)
 
         elapsed = (datetime.now() - self._startup_time).total_seconds()
         if elapsed < DEFAULT_STARTUP_GRACE_PERIOD:
@@ -718,8 +1052,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for ps in self.power_history
             ]
         else:
-            power_state_for_optimizer = power_state
-            history_for_optimizer = self.power_history
+            power_state_for_optimizer = policy_power
+            history_for_optimizer = policy_history
 
         # Refresh plan_influence and grid_voltage from config each cycle (H12)
         self._plan_influence = self.config_entry.data.get(CONF_PLAN_INFLUENCE, PlanInfluence.LIGHT)
@@ -745,6 +1079,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Optimizer error: %s", err)
             raise UpdateFailed(f"Optimizer error: {err}") from err
 
+        self._update_start_qualification(result.decisions)
         self.control_decisions = result.decisions
         self.battery_discharge_action = result.battery_discharge_action
 
@@ -777,12 +1112,16 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 config = self._get_appliance_config_by_id(decision.appliance_id)
                 if config is None:
                     continue
-                # Use actual power if available, otherwise nominal
+                # The normalized reading already includes an unmetered-load
+                # estimate. Never replace valid zero/unavailable with nominal,
+                # nor count a command before the appliance is observed ON.
                 app_state = appliance_states.get(decision.appliance_id)
-                power = (app_state.current_power if app_state and app_state.current_power > 0
-                         else config.nominal_power if config else 0)
-                # M9: Use decision reason to correctly attribute grid-supplemented consumption
-                if "grid supplement" in decision.reason.lower():
+                if (app_state is None or not app_state.is_on
+                        or not app_state.current_power_available or app_state.current_power <= 0):
+                    continue
+                power = app_state.current_power
+                # Source classification comes from the structured decision.
+                if decision.uses_grid_supplement:
                     source = "cheap_tariff"
                 elif power_state.excess_power is not None and power_state.excess_power > 0:
                     source = "solar"
@@ -805,6 +1144,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # 10. Apply decisions (call HA services)
         applied_ids = await self._apply_decisions(result)
+
+        # Dynamic battery charge dispatch (#17).
+        await self._dispatch_dynamic_battery_charge(power_state)
 
         # 11. Send notifications on state changes (only for successfully applied decisions)
         for decision in result.decisions:
@@ -882,6 +1224,13 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         call sites) must not treat ``None`` as ``0.0``.
         """
         data = self.config_entry.data
+        uses_net_meter = bool(data.get(CONF_IMPORT_EXPORT))
+        hybrid_mapping = data.get(CONF_INVERTER_TYPE) == "hybrid" or any(data.get(key) for key in (
+            CONF_BATTERY_SOC, CONF_BATTERY_POWER, CONF_BATTERY_CHARGE_POWER, CONF_BATTERY_DISCHARGE_POWER,
+        ))
+        uses_load_balance = not uses_net_meter and bool(data.get(CONF_PV_POWER) and data.get(CONF_LOAD_POWER)) and (
+            hybrid_mapping or not data.get(CONF_GRID_EXPORT)
+        )
 
         # Required/optional sensor reads: do NOT collapse None to 0.0.
         # Power sensors are read with power=True so that kW/MW values are
@@ -889,7 +1238,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         pv_production: float | None = _parse_sensor_float(
             self.hass, data.get(CONF_PV_POWER), power=True,
         )
-        self._track_sensor_availability(data.get(CONF_PV_POWER), pv_production)
+        if uses_load_balance:
+            self._track_sensor_availability(data.get(CONF_PV_POWER), pv_production)
 
         # Grid export/import: either separate entity or combined.
         grid_export: float | None = None
@@ -913,13 +1263,15 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             grid_export = _parse_sensor_float(
                 self.hass, grid_export_entity, power=True,
             )
-            self._track_sensor_availability(grid_export_entity, grid_export)
+            if not uses_load_balance:
+                self._track_sensor_availability(grid_export_entity, grid_export)
             grid_import = 0.0 if grid_export is not None else None
 
         load_power: float | None = _parse_sensor_float(
             self.hass, data.get(CONF_LOAD_POWER), power=True,
         )
-        self._track_sensor_availability(data.get(CONF_LOAD_POWER), load_power)
+        if uses_load_balance:
+            self._track_sensor_availability(data.get(CONF_LOAD_POWER), load_power)
 
         battery_soc = _parse_sensor_float(self.hass, data.get(CONF_BATTERY_SOC))
 
@@ -934,60 +1286,46 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass, battery_power_entity, power=True,
             )
         elif battery_charge_entity or battery_discharge_entity:
-            charge = _parse_sensor_float(
-                self.hass, battery_charge_entity, power=True,
-            ) or 0.0
-            discharge = _parse_sensor_float(
-                self.hass, battery_discharge_entity, power=True,
-            ) or 0.0
-            battery_power = charge - discharge
+            charge = (
+                _parse_sensor_float(self.hass, battery_charge_entity, power=True)
+                if battery_charge_entity else 0.0
+            )
+            discharge = (
+                _parse_sensor_float(self.hass, battery_discharge_entity, power=True)
+                if battery_discharge_entity else 0.0
+            )
+            battery_power = charge - discharge if charge is not None and discharge is not None else None
 
-        # Calculate excess. Branch selection is topology-based and identical
-        # to the hybrid fix; None-handling is added within each branch body.
-        # See the branch behaviour table in the design spec.
-        has_battery = (
-            data.get(CONF_BATTERY_POWER) is not None
-            or data.get(CONF_BATTERY_CHARGE_POWER) is not None
-            or data.get(CONF_BATTERY_DISCHARGE_POWER) is not None
-        )
-
-        excess_power: float | None
+        has_battery = any(data.get(key) for key in (
+            CONF_BATTERY_POWER, CONF_BATTERY_CHARGE_POWER, CONF_BATTERY_DISCHARGE_POWER,
+        ))
         if import_export_entity:
-            if grid_export is None or grid_import is None:
+            if grid_export is None or grid_import is None or (has_battery and battery_power is None):
                 excess_power = None
             else:
-                excess_power = grid_export - grid_import
-        elif has_battery and load_power is not None and load_power > 0:
-            # Hybrid branch: requires pv_production; load_power is guaranteed
-            # non-None by the predicate.
+                excess_power = grid_export - grid_import + (battery_power if has_battery else 0.0)
+        elif uses_load_balance:
+            # Household load includes managed appliances, not battery charging.
+            # Valid zero remains zero; an outage must not switch the topology.
             excess_power = (
-                pv_production - load_power if pv_production is not None else None
+                pv_production - load_power
+                if pv_production is not None and load_power is not None else None
             )
         elif grid_export_entity:
+            # Preserve the existing non-hybrid meter preference. Export-only
+            # readings cannot quantify import; PV/load can supply that fallback.
             if grid_export is None:
-                # Nuance 1a: grid_export is the user's configured truth source.
-                # Do not fall through — return None to surface the outage.
                 excess_power = None
             elif grid_export > 0:
                 excess_power = grid_export
+            elif data.get(CONF_PV_POWER) and data.get(CONF_LOAD_POWER):
+                self._track_sensor_availability(data.get(CONF_PV_POWER), pv_production)
+                self._track_sensor_availability(data.get(CONF_LOAD_POWER), load_power)
+                excess_power = pv_production - load_power if pv_production is not None and load_power is not None else None
             else:
-                # grid_export == 0: fallback to pv - load. Requires both.
-                if (
-                    pv_production is not None
-                    and load_power is not None
-                    and load_power > 0
-                ):
-                    excess_power = pv_production - load_power
-                else:
-                    excess_power = None
-        elif load_power is not None and load_power > 0:
-            # Load-only branch: requires pv_production.
-            excess_power = (
-                pv_production - load_power if pv_production is not None else None
-            )
+                excess_power = grid_export
         else:
-            # Neither grid nor load configured — misconfiguration, not outage.
-            excess_power = 0.0
+            excess_power = None
 
         return PowerState(
             pv_production=pv_production,
@@ -998,12 +1336,102 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             battery_soc=battery_soc,
             battery_power=battery_power,
             ev_soc=None,
-            timestamp=datetime.now(),
+            timestamp=dt_util.utcnow(),
         )
+
+    def _power_for_optimizer(
+        self, power: PowerState, configs: list[ApplianceConfig],
+        states: dict[str, ApplianceState],
+    ) -> tuple[PowerState, list[PowerState]]:
+        """Apply today's battery policy without mutating raw telemetry/history."""
+        data = self.config_entry.data
+        self._battery_charge_reserve_w = 0.0
+        self._battery_priority_status = "inactive"
+        self._available_excess_power_w = power.excess_power
+        reserve: float | None = 0.0
+        strategy = data.get(CONF_BATTERY_STRATEGY, self.battery_strategy)
+        has_battery = any(data.get(key) for key in (
+            CONF_BATTERY_SOC, CONF_BATTERY_POWER, CONF_BATTERY_CHARGE_POWER,
+            CONF_BATTERY_DISCHARGE_POWER,
+        ))
+        if strategy == BatteryStrategy.BATTERY_FIRST and has_battery:
+            running_w = 0.0
+            for config in configs:
+                state = states.get(config.id)
+                if state is None or not state.is_on:
+                    continue
+                if config.actual_power_entity or state.current_power > 0:
+                    draw = state.current_power
+                elif state.ev_connected is False:
+                    draw = 0.0
+                elif config.dynamic_current and state.current_amperage is not None:
+                    draw = state.current_amperage * max(config.phases, 1) * self.optimizer.grid_voltage
+                else:
+                    draw = config.nominal_power
+                running_w += max(draw, 0.0)
+            cap_entity = data.get(CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY)
+            live_limit = _parse_sensor_float(self.hass, cap_entity, power=True) if cap_entity else None
+            if cap_entity and (cap_state := self.hass.states.get(cap_entity)) is not None:
+                unit = cap_state.attributes.get("unit_of_measurement")
+                if unit is not None and str(unit).lower().strip() not in ("", "w", "kw", "mw"):
+                    live_limit = None  # An ampere limit needs an explicit power adapter.
+            charging_w = power.battery_power
+            if charging_w is None and not any(data.get(key) for key in (
+                CONF_BATTERY_POWER, CONF_BATTERY_CHARGE_POWER, CONF_BATTERY_DISCHARGE_POWER,
+            )) and power.grid_export is not None and power.grid_import is not None and power.excess_power is not None:
+                charging_w = power.excess_power - (power.grid_export - power.grid_import)
+            budget = battery_first_budget(
+                power.excess_power, power.battery_soc,
+                float(data.get(CONF_BATTERY_TARGET_SOC, 80)), charging_w, running_w,
+                data.get(CONF_BATTERY_MAX_CHARGE_POWER_W), live_limit, bool(cap_entity),
+            )
+            self._battery_charge_reserve_w = reserve = budget.reserved_w
+            self._battery_priority_status = budget.source
+            self._available_excess_power_w = budget.available_w
+        if self._available_excess_power_w is None:
+            # Do not allocate from stale positive history when a current
+            # required reading or the current policy budget is unavailable.
+            return replace(power, excess_power=None), [replace(p, excess_power=None) for p in self.power_history]
+        if reserve is None:
+            # Unknown battery requirements forbid allocating positive surplus,
+            # but a reliable negative balance must still reach normal SHED.
+            return replace(power, excess_power=self._available_excess_power_w), [
+                replace(p, excess_power=min(p.excess_power, 0.0) if p.excess_power is not None else None)
+                for p in self.power_history
+            ]
+        if not reserve:
+            return power, self.power_history
+        return replace(power, excess_power=self._available_excess_power_w), [
+            replace(p, excess_power=p.excess_power - reserve if p.excess_power is not None else None)
+            for p in self.power_history
+        ]
 
     # ------------------------------------------------------------------
     # Appliance configuration
     # ------------------------------------------------------------------
+
+    def _effective_phases(self, appliance_id: str, data: dict) -> int:
+        """Read actual phase count, keeping the last valid reading through gaps."""
+        if not hasattr(self, "_effective_phase_counts"):
+            self._effective_phase_counts = {}
+        static = max(1, min(3, int(data.get(CONF_PHASES, 1))))
+        entity = data.get("phase_count_entity")
+        if not entity:
+            self._effective_phase_counts.pop(appliance_id, None)
+            return static
+        reading = _parse_sensor_float(self.hass, entity)
+        if reading is not None and reading in (1, 2, 3):
+            self._effective_phase_counts[appliance_id] = int(reading)
+        return self._effective_phase_counts.get(appliance_id, static)
+
+    def _update_start_qualification(self, decisions: list[ControlDecision]) -> None:
+        """Retain only continuously qualifying pending solar starts."""
+        previous = getattr(self, "_solar_start_since", {})
+        now = _time.monotonic()
+        self._solar_start_since = {
+            decision.appliance_id: previous.get(decision.appliance_id, now)
+            for decision in decisions if decision.solar_start_qualified
+        }
 
     def _get_appliance_configs(self) -> list[ApplianceConfig]:
         """Convert config entry subentries to ApplianceConfig list."""
@@ -1033,7 +1461,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             is_enabled = self.appliance_enabled.get(subentry_id, True)
 
             # Skip disabled appliances unless they have an active override
-            if not is_enabled and not override_active:
+            paused = getattr(self, "appliance_paused", {}).get(subentry_id, False)
+            if (not is_enabled or paused) and not override_active:
                 continue
 
             # Skip appliances with no entity configured
@@ -1056,7 +1485,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 name=sub_data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}"),
                 entity_id=entity_id,
                 priority=priority,
-                phases=int(sub_data.get(CONF_PHASES, 1)),
+                phases=self._effective_phases(subentry_id, sub_data),
                 nominal_power=sub_data.get(CONF_NOMINAL_POWER, 0.0),
                 actual_power_entity=sub_data.get(CONF_ACTUAL_POWER_ENTITY),
                 dynamic_current=sub_data.get(CONF_DYNAMIC_CURRENT, False),
@@ -1090,10 +1519,18 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 helper_only=sub_data.get(CONF_HELPER_ONLY, False),
                 protect_from_preemption=sub_data.get(CONF_PROTECT_FROM_PREEMPTION, False),
                 current_step=sub_data.get(CONF_CURRENT_STEP, 0.1),
+                current_update_interval=sub_data.get(CONF_CURRENT_UPDATE_INTERVAL, 0),
+                current_min_change=sub_data.get(CONF_CURRENT_MIN_CHANGE, 0),
                 override_active=override_active,
                 max_daily_activations=max_activations,
-                on_threshold=sub_data.get(CONF_ON_THRESHOLD),
+                on_threshold=sub_data.get(CONF_ON_THRESHOLD, self.config_entry.data.get(CONF_ON_THRESHOLD)),
                 completion_power_threshold=sub_data.get(CONF_COMPLETION_POWER_THRESHOLD),
+                enable_condition_entity=sub_data.get("enable_condition_entity"),
+                enable_condition_mode=sub_data.get("enable_condition_mode", "start_only"),
+                start_delay=sub_data.get("start_delay", 0),
+                phase_count_entity=sub_data.get("phase_count_entity"),
+                remaining_runtime_entity=sub_data.get("remaining_runtime_entity"),
+                require_contiguous_runtime=sub_data.get("require_contiguous_runtime", False),
             )
             configs.append(config)
 
@@ -1114,9 +1551,13 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for d in (
             self._last_state_change,
             self._last_applied_current,
+            getattr(self, "_last_current_write", {}),
+            getattr(self, "_effective_phase_counts", {}),
+            getattr(self, "_solar_start_since", {}),
             self._activations_today,
             self._previous_is_on,
             self.appliance_enabled,
+            getattr(self, "appliance_paused", {}),
             self.appliance_overrides,
             self.appliance_priorities,
             self.appliance_min_daily_runtime,
@@ -1129,12 +1570,21 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return configs
 
     def _get_appliance_states(
-        self, configs: list[ApplianceConfig]
+        self, configs: list[ApplianceConfig], *, update_runtime: bool = True
     ) -> dict[str, ApplianceState]:
         """Read current state of each controlled appliance entity."""
+        self._ensure_daily_date()
         states: dict[str, ApplianceState] = {}
+        # Track all physical appliances even while their automatic control is
+        # disabled. This also gives restored disabled appliances a live state.
+        by_id = {config.id: config for config in configs}
+        for appliance_id in self.config_entry.subentries:
+            if appliance_id not in by_id:
+                config = self._get_appliance_config_by_id(appliance_id)
+                if config is not None:
+                    by_id[appliance_id] = config
 
-        for config in configs:
+        for config in by_id.values():
             entity_state = self.hass.states.get(config.entity_id)
             is_on = False
             if entity_state is not None:
@@ -1153,18 +1603,26 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._previous_is_on[config.id] = is_on
 
             current_power = 0.0
+            current_power_available = True
             if config.actual_power_entity:
-                current_power = (
-                    _parse_sensor_float(
-                        self.hass, config.actual_power_entity, power=True,
-                    ) or 0.0
-                )
+                reading = _parse_sensor_float(self.hass, config.actual_power_entity, power=True)
+                current_power_available = reading is not None
+                current_power = reading if reading is not None else 0.0
 
             current_amperage: float | None = None
             if config.current_entity:
                 current_amperage = _parse_sensor_float(
                     self.hass, config.current_entity
                 )
+
+            # During actuator readback lag, account for the accepted setpoint.
+            # Otherwise an unchanged stale reading could invent a reduction.
+            last_write = getattr(self, "_last_current_write", {}).get(config.id)
+            last_target = self._last_applied_current.get(config.id)
+            if (last_write is not None and last_target is not None
+                    and (current_amperage is None or config.min_current <= current_amperage <= config.max_current)
+                    and _time.monotonic() - last_write < max(60, config.current_update_interval)):
+                current_amperage = last_target
 
             ev_connected: bool | None = None
             if config.ev_connected_entity:
@@ -1176,6 +1634,16 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if config.ev_soc_entity:
                 ev_soc = _parse_sensor_float(self.hass, config.ev_soc_entity)
 
+            if is_on and not config.actual_power_entity:
+                # Nominal draw is the documented fallback for unmetered loads.
+                # A configured real zero is never replaced by this estimate.
+                if ev_connected is False:
+                    current_power = 0.0
+                elif config.dynamic_current and current_amperage is not None:
+                    current_power = max(current_amperage, 0.0) * self.optimizer.grid_voltage * max(config.phases, 1)
+                else:
+                    current_power = config.nominal_power
+
             # Retrieve and update runtime from stored state
             previous = self.appliance_states.get(config.id)
             runtime_today = previous.runtime_today if previous else timedelta()
@@ -1183,20 +1651,19 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             last_state_change = previous.last_state_change if previous else None
 
             # Increment runtime and energy if the appliance is currently ON
-            if is_on and previous is not None:
+            restored = config.id in getattr(self, "_restored_appliance_ids", set())
+            if update_runtime and is_on and previous is not None and not restored:
                 cycle_seconds = self.update_interval.total_seconds()
                 # Gate runtime on actual power when completion threshold is configured
                 counts_as_running = (
-                    config.completion_power_threshold is None
+                    config.require_contiguous_runtime
+                    or config.completion_power_threshold is None
                     or current_power >= config.completion_power_threshold
                 )
                 if counts_as_running:
                     runtime_today += timedelta(seconds=cycle_seconds)
                 # Energy in kWh: power(W) * time(h)
-                power_for_energy = (
-                    current_power if current_power > 0
-                    else (0.0 if config.actual_power_entity else config.nominal_power)
-                )
+                power_for_energy = current_power
                 energy_today += (power_for_energy * cycle_seconds) / 3600 / 1000
 
             # Seed last_state_change for appliances that are ON but have no
@@ -1216,49 +1683,21 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ev_connected=ev_connected,
                 ev_soc=ev_soc,
                 activations_today=self._activations_today.get(config.id, 0),
+                current_power_available=current_power_available,
+                remaining_runtime_minutes=_parse_sensor_float(self.hass, config.remaining_runtime_entity) if config.remaining_runtime_entity else None,
+                enable_condition=(_parse_sensor_bool(self.hass, config.enable_condition_entity) if config.enable_condition_entity else True),
+                solar_start_elapsed=max(0, _time.monotonic() - getattr(self, "_solar_start_since", {}).get(config.id, _time.monotonic())),
+                seconds_since_current_change=(
+                    max(0.0, _time.monotonic() - self._last_current_write[config.id])
+                    if config.id in getattr(self, "_last_current_write", {}) else None
+                ),
             )
             states[config.id] = state
 
-        # Preserve state for disabled appliances so runtime/energy sensors
-        # don't go unavailable and don't reset to zero when re-enabled.
-        # Refresh is_on and current_power from actual HA entities so the
-        # Active and Power sensors stay accurate even when disabled.
-        subentries = getattr(self.config_entry, "subentries", {})
-        for sub_id in subentries:
-            if sub_id not in states and sub_id in self.appliance_states:
-                old = self.appliance_states[sub_id]
-                sub_data = subentries[sub_id].data
-
-                # Refresh is_on from the actual switch entity
-                entity_id = sub_data.get(CONF_APPLIANCE_ENTITY, "")
-                entity_state = self.hass.states.get(entity_id) if entity_id else None
-                is_on = (
-                    entity_state is not None
-                    and entity_state.state not in _OFF_STATES
-                    and entity_state.state not in _UNAVAILABLE_STATES
-                )
-
-                # Refresh current_power from the actual power sensor
-                power_entity = sub_data.get(CONF_ACTUAL_POWER_ENTITY)
-                current_power = (
-                    _parse_sensor_float(self.hass, power_entity, power=True)
-                    or 0.0
-                ) if power_entity else 0.0
-
-                states[sub_id] = ApplianceState(
-                    appliance_id=old.appliance_id,
-                    is_on=is_on,
-                    current_power=current_power,
-                    current_amperage=old.current_amperage,
-                    runtime_today=old.runtime_today,
-                    energy_today=old.energy_today,
-                    last_state_change=old.last_state_change,
-                    ev_connected=old.ev_connected,
-                    ev_soc=old.ev_soc,
-                    activations_today=old.activations_today,
-                )
-
-        self.appliance_states = states
+        if update_runtime:
+            self.appliance_states = states
+            self._restored_appliance_ids = set()
+            self._schedule_daily_state_save()
         return states
 
     # ------------------------------------------------------------------
@@ -1307,30 +1746,25 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         data = self.config_entry.data
 
-        # Gather forecast data
-        forecast_entity = data.get(CONF_FORECAST_SENSOR, "")
-        ha_states: dict[str, dict] = {}
-        if forecast_entity:
-            state_dict = _entity_state_dict(self.hass, forecast_entity)
+        # A missing configured source invalidates the whole forecast; retain no stale plan.
+        ha_states = {}
+        for entity in [*getattr(self, "_forecast_entities", []), *getattr(self, "_forecast_tomorrow_entities", [])]:
+            state_dict = _entity_state_dict(self.hass, entity)
             if state_dict:
-                ha_states[forecast_entity] = state_dict
-
+                ha_states[entity] = state_dict
         try:
-            forecast_data = self._forecast_provider.get_forecast(ha_states)
+            forecast_data = self._forecast_provider.get_forecast(ha_states, now=dt_util.now())
         except Exception as err:
-            _LOGGER.warning("Forecast provider error: %s", err)
+            if getattr(self, "_forecast_status", None) != "unavailable":
+                _LOGGER.warning("Forecast provider error: %s", err)
+            self._forecast_status = "unavailable"
+            self._forecast_data = None
+            self._forecast_error = str(err)
+            self.current_plan = None
             return
-
-        # If a separate tomorrow sensor is configured, use its state as tomorrow_total_kwh
-        tomorrow_entity = data.get(CONF_FORECAST_TOMORROW_SENSOR)
-        if tomorrow_entity and forecast_data.tomorrow_total_kwh is None:
-            tomorrow_val = _parse_sensor_float(self.hass, tomorrow_entity)
-            if tomorrow_val is not None:
-                forecast_data = ForecastData(
-                    remaining_today_kwh=forecast_data.remaining_today_kwh,
-                    hourly_breakdown=forecast_data.hourly_breakdown,
-                    tomorrow_total_kwh=tomorrow_val,
-                )
+        self._forecast_status = "available"
+        self._forecast_data = forecast_data
+        self._forecast_error = None
 
         try:
             tariff_info = self._get_tariff_info()
@@ -1349,9 +1783,23 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 forecast=forecast_data,
                 tariff=tariff_info,
                 appliances=appliance_configs,
+                appliance_states=self._get_appliance_states(appliance_configs, update_runtime=False),
+                now=dt_util.now(),
                 battery_config=battery_config,
                 current_soc=battery_soc,
                 export_limit=export_limit,
+                dynamic_battery_charge_enabled=self.config_entry.data.get(
+                    CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False
+                ),
+                battery_max_charge_power_w=int(
+                    self.config_entry.data.get(CONF_BATTERY_MAX_CHARGE_POWER_W, 0) or 0
+                ),
+                battery_trickle_charge_power_w=int(
+                    self.config_entry.data.get(
+                        CONF_BATTERY_TRICKLE_CHARGE_POWER_W,
+                        DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W,
+                    )
+                ),
             )
             _LOGGER.debug(
                 "Planner generated plan with %d entries, confidence %.2f",
@@ -1359,6 +1807,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.current_plan.confidence,
             )
         except Exception as err:
+            self.current_plan = None
+            self._forecast_status = "planner_error"
+            self._forecast_error = str(err)
             _LOGGER.error("Planner error: %s", err)
 
     def _get_battery_config(self) -> BatteryConfig | None:
@@ -1398,6 +1849,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Returns list of appliance_ids that were successfully changed.
         """
         if not self._enabled:
+            self._solar_start_since = {}
             _LOGGER.debug("Controller disabled, skipping all service calls")
             return []
 
@@ -1420,6 +1872,10 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if decision.action == Action.IDLE:
                 continue
 
+            # A pause relinquishes automatic control; an explicit override still acts.
+            if (getattr(self, "appliance_paused", {}).get(decision.appliance_id, False)
+                    and not self.appliance_overrides.get(decision.appliance_id, False)):
+                continue
             # Skip disabled appliances (unless override is active)
             if not self.appliance_enabled.get(decision.appliance_id, True) and not self.appliance_overrides.get(decision.appliance_id, False):
                 continue
@@ -1510,40 +1966,46 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         appliance_config.current_entity
                         and decision.target_current is not None
                     ):
-                        # H3: Skip entirely if same current already applied and appliance is on
-                        if (
-                            is_on
-                            and decision.target_current == self._last_applied_current.get(decision.appliance_id)
-                        ):
-                            _LOGGER.debug(
-                                "Skipping SET_CURRENT for %s: current %.1fA already applied",
-                                appliance_config.name, decision.target_current,
-                            )
-                            continue
-
-                        current_domain = (
-                            appliance_config.current_entity.split(".")[0]
-                            if "." in appliance_config.current_entity
-                            else "number"
+                        target = decision.target_current
+                        observed = _parse_sensor_float(self.hass, appliance_config.current_entity)
+                        last_target = self._last_applied_current.get(decision.appliance_id)
+                        disconnected = _parse_sensor_bool(self.hass, appliance_config.ev_connected_entity) is False
+                        writes = getattr(self, "_last_current_write", {})
+                        elapsed = _time.monotonic() - writes[decision.appliance_id] if decision.appliance_id in writes else None
+                        pending_other = (last_target is not None and last_target != target
+                                         and elapsed is not None
+                                         and elapsed < max(60, appliance_config.current_update_interval))
+                        confirmed = (not pending_other and observed is not None
+                                     and math.isclose(observed, target, abs_tol=1e-6))
+                        pending = (last_target == target
+                                   and (observed is None or appliance_config.min_current <= observed <= appliance_config.max_current)) and (
+                            disconnected or
+                            (elapsed is not None and elapsed < max(60, appliance_config.current_update_interval))
                         )
-                        # First: set the current value
-                        try:
-                            async with asyncio.timeout(10):
-                                await self.hass.services.async_call(
-                                    current_domain,
-                                    "set_value",
-                                    {
-                                        "entity_id": appliance_config.current_entity,
-                                        "value": decision.target_current,
-                                    },
-                                    blocking=True,
-                                )
-                        except (TimeoutError, Exception) as err:
-                            _LOGGER.error("Failed to set current for %s: %s", appliance_config.name, err)
+                        if confirmed or pending:
+                            self._last_applied_current[decision.appliance_id] = target
+                            if is_on or disconnected:
+                                continue
+                        else:
+                            current_domain = appliance_config.current_entity.split(".")[0]
+                            try:
+                                async with asyncio.timeout(10):
+                                    await self.hass.services.async_call(
+                                        current_domain, "set_value",
+                                        {"entity_id": appliance_config.current_entity, "value": target},
+                                        blocking=True,
+                                    )
+                            except Exception as err:
+                                _LOGGER.error("Failed to set current for %s: %s", appliance_config.name, err)
+                                continue
+                            self._last_applied_current[decision.appliance_id] = target
+                            if not hasattr(self, "_last_current_write"):
+                                self._last_current_write = {}
+                            self._last_current_write[decision.appliance_id] = _time.monotonic()
+                        if disconnected:
+                            # A disconnected EV may be preset once; it has not
+                            # physically started and must not produce ON events.
                             continue
-
-                        # Track last applied current for deduplication
-                        self._last_applied_current[decision.appliance_id] = decision.target_current
 
                         # H2: Only call turn_on if the appliance is not already on
                         if not is_on:
@@ -1614,6 +2076,24 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
             target_value = default_value
 
+        # Clamp against the target entity's declared min/max so HA doesn't reject
+        # the service call. Some Sungrow Modbus packages declare the helper as
+        # min=100 W, which silently rejects the optimizer's 0 W discharge block.
+        state = self.hass.states.get(discharge_entity)
+        if state is not None:
+            entity_min = state.attributes.get("min")
+            entity_max = state.attributes.get("max")
+            original = target_value
+            if entity_min is not None and target_value < entity_min:
+                target_value = float(entity_min)
+            if entity_max is not None and target_value > entity_max:
+                target_value = float(entity_max)
+            if target_value != original:
+                _LOGGER.debug(
+                    "Clamped battery discharge limit %.1fW -> %.1fW for %s (range %s..%s)",
+                    original, target_value, discharge_entity, entity_min, entity_max,
+                )
+
         # Skip the service call if the target value hasn't changed
         if target_value == self._last_discharge_limit:
             return
@@ -1637,6 +2117,164 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except Exception as err:
             _LOGGER.error("Failed to set battery discharge limit: %s", err)
+
+    async def _write_battery_max_charge(self, value_w: int) -> bool:
+        """Write the battery cap; return success for an accepted or deduplicated write.
+
+        A missing actuator or failed service call returns False so pending
+        releases can be retried on the next controller cycle.
+
+        Mirrors the clamping + dedupe + throttled-WARN pattern of
+        _apply_battery_discharge_limit. See
+        docs/dynamic-battery-charging.md
+        section "Coordinator reactive loop / Write hysteresis".
+        """
+        data = self.config_entry.data
+        entity_id = data.get(CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY)
+        if not entity_id:
+            return False
+
+        domain = entity_id.split(".")[0] if "." in entity_id else "number"
+        target_value: float = float(value_w)
+        now_ts = datetime.now(timezone.utc)
+
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            last = self._dyn_charge_last_warn_time
+            if last is None or (now_ts - last).total_seconds() > 60:
+                _LOGGER.warning(
+                    "Battery max-charge entity %s unavailable; skipping write",
+                    entity_id,
+                )
+                self._dyn_charge_last_warn_time = now_ts
+            return False
+
+        entity_min = state.attributes.get("min")
+        entity_max = state.attributes.get("max")
+        original = target_value
+        if entity_min is not None and target_value < entity_min:
+            target_value = float(entity_min)
+        if entity_max is not None and target_value > entity_max:
+            target_value = float(entity_max)
+        if target_value != original:
+            _LOGGER.debug(
+                "Clamped battery max-charge %.1fW -> %.1fW for %s (range %s..%s)",
+                original, target_value, entity_id, entity_min, entity_max,
+            )
+
+        # Dedupe: 50W deadband + 5min idle timeout.
+        DEADBAND_W = 50.0
+        IDLE_TIMEOUT_S = 300.0
+        last_w = self._dyn_charge_last_written_w
+        last_t = self._dyn_charge_last_write_time
+        if (
+            last_w is not None
+            and last_t is not None
+            and abs(target_value - last_w) < DEADBAND_W
+            and (now_ts - last_t).total_seconds() < IDLE_TIMEOUT_S
+        ):
+            return True
+
+        try:
+            async with asyncio.timeout(10):
+                await self.hass.services.async_call(
+                    domain,
+                    "set_value",
+                    {"entity_id": entity_id, "value": target_value},
+                    blocking=True,
+                )
+            self._dyn_charge_last_written_w = int(target_value)
+            self._dyn_charge_last_write_time = now_ts
+            return True
+        except TimeoutError:
+            _LOGGER.warning(
+                "Service call timed out setting battery max-charge on %s",
+                entity_id,
+            )
+        except Exception as err:
+            _LOGGER.error("Failed to set battery max-charge: %s", err)
+        return False
+
+    async def _dispatch_dynamic_battery_charge(self, power_state: PowerState | None) -> None:
+        """Per-cycle dispatch for the dynamic battery charge loop.
+
+        Implements the pause/resume state machine described in
+        docs/dynamic-battery-charging.md
+        section "Pause / resume state machine".
+        """
+        should_run = _dyn_charge_should_run(self)
+        max_w = int(self.config_entry.data.get(CONF_BATTERY_MAX_CHARGE_POWER_W, 0) or 0)
+
+        # An accepted release ends this pause's responsibility; failures remain
+        # pending so an unavailable actuator or transient service error can recover.
+        if not should_run:
+            valid_target = bool(self.config_entry.data.get(CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY)) and max_w > 0
+            startup_time = getattr(self, "_startup_time", None)
+            grace_elapsed = startup_time is None or (datetime.now() - startup_time).total_seconds() >= DEFAULT_STARTUP_GRACE_PERIOD
+            cold_forecast_pause = (
+                valid_target and grace_elapsed
+                and self.config_entry.data.get(CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False)
+                and not getattr(self, "_dyn_charge_self_disabled_reason", None)
+                and getattr(self, "_forecast_status", "not_configured") in ("unavailable", "pending", "planner_error")
+                and not getattr(self, "_dyn_charge_pause_released", False)
+            )
+            if self._dyn_charge_loop_active or cold_forecast_pause:
+                self._dyn_charge_release_pending = True
+                self._dyn_charge_loop_active = False
+            if getattr(self, "_dyn_charge_release_pending", False) and valid_target:
+                if await self._write_battery_max_charge(max_w) is True:
+                    self._dyn_charge_release_pending = False
+                    self._dyn_charge_pause_released = True
+                    _LOGGER.info("Dynamic battery charge: paused, yielded cap to max")
+            return
+
+        # A valid resumed curve supersedes an unfinished release. The next pause
+        # must release again, even if this one began during startup.
+        self._dyn_charge_release_pending = False
+        self._dyn_charge_pause_released = False
+
+        # Falling edge of pause: resume; the deadband naturally lets the new value through.
+        if should_run and not self._dyn_charge_loop_active:
+            self._dyn_charge_loop_active = True
+            _LOGGER.info("Dynamic battery charge: resumed dynamic control")
+
+        curve = (
+            self.current_plan.battery_charge_curve
+            if getattr(self, "current_plan", None) is not None else None
+        )
+        trickle_w = int(self.config_entry.data.get(
+            CONF_BATTERY_TRICKLE_CHARGE_POWER_W,
+            DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W,
+        ))
+        ceiling_w = int(self.config_entry.data.get(CONF_EXPORT_LIMIT, 0) or 0)
+        now_ts = datetime.now(timezone.utc)
+
+        setpoint_w = compute_battery_charge_setpoint(
+            now=now_ts,
+            excess_w=power_state.excess_power if power_state else None,
+            curve=curve,
+            export_soft_ceiling_w=ceiling_w,
+            battery_max_charge_power_w=max_w,
+            battery_trickle_charge_power_w=trickle_w,
+        )
+
+        # Stash components for the status sensor (Task 6 will surface these).
+        if curve is not None:
+            for sp in curve.setpoints:
+                if sp.start <= now_ts < sp.end:
+                    self._dyn_charge_planned_w = sp.max_charge_w
+                    break
+            else:
+                self._dyn_charge_planned_w = trickle_w
+        else:
+            self._dyn_charge_planned_w = trickle_w
+
+        self._dyn_charge_reactive_w = (
+            max(0, int((power_state.excess_power or 0) - ceiling_w))
+            if power_state and power_state.excess_power is not None else 0
+        )
+
+        await self._write_battery_max_charge(setpoint_w)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1671,7 +2309,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name=sub_data.get(CONF_APPLIANCE_NAME, f"Appliance {appliance_id}"),
             entity_id=sub_data.get(CONF_APPLIANCE_ENTITY, ""),
             priority=priority,
-            phases=int(sub_data.get(CONF_PHASES, 1)),
+            phases=self._effective_phases(appliance_id, sub_data),
             nominal_power=sub_data.get(CONF_NOMINAL_POWER, 0.0),
             actual_power_entity=sub_data.get(CONF_ACTUAL_POWER_ENTITY),
             dynamic_current=sub_data.get(CONF_DYNAMIC_CURRENT, False),
@@ -1707,14 +2345,22 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             helper_only=sub_data.get(CONF_HELPER_ONLY, False),
             protect_from_preemption=sub_data.get(CONF_PROTECT_FROM_PREEMPTION, False),
             current_step=sub_data.get(CONF_CURRENT_STEP, 0.1),
+            current_update_interval=sub_data.get(CONF_CURRENT_UPDATE_INTERVAL, 0),
+            current_min_change=sub_data.get(CONF_CURRENT_MIN_CHANGE, 0),
             override_active=override_active,
             max_daily_activations=(
                 int(sub_data[CONF_MAX_DAILY_ACTIVATIONS])
                 if sub_data.get(CONF_MAX_DAILY_ACTIVATIONS) is not None
                 else None
             ),
-            on_threshold=sub_data.get(CONF_ON_THRESHOLD),
+            on_threshold=sub_data.get(CONF_ON_THRESHOLD, self.config_entry.data.get(CONF_ON_THRESHOLD)),
             completion_power_threshold=sub_data.get(CONF_COMPLETION_POWER_THRESHOLD),
+            enable_condition_entity=sub_data.get("enable_condition_entity"),
+            enable_condition_mode=sub_data.get("enable_condition_mode", "start_only"),
+            start_delay=sub_data.get("start_delay", 0),
+            phase_count_entity=sub_data.get("phase_count_entity"),
+            remaining_runtime_entity=sub_data.get("remaining_runtime_entity"),
+            require_contiguous_runtime=sub_data.get("require_contiguous_runtime", False),
         )
 
     async def _turn_off_all_managed(self) -> None:
@@ -1776,9 +2422,23 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return {
             "power_state": latest_power,
+            "battery_charge_reserve_w": getattr(self, "_battery_charge_reserve_w", None),
+            "available_excess_power_w": getattr(self, "_available_excess_power_w", None),
+            "battery_priority_status": getattr(self, "_battery_priority_status", "inactive"),
             "power_history": list(self.power_history),
             "current_plan": self.current_plan,
+            "forecast_status": getattr(self, "_forecast_status", "not_configured"),
+            "forecast_remaining_today_kwh": getattr(getattr(self, "_forecast_data", None), "remaining_today_kwh", None),
+            "forecast_tomorrow_total_kwh": getattr(getattr(self, "_forecast_data", None), "tomorrow_total_kwh", None),
+            "forecast_interval_count": len(getattr(getattr(self, "_forecast_data", None), "hourly_breakdown", [])),
+            "forecast_error": getattr(self, "_forecast_error", None),
+            "forecast_sources": getattr(self, "_forecast_entities", []),
+            "forecast_tomorrow_sources": getattr(self, "_forecast_tomorrow_entities", []),
             "control_decisions": list(self.control_decisions),
+            "appliance_enabled": dict(self.appliance_enabled),
+            "appliance_overrides": dict(self.appliance_overrides),
+            "paused_appliances": dict(getattr(self, "appliance_paused", {})),
+            "pending_stop_appliances": sorted(getattr(self, "_pending_stop_appliances", ())),
             "battery_discharge_action": self.battery_discharge_action,
             "appliance_states": dict(self.appliance_states),
             "appliance_configs": {c.id: c for c in self._last_appliance_configs},

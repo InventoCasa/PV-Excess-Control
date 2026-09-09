@@ -4,7 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
-from custom_components.pv_excess_control.const import Action
+from custom_components.pv_excess_control.const import (
+    Action,
+    CONF_DYNAMIC_BATTERY_CHARGE_ENABLED,
+)
 from custom_components.pv_excess_control.models import (
     ApplianceConfig,
     ApplianceState,
@@ -258,3 +261,66 @@ class TestStatusSensorNativeValue:
         text = sensor.native_value
         assert len(text) == 255
         assert text.endswith("...")
+
+
+class TestDynamicBatteryChargeAttributes:
+    def _build_sensor(
+        self,
+        *,
+        feature_enabled: bool = True,
+        loop_active: bool = False,
+        force_charge: bool = False,
+        grid_charge_engaged: bool = False,
+        self_disabled_reason: str | None = None,
+        last_written_w: int | None = 1500,
+        planned_w: int = 1000,
+        reactive_w: int = 500,
+    ):
+        from custom_components.pv_excess_control.sensor import PvExcessStatusSensor
+        coord = MagicMock()
+        coord.config_entry = MagicMock()
+        coord.config_entry.entry_id = "test_entry"
+        coord.config_entry.data = {
+            CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: feature_enabled,
+        }
+        coord._dyn_charge_loop_active = loop_active
+        coord.force_charge = force_charge
+        coord._grid_charge_engaged = grid_charge_engaged
+        coord._dyn_charge_self_disabled_reason = self_disabled_reason
+        coord._dyn_charge_last_written_w = last_written_w
+        coord._dyn_charge_planned_w = planned_w
+        coord._dyn_charge_reactive_w = reactive_w
+        return PvExcessStatusSensor(coord)
+
+    def test_attributes_active_when_loop_active(self):
+        sensor = self._build_sensor(loop_active=True)
+        attrs = sensor.extra_state_attributes
+        assert attrs["dynamic_battery_charge_status"] == "active"
+        assert attrs["dynamic_battery_charge_setpoint_w"] == 1500
+        assert attrs["dynamic_battery_charge_planned_w"] == 1000
+        assert attrs["dynamic_battery_charge_reactive_w"] == 500
+
+    def test_attributes_paused_force_charge(self):
+        sensor = self._build_sensor(loop_active=False, force_charge=True)
+        attrs = sensor.extra_state_attributes
+        assert attrs["dynamic_battery_charge_status"] == "paused: forced_charge"
+
+    def test_attributes_paused_grid_charge(self):
+        sensor = self._build_sensor(loop_active=False, grid_charge_engaged=True)
+        attrs = sensor.extra_state_attributes
+        assert attrs["dynamic_battery_charge_status"] == "paused: grid_charge_engaged"
+
+    def test_attributes_disabled_with_reason(self):
+        sensor = self._build_sensor(
+            loop_active=False, self_disabled_reason="forecast_unavailable"
+        )
+        attrs = sensor.extra_state_attributes
+        assert attrs["dynamic_battery_charge_status"] == "disabled: forecast_unavailable"
+
+    def test_attributes_omitted_when_feature_disabled(self):
+        sensor = self._build_sensor(feature_enabled=False)
+        attrs = sensor.extra_state_attributes
+        assert "dynamic_battery_charge_status" not in attrs
+        assert "dynamic_battery_charge_setpoint_w" not in attrs
+        assert "dynamic_battery_charge_planned_w" not in attrs
+        assert "dynamic_battery_charge_reactive_w" not in attrs

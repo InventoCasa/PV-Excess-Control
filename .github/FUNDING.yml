@@ -1,10 +1,7 @@
 # GitHub Sponsors button configuration
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
 #
-# This file is managed in the private Gitea repository as the single source
-# of truth and syncs to the public GitHub repo via scripts/publish-public.sh.
-# The publish filter has an explicit carve-out for .github/FUNDING.yml — see
-# scripts/publish-exclude.txt.
+# Maintained directly in this GitHub repository.
 
 github: [InventoCasa]
 buy_me_a_coffee: henrikic

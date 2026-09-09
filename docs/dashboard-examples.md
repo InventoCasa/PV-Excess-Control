@@ -461,105 +461,7 @@ This chart uses the `plan_entries` attribute on `sensor.pv_excess_control_plan_c
 > - [`price-schedule-card-template.yaml`](dashboard/price-schedule-card-template.yaml) — generic template with `# <- CHANGE` markers
 > - [`price-schedule-card-example.yaml`](dashboard/price-schedule-card-example.yaml) — concrete example with 4 appliances and Octopus Energy pricing
 
-### Plan Timeline (Range Bars)
-
-Visualizes the planner's scheduled actions as range bars. Plan entries are read from the `plan_entries` attribute on `sensor.pv_excess_control_plan_confidence`.
-
-> **Note:** This is a simplified visualization. ApexCharts range bars require a start/end pair; entries without a `window_start`/`window_end` (e.g. reason-only entries) are skipped by the `data_generator`. Plan confidence is shown in the card header.
-
-```yaml
-type: custom:apexcharts-card
-header:
-  title: >-
-    Plan Timeline — confidence:
-    {{ states('sensor.pv_excess_control_plan_confidence') }}%
-  show: true
-graph_span: 24h
-span:
-  start: day
-series:
-  - entity: sensor.pv_excess_control_plan_confidence
-    name: EV Charger
-    type: rangeBar
-    color: cyan
-    data_generator: |
-      const entries = entity.attributes.plan_entries || [];
-      return entries
-        .filter(e =>
-          e.appliance_name === 'EV Charger' &&
-          e.window_start && e.window_end &&
-          (e.action === 'on' || e.action === 'set_current')
-        )
-        .map(e => ({
-          x: e.appliance_id,
-          y: [
-            new Date(e.window_start).getTime(),
-            new Date(e.window_end).getTime()
-          ],
-          meta: e.reason
-        }));
-  - entity: sensor.pv_excess_control_plan_confidence
-    name: Heat Pump
-    type: rangeBar
-    color: deep-orange
-    data_generator: |
-      const entries = entity.attributes.plan_entries || [];
-      return entries
-        .filter(e =>
-          e.appliance_name === 'Heat Pump' &&
-          e.window_start && e.window_end &&
-          (e.action === 'on' || e.action === 'set_current')
-        )
-        .map(e => ({
-          x: e.appliance_id,
-          y: [
-            new Date(e.window_start).getTime(),
-            new Date(e.window_end).getTime()
-          ],
-          meta: e.reason
-        }));
-  - entity: sensor.pv_excess_control_plan_confidence
-    name: Dishwasher
-    type: rangeBar
-    color: blue
-    data_generator: |
-      const entries = entity.attributes.plan_entries || [];
-      return entries
-        .filter(e =>
-          e.appliance_name === 'Dishwasher' &&
-          e.window_start && e.window_end &&
-          (e.action === 'on' || e.action === 'set_current')
-        )
-        .map(e => ({
-          x: e.appliance_id,
-          y: [
-            new Date(e.window_start).getTime(),
-            new Date(e.window_end).getTime()
-          ],
-          meta: e.reason
-        }));
-apex_config:
-  chart:
-    type: rangeBar
-    height: 160
-  plotOptions:
-    bar:
-      horizontal: true
-      barHeight: 50%
-  xaxis:
-    type: datetime
-    labels:
-      datetimeUTC: false
-  tooltip:
-    custom: |
-      function({ seriesIndex, dataPointIndex, w }) {
-        const data = w.config.series[seriesIndex].data[dataPointIndex];
-        const start = new Date(data.y[0]).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-        const end = new Date(data.y[1]).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-        const reason = (data.meta || '').replace(/_/g, ' ');
-        return '<div style="padding:4px 8px">' + start + '–' + end + '<br/>' + reason + '</div>';
-      }
-```
+> **Why no range-bar variant?** The HA `apexcharts-card` wrapper does not expose the standalone ApexCharts.js `rangeBar` type — only `line`, `column`, and `area` are accepted. A previous range-bar example here errored on render (issue #20). To get a horizontal-band look, layer one stepline series per appliance at distinct y-heights as shown in the templates above.
 
 ---
 
@@ -957,3 +859,52 @@ cards:
       - entity: sensor.pv_excess_control_dishwasher_activations_today
         name: Activations
 ```
+
+---
+
+## 10. Dynamic Battery Charge Setpoint
+
+### Dynamic Battery Charge Setpoint
+
+Visualizes how the planner curve floor and reactive ceiling-follower combine into the actual battery max-charge cap written to the inverter each cycle. Useful for tuning the export soft ceiling and sanity-checking the curve against forecast accuracy.
+
+Only visible when the dynamic battery charging feature is enabled (`dynamic_battery_charge_status` is not `"disabled: ..."`). All three series live as attributes on `sensor.pv_excess_control_status`.
+
+```yaml
+type: custom:apexcharts-card
+graph_span: 12h
+header:
+  show: true
+  title: Dynamic Battery Charge Control
+  show_states: true
+series:
+  - entity: sensor.pv_excess_control_status
+    name: Setpoint
+    attribute: dynamic_battery_charge_setpoint_w
+    type: line
+    stroke_width: 3
+    color: '#4CAF50'
+  - entity: sensor.pv_excess_control_status
+    name: Planned Floor
+    attribute: dynamic_battery_charge_planned_w
+    type: line
+    curve: stepline
+    stroke_width: 2
+    color: '#2196F3'
+  - entity: sensor.pv_excess_control_status
+    name: Reactive Lift
+    attribute: dynamic_battery_charge_reactive_w
+    type: line
+    stroke_width: 2
+    color: '#FF9800'
+apex_config:
+  yaxis:
+    title:
+      text: Watts
+  xaxis:
+    type: datetime
+    labels:
+      datetimeUTC: false
+```
+
+> Verified against the [romrider/apexcharts-card](https://github.com/romrider/apexcharts-card) docs. All series use `type: line` (the only supported chart type alongside `column` and `area`).

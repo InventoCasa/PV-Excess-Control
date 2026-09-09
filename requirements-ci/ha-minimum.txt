@@ -1,0 +1,7 @@
+# Validated minimum supported Home Assistant (Python 3.13).
+homeassistant==2025.8.0
+pytest==8.4.1
+pytest-asyncio==1.1.0
+pytest-homeassistant-custom-component==0.13.269
+# aiodns in this HA release is incompatible with pycares 5.
+pycares==4.11.0

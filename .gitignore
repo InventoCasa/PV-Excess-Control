@@ -16,3 +16,10 @@ tests/playwright/screenshots/
 package.json
 package-lock.json
 screenshot.png
+
+# Local configuration
+/.local/
+/secrets/
+*.key
+*.pem
+.env.*

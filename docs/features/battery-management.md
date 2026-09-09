@@ -9,7 +9,7 @@ PV Excess Control integrates with hybrid inverter systems to make battery-aware 
 Three strategies control how the battery is treated relative to appliances:
 
 ### Battery First
-The battery is charged to the target SoC before any appliances are turned on. Best for maximizing self-sufficiency -- the battery is always ready for the evening.
+Below target SoC, charging power is reserved before ordinary appliance allocation, even without a forecast. Appliances may use surplus beyond the battery charging limit. If no limit is known, only measured charging is protected. Explicit overrides and existing runtime/safety constraints retain their precedence. See [power reservation and measurement limits](../energy-policy.md#battery-first-without-a-forecast).
 
 ### Appliance First
 Appliances run using solar excess before any power goes to the battery. Best for time-sensitive tasks (EV charging deadline, dishwasher cycle) where you want maximum runtime during solar hours.
