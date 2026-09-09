@@ -10,8 +10,9 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_APPLIANCE_NAME, DOMAIN, MANUFACTURER
+from .const import CONF_APPLIANCE_NAME, DOMAIN
 from .coordinator import PvExcessCoordinator
+from .entity_lifecycle import add_entities_by_subentry, device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ async def async_setup_entry(
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
         entities.append(ApplianceActiveBinarySensor(coordinator, subentry_id, appliance_name))
 
-    async_add_entities(entities)
+    add_entities_by_subentry(async_add_entities, entities)
 
 
 class _PvExcessBinarySensorBase(
@@ -54,10 +55,10 @@ class _PvExcessBinarySensorBase(
 
     @property
     def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.config_entry.entry_id)},
-            name="PV Excess Control",
-            manufacturer=MANUFACTURER,
+        return device_info(
+            self.coordinator.config_entry,
+            getattr(self, "_appliance_id", None),
+            getattr(self, "_appliance_name", None),
         )
 
 
@@ -114,7 +115,7 @@ class ApplianceActiveBinarySensor(_PvExcessBinarySensorBase):
         super().__init__(coordinator)
         self._appliance_id = appliance_id
         self._appliance_name = appliance_name
-        self._attr_name = f"{appliance_name} Active"
+        self._attr_name = "Active"
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{appliance_id}_active"
         )

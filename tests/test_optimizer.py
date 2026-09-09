@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -983,12 +984,12 @@ class TestOptimizerTariff:
         assert decision.action == Action.IDLE
 
     def test_high_feed_in_prefers_export(self):
-        """When feed-in tariff > cheap grid price, turn ON from grid (export solar)."""
+        """A cheap opportunity tariff allows starts but cannot invent physical import."""
         optimizer = _optimizer_for_tests()
         # 1500W excess, 1000W appliance, allow_grid_supplement=True
         # Feed-in is 0.12/kWh, cheap grid price is 0.05/kWh
         # Net cost of using solar = lost 0.12, vs buying from grid = 0.05
-        # -> Optimizer should turn ON from grid (export solar instead)
+        # Physical solar still supplies this load on the net-metered connection.
         appliance = _make_appliance(
             nominal_power=1000.0,
             allow_grid_supplement=True,
@@ -1009,9 +1010,11 @@ class TestOptimizerTariff:
 
         assert len(result.decisions) == 1
         decision = result.decisions[0]
-        # Should turn ON via grid supplement: export solar, buy from grid
+        # On a net-metered connection, existing solar physically supplies the
+        # appliance even when imported energy would have a cheaper price.
         assert decision.action == Action.ON
-        assert "grid supplement" in decision.reason.lower() or "export solar" in decision.reason.lower()
+        assert not decision.uses_grid_supplement
+        assert decision.grid_supplement_watts == 0
 
     def test_per_appliance_cheap_threshold_allows_supplement(self):
         """Per-appliance threshold (higher) allows grid supplement even when global would block."""
@@ -2508,7 +2511,7 @@ class TestDeadlineReasonStrings:
             f"Expected deadline must-run prefix, got: {reason!r}"
         )
         # New format: "... remaining, deadline 14:00 (in ...)"
-        assert "remaining, deadline 14:00 (in " in reason, (
+        assert re.search(r"remaining, deadline 14:00 (?:\(tomorrow\) )?\(in ", reason), (
             f"Expected 'remaining, deadline 14:00 (in ' marker, got: {reason!r}"
         )
         # Old format signature: "...s remaining, deadline in Ns"
@@ -4296,9 +4299,9 @@ class TestCheapWindowTargetAmps:
             phases=3,
         )
         tariff = _make_tariff(current_price=0.01, cheap_threshold=0.05)
-        # 4000 / (230 * 3) = 5.797 → step_floor 0.1 → 5.7
+        # The target itself is independent of the imported-portion limit.
         result = optimizer._cheap_window_target_amps(appliance, tariff, phases=3)
-        assert result == 5.7
+        assert result == 16.0
 
     def test_clamped_up_to_min_current(self):
         optimizer = _optimizer_for_tests(grid_voltage=230)
@@ -4320,12 +4323,7 @@ class TestCheapWindowTargetAmps:
 # ---------------------------------------------------------------------------
 
 class TestCheapGridTargetSite1:
-    """Tests for the grid-supplement entry point in _allocate_dynamic_current (Site 1).
-
-    When there is insufficient solar excess to start a dynamic-current appliance
-    but the tariff is cheap, Site 1 now uses _cheap_window_target_amps to pick
-    the target amperage instead of hard-coding min_current.
-    """
+    """Cheap tariff targets for loads starting with insufficient solar."""
 
     def test_dynamic_current_cheap_grid_target_default_max(self):
         """OFF appliance, cheap, low excess, override=max_current → SET_CURRENT max_current."""
@@ -4339,8 +4337,8 @@ class TestCheapGridTargetSite1:
         state = _make_state(appliance.id, is_on=False)
         tariff = _make_tariff(current_price=0.01, cheap_threshold=0.05)
 
-        decision, power_consumed = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=0.0, tariff=tariff, plan=None,
+        decision, power_consumed = optimizer._allocate_appliance(
+            appliance, state, avg_budget=0.0, instant_budget=0.0, tariff=tariff, plan=None,
         )
         assert decision.action == Action.SET_CURRENT
         assert decision.target_current == 16.0
@@ -4358,12 +4356,12 @@ class TestCheapGridTargetSite1:
         state = _make_state(appliance.id, is_on=False)
         tariff = _make_tariff(current_price=0.01, cheap_threshold=0.05)
 
-        decision, _ = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=0.0, tariff=tariff, plan=None,
+        decision, _ = optimizer._allocate_appliance(
+            appliance, state, avg_budget=0.0, instant_budget=0.0, tariff=tariff, plan=None,
         )
-        # 4000W / (230*3) = 5.797A → floored 5.7
-        assert decision.action == Action.SET_CURRENT
-        assert decision.target_current == 5.7
+        # With no solar, 4000W cannot support the 4140W minimum.
+        assert decision.action == Action.IDLE
+        assert decision.target_current is None
 
     def test_dynamic_current_cheap_grid_target_none_preserves_min_current_behavior(self):
         optimizer = _optimizer_for_tests(grid_voltage=230)
@@ -4376,8 +4374,8 @@ class TestCheapGridTargetSite1:
         state = _make_state(appliance.id, is_on=False)
         tariff = _make_tariff(current_price=0.01, cheap_threshold=0.05)
 
-        decision, _ = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=0.0, tariff=tariff, plan=None,
+        decision, _ = optimizer._allocate_appliance(
+            appliance, state, avg_budget=0.0, instant_budget=0.0, tariff=tariff, plan=None,
         )
         assert decision.action == Action.SET_CURRENT
         assert decision.target_current == 6.0  # min_current, the existing behaviour
@@ -4393,8 +4391,8 @@ class TestCheapGridTargetSite1:
         state = _make_state(appliance.id, is_on=False)
         tariff = _make_tariff(current_price=0.01, cheap_threshold=0.05)
 
-        decision, _ = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=0.0, tariff=tariff, plan=None,
+        decision, _ = optimizer._allocate_appliance(
+            appliance, state, avg_budget=0.0, instant_budget=0.0, tariff=tariff, plan=None,
         )
         # Override is gated by allow_grid_supplement → existing IDLE branch fires
         assert decision.action == Action.IDLE
@@ -4405,12 +4403,7 @@ class TestCheapGridTargetSite1:
 # ---------------------------------------------------------------------------
 
 class TestCheapGridTargetSite2:
-    """Tests for the natural-scaling path in _allocate_dynamic_current (Site 2).
-
-    When there IS enough solar excess to start a dynamic-current appliance
-    naturally, but the tariff is cheap and an override is set, Site 2 clamps
-    the computed target_amps UP to the override value.
-    """
+    """Cheap tariff targets supplement naturally available solar current."""
 
     def test_dynamic_current_natural_scaling_clamps_up_to_override_when_cheap(self):
         """OFF appliance starting on partial solar + cheap tariff → uses override even though excess alone supports a lower current."""
@@ -4426,8 +4419,8 @@ class TestCheapGridTargetSite2:
 
         # Excess supports natural amps of 5520/(230*3) = 8A — without override, decision would be 8A.
         # Need avg_budget >= min_watts_needed (6 * 230 * 3 = 4140 + on_threshold) to enter natural-scaling path.
-        decision, _ = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=5520.0, tariff=tariff, plan=None,
+        decision, _ = optimizer._allocate_appliance(
+            appliance, state, avg_budget=5520.0, instant_budget=5520.0, tariff=tariff, plan=None,
         )
         assert decision.action == Action.SET_CURRENT
         assert decision.target_current == 16.0  # override clamped up
@@ -4444,22 +4437,15 @@ class TestCheapGridTargetSite2:
         state = _make_state(appliance.id, is_on=False)
         tariff = _make_tariff(current_price=0.10, cheap_threshold=0.05)  # not cheap
 
-        decision, _ = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=5520.0, tariff=tariff, plan=None,
+        decision, _ = optimizer._allocate_appliance(
+            appliance, state, avg_budget=5520.0, instant_budget=5520.0, tariff=tariff, plan=None,
         )
         # 5520/(230*3) = 8.0A naturally
         assert decision.action == Action.SET_CURRENT
         assert decision.target_current == 8.0
 
     def test_dynamic_current_natural_scaling_capped_by_max_grid_power_when_cheap(self):
-        """Site 2: cheap window with max_grid_power cap dominating override.
-
-        Large solar excess naturally supports max_current=16A, but with
-        max_grid_power=4000W, _cheap_window_target_amps returns 5.7A
-        (4000/(230*3)=5.797 → step_floor 0.1 = 5.7). Site 2's strict-greater
-        guard means the natural 16A is preserved (override 5.7 < natural 16),
-        so the test confirms the natural path is NOT clamped down by the
-        override — the override only ever clamps UP."""
+        """The import cap does not limit current already supported by solar."""
         optimizer = _optimizer_for_tests(grid_voltage=230)
         appliance = _make_appliance(
             dynamic_current=True, current_entity="number.kona_curr",
@@ -4471,11 +4457,10 @@ class TestCheapGridTargetSite2:
         tariff = _make_tariff(current_price=0.01, cheap_threshold=0.05)
 
         # avg_budget large enough to naturally support max_current
-        decision, _ = optimizer._allocate_dynamic_current(
-            appliance, state, avg_budget=15_000.0, tariff=tariff, plan=None,
+        decision, _ = optimizer._allocate_appliance(
+            appliance, state, avg_budget=15_000.0, instant_budget=15_000.0, tariff=tariff, plan=None,
         )
-        # Natural is 16A (clamped to max_current). Override capped to 5.7 by
-        # max_grid_power. Site 2 only clamps UP (strict greater), so 16 stays.
+        # All 16A are solar-supported, so the import cap does not restrict them.
         assert decision.action == Action.SET_CURRENT
         assert decision.target_current == 16.0
 
@@ -4535,10 +4520,7 @@ class TestCheapGridTargetSite3:
         assert decision.target_current == 6.0
 
     def test_dynamic_current_already_on_override_capped_by_max_grid_power(self):
-        """ON appliance, cheap, override=max_current=16A, max_grid_power=4000W → cap to 5.7A.
-        But min_current=6.0 means natural target_amps stays at 6A (current 6A + 0 budget).
-        Override result is 5.7A (capped by max_grid_power), which is LESS than natural 6A.
-        Strict-greater clamp does NOT modify, so target stays at 6A."""
+        """The imported-portion cap supplements the existing solar-supported current."""
         optimizer = _optimizer_for_tests(grid_voltage=230)
         appliance = _make_appliance(
             dynamic_current=True, current_entity="number.kona_curr",
@@ -4553,20 +4535,16 @@ class TestCheapGridTargetSite3:
             appliance, state, avg_budget=0.0, instant_budget=0.0,
             plan=None, tariff=tariff,
         )
-        # 4000/(230*3) = 5.797 → floored 5.7A. min_current=6.0 clamps natural up → 6.0
-        # Override 5.7 < natural 6.0, strict-greater fails, target stays at 6.0
+        # Existing 4140W solar plus up to 4000W grid supports 11.7A.
         assert decision.action == Action.SET_CURRENT
-        assert decision.target_current == 6.0
+        assert decision.target_current == pytest.approx(11.7)
+        assert decision.grid_supplement_watts == pytest.approx(3933)
 
-    def test_already_on_override_active_reason_tagged_for_shed_guard(self):
-        """When the override clamps an already-ON dynamic-current appliance UP,
-        the decision's reason MUST contain 'grid supplement' so SHED's guard at
-        optimizer.py:~1483 (`'grid supplement' in decision.reason.lower()`)
-        skips it. Otherwise the inflated power_delta drives instant_budget
-        negative and SHED reduces the appliance back to min_current.
+    def test_already_on_override_active_marks_structured_grid_support(self):
+        """The cheap target carries explicit grid support and debits only solar.
 
-        Regression test for the prod incident on 2026-04-26 where Kona stuck
-        at 6A despite cheap_grid_target_current=16A and -€0.086/kWh price.
+        Regression for the 2026-04-26 incident where the 16A target fell back
+        to 6A because imported watts were charged to the solar budget.
         """
         optimizer = _optimizer_for_tests(grid_voltage=230)
         appliance = _make_appliance(
@@ -4584,10 +4562,7 @@ class TestCheapGridTargetSite3:
         )
         assert decision.action == Action.SET_CURRENT
         assert decision.target_current == 16.0
-        assert "grid supplement" in decision.reason.lower(), (
-            f"reason '{decision.reason}' missing 'grid supplement' tag — "
-            "SHED guard will not skip this decision"
-        )
+        assert decision.uses_grid_supplement
         # Budget deduction must be the solar-supportable portion (= available −
         # current_power = avg_budget) only, not the full power_delta (= override
         # target × V × phases − current_power), so other appliances are not
@@ -4603,18 +4578,10 @@ class TestCheapGridTargetSite3:
         assert power_delta == 4410.0  # exactly the solar-supportable portion
 
     def test_already_on_override_active_when_natural_target_below_min_current(self):
-        """When raw_amps from the dual-budget formula falls below min_current
-        (e.g. avg_budget runs deeper negative than instant_budget mid-cycle),
-        the early-return at optimizer.py:~698 used to bypass the override and
-        emit a SHED-eligible 'Staying on…' reason. With the override active,
-        the override target must take precedence — the early return must NOT
-        fire, and the decision MUST be tagged 'grid supplement' so SHED's
-        guard skips it.
+        """A cheap target survives a negative residual that cannot support minimum.
 
-        Regression test for the prod incident on 2026-04-26 at 10:42:43 UTC
-        where Kona was shed despite cheap_grid_target_current=16A and price
-        at -€0.137/kWh, because excess_for_adjustment dipped below
-        (min_current * V * phases − current_power) = -7360W.
+        Regression for the 2026-04-26 incident where a below-minimum natural
+        target bypassed tariff support before SHED.
         """
         optimizer = _optimizer_for_tests(grid_voltage=230)
         appliance = _make_appliance(
@@ -4638,10 +4605,7 @@ class TestCheapGridTargetSite3:
             f"reason='{decision.reason}'"
         )
         assert decision.target_current == 16.0
-        assert "grid supplement" in decision.reason.lower(), (
-            f"reason '{decision.reason}' missing 'grid supplement' tag — "
-            "SHED guard will not skip this decision"
-        )
+        assert decision.uses_grid_supplement
 
 
 # ---------------------------------------------------------------------------
@@ -4656,10 +4620,11 @@ class TestPhase4CheapTariffDischargeBlock:
     auto-grid-charge state machine engaged)."""
 
     @staticmethod
-    def _decision(appliance_id: str, action: Action, reason: str):
+    def _decision(appliance_id: str, action: Action, reason: str, *, uses_grid=False):
         return ControlDecision(
             appliance_id=appliance_id, action=action,
             target_current=None, reason=reason, overrides_plan=False,
+            uses_grid_supplement=uses_grid,
         )
 
     def test_cheap_window_override_decision_blocks_discharge(self):
@@ -4670,6 +4635,7 @@ class TestPhase4CheapTariffDischargeBlock:
         decisions = [self._decision(
             "kona", Action.SET_CURRENT,
             "Grid supplement (cheap-window target): 16.0A (11040W, 4909W solar-supportable)",
+            uses_grid=True,
         )]
 
         action = optimizer._battery_discharge_protection(
@@ -4680,13 +4646,13 @@ class TestPhase4CheapTariffDischargeBlock:
         assert action.max_discharge_watts == 0
 
     def test_opportunity_cost_decision_blocks_discharge(self):
-        """A decision tagged with the opportunity-cost grid-supplement reason
-        also triggers the block (same substring, different code path)."""
+        """Opportunity-cost support uses the same explicit flag as cheap tariffs."""
         optimizer = _optimizer_for_tests()
         appliance = _make_appliance(id="kona")
         decisions = [self._decision(
             "kona", Action.SET_CURRENT,
             "Grid supplement (export solar at 0.080, buy grid at -0.137): 16.0A",
+            uses_grid=True,
         )]
 
         action = optimizer._battery_discharge_protection(
@@ -4710,6 +4676,7 @@ class TestPhase4CheapTariffDischargeBlock:
         decisions = [self._decision(
             "kona", Action.SET_CURRENT,
             "Grid supplement (cheap-window target): 16.0A (...)",
+            uses_grid=True,
         )]
 
         action = optimizer._battery_discharge_protection(
@@ -4773,6 +4740,7 @@ class TestPhase4CheapTariffDischargeBlock:
         decisions = [self._decision(
             "kona", Action.SET_CURRENT,
             "Grid supplement (cheap-window target): 16.0A (...)",
+            uses_grid=True,
         )]
         decisions_before = list(decisions)  # snapshot
 
@@ -4797,6 +4765,7 @@ class TestPhase4CheapTariffDischargeBlock:
         decisions = [self._decision(
             "kona", Action.SET_CURRENT,
             "Grid supplement (cheap-window target): 16.0A (...)",
+            uses_grid=True,
         )]
 
         action = optimizer._battery_discharge_protection(

@@ -9,6 +9,8 @@ from custom_components.pv_excess_control.models import (
     Action,
     ApplianceConfig,
     ApplianceState,
+    BatteryChargeSetpoint,
+    BatteryChargeCurve,
     BatteryConfig,
     BatteryDischargeAction,
     BatteryStrategy,
@@ -630,3 +632,58 @@ class TestBatteryTarget:
         )
         with pytest.raises(Exception):
             bt.target_soc = 50.0  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# TestBatteryChargeCurve
+# ---------------------------------------------------------------------------
+
+class TestBatteryChargeCurve:
+    def test_setpoint_is_frozen(self):
+        sp = BatteryChargeSetpoint(
+            start=datetime(2026, 5, 5, 9, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 5, 10, tzinfo=timezone.utc),
+            max_charge_w=1500,
+        )
+        with pytest.raises(Exception):
+            sp.max_charge_w = 2000  # frozen dataclass
+
+    def test_curve_holds_setpoints_and_telemetry(self):
+        sp = BatteryChargeSetpoint(
+            datetime(2026, 5, 5, 9, tzinfo=timezone.utc),
+            datetime(2026, 5, 5, 10, tzinfo=timezone.utc),
+            1500,
+        )
+        curve = BatteryChargeCurve(
+            created_at=datetime(2026, 5, 5, 8, tzinfo=timezone.utc),
+            setpoints=(sp,),
+            expected_curtailment_kwh=4.5,
+            headroom_kwh=3.0,
+            fallback_reason=None,
+        )
+        assert curve.setpoints[0].max_charge_w == 1500
+        assert curve.fallback_reason is None
+
+    def test_curve_fallback_reason_string(self):
+        curve = BatteryChargeCurve(
+            created_at=datetime(2026, 5, 5, 8, tzinfo=timezone.utc),
+            setpoints=(),
+            expected_curtailment_kwh=0.0,
+            headroom_kwh=0.0,
+            fallback_reason="forecast_unavailable",
+        )
+        assert curve.fallback_reason == "forecast_unavailable"
+
+    def test_plan_battery_charge_curve_defaults_to_none(self):
+        plan = Plan(
+            created_at=datetime(2026, 5, 5, 0, tzinfo=timezone.utc),
+            horizon=timedelta(hours=24),
+            entries=[],
+            battery_target=BatteryTarget(
+                target_soc=80.0,
+                target_time=datetime(2026, 5, 5, 18, tzinfo=timezone.utc),
+                strategy=BatteryStrategy.BALANCED,
+            ),
+            confidence=0.5,
+        )
+        assert plan.battery_charge_curve is None

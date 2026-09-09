@@ -235,6 +235,15 @@ def _make_coordinator(
     coord._latest_tariff = None
     coord._latest_power_state = None
 
+    # Dynamic battery charging (#17)
+    coord._dyn_charge_loop_active = False
+    coord._dyn_charge_last_written_w = None
+    coord._dyn_charge_last_write_time = None
+    coord._dyn_charge_last_warn_time = None
+    coord._dyn_charge_self_disabled_reason = None
+    coord._dyn_charge_planned_w = 0
+    coord._dyn_charge_reactive_w = 0
+
     tariff_type = entry.data.get(CONF_TARIFF_PROVIDER, TariffProviderEnum.NONE)
     coord._tariff_provider = create_tariff_provider(tariff_type, "")
 
@@ -882,11 +891,11 @@ class TestCollectPowerState:
         assert ps.grid_import is None
         assert ps.excess_power is None
 
-    def test_load_unavailable_hybrid_falls_through_to_grid_export(self):
+    def test_load_unavailable_hybrid_keeps_balance_unavailable(self):
         """Hybrid config, PV=4000, load unavailable, grid_export=1500.
 
-        Hybrid predicate is False (load_power is None), so it falls through
-        to the grid_export_entity branch. grid_export=1500>0 → excess=1500.
+        A configured hybrid PV/load topology must not switch to the meter
+        when its load reading becomes unavailable.
         """
         entry = _make_config_entry(data={
             CONF_PV_POWER: "sensor.pv_power",
@@ -913,7 +922,7 @@ class TestCollectPowerState:
         ps = coord._collect_power_state()
 
         assert ps.load_power is None
-        assert ps.excess_power == 1500.0
+        assert ps.excess_power is None
 
     def test_all_sensors_good_hybrid_still_works(self):
         """Regression guard: hybrid happy path still produces pv-load."""
@@ -1099,6 +1108,7 @@ class TestPowerHistory:
     def test_history_max_size_enforced(self):
         """History is capped at MAX_HISTORY_SIZE entries."""
         from custom_components.pv_excess_control.coordinator import MAX_HISTORY_SIZE
+        from homeassistant.util import dt as dt_util
 
         coord = _make_coordinator(states={
             "sensor.pv_power": MockState("1000"),
@@ -1440,8 +1450,8 @@ class TestGetApplianceStates:
 
         # The disabled appliance's state should be PRESERVED
         assert "sub_pump" in result2
-        assert result2["sub_pump"].runtime_today == timedelta(hours=1, minutes=30)
-        assert result2["sub_pump"].energy_today == 1.5
+        assert result2["sub_pump"].runtime_today == timedelta(hours=1, minutes=30, seconds=30)
+        assert result2["sub_pump"].energy_today == pytest.approx(1.5 + 1000 * 30 / 3600000)
 
     def test_removed_appliance_state_not_preserved(self):
         """State for a completely removed appliance (no subentry) should NOT be preserved."""
@@ -1524,8 +1534,15 @@ class TestSetupAndUnload:
             hass.config_entries,
             "async_forward_entry_setups",
             new_callable=AsyncMock,
-        ) as mock_forward:
+        ) as mock_forward, patch.object(
+            PvExcessCoordinator, "async_restore_daily_state", new_callable=AsyncMock,
+        ) as mock_restore, patch(
+            "custom_components.pv_excess_control.async_reconcile_appliance_entities",
+        ), patch(
+            "custom_components.pv_excess_control.async_track_time_change",
+        ):
             result = await async_setup_entry(hass, entry)
+            mock_restore.assert_awaited_once()
 
         assert result is True
         assert DOMAIN in hass.data
@@ -1654,6 +1671,7 @@ class TestUpdateCycle:
     async def test_update_enforces_history_max_size(self):
         """Update cycle enforces MAX_HISTORY_SIZE limit."""
         from custom_components.pv_excess_control.coordinator import MAX_HISTORY_SIZE
+        from homeassistant.util import dt as dt_util
 
         states = {
             "sensor.pv_power": MockState("1000"),
@@ -1674,7 +1692,7 @@ class TestUpdateCycle:
                     battery_soc=None,
                     battery_power=None,
                     ev_soc=None,
-                    timestamp=datetime.now(),
+                    timestamp=dt_util.utcnow(),
                 )
             )
 

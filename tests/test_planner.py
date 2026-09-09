@@ -704,6 +704,7 @@ class TestApplianceScheduling:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -764,6 +765,7 @@ class TestApplianceScheduling:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -808,6 +810,7 @@ class TestApplianceScheduling:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -858,6 +861,7 @@ class TestApplianceScheduling:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -917,6 +921,7 @@ class TestExportLimitManagement:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -973,6 +978,7 @@ class TestWeatherPreplanning:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -1028,6 +1034,7 @@ class TestCreatePlan:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -1067,6 +1074,7 @@ class TestCreatePlan:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=tariffs),
             appliances=appliances,
@@ -1102,6 +1110,7 @@ class TestCreatePlan:
 
         planner = Planner()
         plan = planner.create_plan(
+            now=_dt(0),
             forecast=forecast,
             tariff=_make_tariff_info(windows=[]),  # No tariff windows
             appliances=appliances,
@@ -1266,3 +1275,110 @@ class TestPlannerPerApplianceThreshold:
         # The entry's reason should be MIN_RUNTIME, not CHEAP_TARIFF
         assert len(entries) >= 1
         assert entries[0].reason == PlanReason.MIN_RUNTIME
+
+
+# ===========================================================================
+# TestCreatePlanWithCurve
+# ===========================================================================
+
+class TestCreatePlanWithCurve:
+    """Tests for create_plan() wiring of plan_battery_charge_curve."""
+
+    def test_create_plan_returns_curve_when_enabled(self):
+        """create_plan populates battery_charge_curve when dynamic charge is enabled."""
+        from datetime import datetime, time, timezone
+        from custom_components.pv_excess_control.models import BatteryConfig, TariffInfo
+        from custom_components.pv_excess_control.const import BatteryStrategy
+
+        UTC = timezone.utc
+        forecast = ForecastData(
+            remaining_today_kwh=20.0,
+            hourly_breakdown=[
+                HourlyForecast(
+                    start=datetime(2026, 5, 5, h, tzinfo=UTC),
+                    end=datetime(2026, 5, 5, h + 1, tzinfo=UTC),
+                    expected_kwh=4.0,
+                    expected_watts=4000.0,
+                )
+                for h in range(8, 18)
+            ],
+        )
+        battery = _make_battery_config(
+            capacity_kwh=10.0,
+            target_soc=80.0,
+            strategy=BatteryStrategy.BALANCED,
+        )
+        tariff = _make_tariff_info()
+        plan = Planner().create_plan(
+            forecast=forecast,
+            tariff=tariff,
+            appliances=[],
+            battery_config=battery,
+            current_soc=30.0,
+            base_load_watts=500.0,
+            now=datetime(2026, 5, 5, 8, tzinfo=UTC),
+            export_limit=6000,
+            dynamic_battery_charge_enabled=True,
+            battery_max_charge_power_w=5000,
+            battery_trickle_charge_power_w=100,
+        )
+        assert plan.battery_charge_curve is not None
+
+    def test_create_plan_skips_curve_when_disabled(self):
+        """create_plan leaves battery_charge_curve as None when disabled."""
+        from datetime import datetime, timezone
+        from custom_components.pv_excess_control.const import BatteryStrategy
+
+        UTC = timezone.utc
+        forecast = ForecastData(remaining_today_kwh=0.0, hourly_breakdown=[])
+        battery = _make_battery_config(
+            capacity_kwh=10.0,
+            target_soc=80.0,
+            strategy=BatteryStrategy.BALANCED,
+        )
+        tariff = _make_tariff_info()
+        plan = Planner().create_plan(
+            forecast=forecast,
+            tariff=tariff,
+            appliances=[],
+            battery_config=battery,
+            current_soc=30.0,
+            base_load_watts=500.0,
+            now=datetime(2026, 5, 5, 8, tzinfo=UTC),
+            export_limit=6000,
+            dynamic_battery_charge_enabled=False,
+        )
+        assert plan.battery_charge_curve is None
+
+    def test_create_plan_curve_omitted_when_no_battery_config(self):
+        """With dynamic charge enabled but no battery_config, the curve must be None."""
+        from datetime import datetime, timezone
+
+        UTC = timezone.utc
+        forecast = ForecastData(
+            remaining_today_kwh=20.0,
+            hourly_breakdown=[
+                HourlyForecast(
+                    start=datetime(2026, 5, 5, h, tzinfo=UTC),
+                    end=datetime(2026, 5, 5, h + 1, tzinfo=UTC),
+                    expected_kwh=4.0,
+                    expected_watts=4000.0,
+                )
+                for h in range(8, 18)
+            ],
+        )
+        tariff = _make_tariff_info()
+        plan = Planner().create_plan(
+            forecast=forecast,
+            tariff=tariff,
+            appliances=[],
+            battery_config=None,
+            current_soc=30.0,
+            base_load_watts=500.0,
+            now=datetime(2026, 5, 5, 8, tzinfo=UTC),
+            export_limit=6000,
+            dynamic_battery_charge_enabled=True,
+            battery_max_charge_power_w=5000,
+            battery_trickle_charge_power_w=100,
+        )
+        assert plan.battery_charge_curve is None

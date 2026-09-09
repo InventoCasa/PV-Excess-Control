@@ -1,0 +1,133 @@
+{
+  "entity": {
+    "switch": {
+      "appliance_paused": {
+        "name": "Pausiert"
+      },
+      "allow_grid_supplement": {
+        "name": "Netzergänzung erlauben"
+      }
+    },
+    "number": {
+      "cheap_price_threshold": {
+        "name": "Preisgrenze für günstigen Strom"
+      },
+      "battery_charge_price_threshold": {
+        "name": "Preisgrenze für Batterieladung"
+      }
+    }
+  },
+  "selector": {
+    "enable_condition_mode": {
+      "options": {
+        "start_only": "Nur vor dem Start",
+        "while_running": "Vor dem Start und während des Betriebs"
+      }
+    }
+  },
+  "config_subentries": {
+    "appliance": {
+      "step": {
+        "current": {
+          "data": {
+            "phase_count_entity": "Sensor für die tatsächliche Phasenzahl"
+          },
+          "data_description": {
+            "phase_count_entity": "Optionaler ganzzahliger Wert von 1 bis 3 für die Leistungsberechnung. Bei 0 oder unbekannt bleibt der letzte gültige Wert erhalten; beim Start gilt die konfigurierte Phasenzahl. Schaltet keine Hardwarephasen um."
+          }
+        },
+        "reconfigure_current": {
+          "data": {
+            "phase_count_entity": "Sensor für die tatsächliche Phasenzahl"
+          },
+          "data_description": {
+            "phase_count_entity": "Optionaler ganzzahliger Wert von 1 bis 3 für die Leistungsberechnung. Bei 0 oder unbekannt bleibt der letzte gültige Wert erhalten; beim Start gilt die konfigurierte Phasenzahl. Schaltet keine Hardwarephasen um."
+          }
+        },
+        "constraints": {
+          "data": {
+            "enable_condition_entity": "Freigabebedingung",
+            "enable_condition_mode": "Verhalten der Freigabebedingung",
+            "start_delay": "Verzögerung für Solarstarts",
+            "remaining_runtime_entity": "Restlaufzeit-Entity (Minuten)",
+            "require_contiguous_runtime": "Zusammenhängende Laufzeit erforderlich"
+          },
+          "data_description": {
+            "enable_condition_entity": "Optionaler Binärsensor oder Eingabe-Schalter. Aus oder unbekannt verhindert automatische Starts.",
+            "enable_condition_mode": "Nur vor dem Start oder zusätzlich während des Betriebs prüfen. Im zweiten Modus wird bei fehlender Freigabe auch ein bereits laufender Nur-Einschalten-Verbraucher gestoppt. Manuelle Übersteuerung hat Vorrang.",
+            "start_delay": "Sekunden mit durchgehend ausreichend zugeteilter Solarleistung vor dem Start. Günstiger Netzstrom, zwingende Laufzeitfristen und manuelle Übersteuerung umgehen die Verzögerung. Bei Hilfsgeräten diese Einstellung am abhängigen Verbraucher vornehmen.",
+            "remaining_runtime_entity": "Sensor oder Zahlen-Helper mit noch benötigten Minuten. Null beendet den Bedarf, unbekannt verhindert neue Starts. Nicht mit positivem festem Tagesminimum kombinierbar.",
+            "require_contiguous_runtime": "Begonnenen Bedarf auch bei sinkender Solarleistung fortsetzen. Erfordert ein positives Tagesmaximum; Sicherheitsgrenzen bleiben wirksam."
+          }
+        },
+        "reconfigure_constraints": {
+          "data": {
+            "enable_condition_entity": "Freigabebedingung",
+            "enable_condition_mode": "Verhalten der Freigabebedingung",
+            "start_delay": "Verzögerung für Solarstarts",
+            "remaining_runtime_entity": "Restlaufzeit-Entity (Minuten)",
+            "require_contiguous_runtime": "Zusammenhängende Laufzeit erforderlich"
+          },
+          "data_description": {
+            "enable_condition_entity": "Optionaler Binärsensor oder Eingabe-Schalter. Aus oder unbekannt verhindert automatische Starts.",
+            "enable_condition_mode": "Nur vor dem Start oder zusätzlich während des Betriebs prüfen. Im zweiten Modus wird bei fehlender Freigabe auch ein bereits laufender Nur-Einschalten-Verbraucher gestoppt. Manuelle Übersteuerung hat Vorrang.",
+            "start_delay": "Sekunden mit durchgehend ausreichend zugeteilter Solarleistung vor dem Start. Günstiger Netzstrom, zwingende Laufzeitfristen und manuelle Übersteuerung umgehen die Verzögerung. Bei Hilfsgeräten diese Einstellung am abhängigen Verbraucher vornehmen.",
+            "remaining_runtime_entity": "Sensor oder Zahlen-Helper mit noch benötigten Minuten. Null beendet den Bedarf, unbekannt verhindert neue Starts. Nicht mit positivem festem Tagesminimum kombinierbar.",
+            "require_contiguous_runtime": "Begonnenen Bedarf auch bei sinkender Solarleistung fortsetzen. Erfordert ein positives Tagesmaximum; Sicherheitsgrenzen bleiben wirksam."
+          }
+        }
+      },
+      "error": {
+        "helper_only_with_gate": "Hilfsgeräte dürfen keine eigene Freigabebedingung oder Startverzögerung haben. Am abhängigen Verbraucher konfigurieren."
+      }
+    }
+  },
+  "config": {
+    "step": {
+      "settings": {
+        "data": {
+          "on_threshold": "Standardpuffer zum Einschalten",
+          "off_threshold": "Schwelle zum Abschalten"
+        },
+        "data_description": {
+          "on_threshold": "Optionaler Standardwert in Watt. Verbraucherspezifische Werte haben Vorrang. Leer erhält die Standardwerte: 200 W für feste Lasten, 50 W für dynamische Verbraucher.",
+          "off_threshold": "Schaltschwelle von −500 bis +500 W. Positive Werte lassen bei Solarstarts und Stromanpassungen einen Einspeisepuffer frei."
+        }
+      },
+      "forecast": {
+        "data": {
+          "additional_forecast_sensors": "Weitere Prognosesensoren",
+          "additional_forecast_tomorrow_sensors": "Weitere Prognosesensoren für morgen"
+        },
+        "data_description": {
+          "additional_forecast_sensors": "Prognosen separater PV-Flächen. Doppelte Entity-IDs zählen nur einmal; keinen bereits enthaltenen Summensensor ergänzen.",
+          "additional_forecast_tomorrow_sensors": "Diese Quellen und der einzelne Morgen-Sensor ersetzen gemeinsam den morgigen Anteil der primären Prognosen. Alle morgigen Flächen angeben."
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "settings": {
+        "data": {
+          "on_threshold": "Standardpuffer zum Einschalten",
+          "off_threshold": "Schwelle zum Abschalten"
+        },
+        "data_description": {
+          "on_threshold": "Optionaler Standardwert in Watt. Verbraucherspezifische Werte haben Vorrang. Leer erhält die Standardwerte: 200 W für feste Lasten, 50 W für dynamische Verbraucher.",
+          "off_threshold": "Schaltschwelle von −500 bis +500 W. Positive Werte lassen bei Solarstarts und Stromanpassungen einen Einspeisepuffer frei."
+        }
+      },
+      "forecast": {
+        "data": {
+          "additional_forecast_sensors": "Weitere Prognosesensoren",
+          "additional_forecast_tomorrow_sensors": "Weitere Prognosesensoren für morgen"
+        },
+        "data_description": {
+          "additional_forecast_sensors": "Prognosen separater PV-Flächen. Doppelte Entity-IDs zählen nur einmal; keinen bereits enthaltenen Summensensor ergänzen.",
+          "additional_forecast_tomorrow_sensors": "Diese Quellen und der einzelne Morgen-Sensor ersetzen gemeinsam den morgigen Anteil der primären Prognosen. Alle morgigen Flächen angeben."
+        }
+      }
+    }
+  }
+}

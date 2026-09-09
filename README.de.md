@@ -12,6 +12,8 @@
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa)](https://github.com/sponsors/InventoCasa)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-FFDD00)](https://buymeacoffee.com/henrikic)
 
+Der [Release-Kandidat 0.4.0rc1](docs/release-candidate.de.md) dokumentiert Migration und Prüfstand. Neue optionale [Bedingungen und Bedienelemente](docs/generic-controls.de.md) sowie [Prognose- und Restlaufzeit-Eingaben](docs/forecast-runtime.de.md) behalten bestehende Standardwerte bei.
+
 ## Über das Projekt
 
 PV Excess Control wird entwickelt und gepflegt von Henrik Wasserfuhr, Gründer von [**InventoCasa**](https://inventocasa.de). Wir sind spezialisierte Smart Home Integratoren und entwerfen sowie implementieren komplette Home Assistant Umgebungen für Neubauten, Renovierungen und Nachrüstungen.
@@ -36,6 +38,7 @@ Diese Integration ist Open Source, weil ich daran glaube, der Community, die Hom
 - **Batteriebewusste Optimierung** - Drei Strategien: Batterie zuerst, Gerät zuerst, Ausgeglichen.
 - **Minimum-SoC Batterie-Schutz** - Schaltet Geräte ab, wenn der Batteriestand unter einen konfigurierten Schwellenwert fällt.
 - **Batterieentladeschutz** - Begrenzt die Entladerate, wenn große Verbraucher laufen.
+- **Dynamische Batterieladung** — Eine optionale Prognosekurve verschiebt das Laden in erwartete Abregelungszeiten; die reaktive Regelung hebt die Ladegrenze bei überschüssiger PV-Leistung an. Siehe [Dokumentation](docs/dynamic-battery-charging.md).
 
 ### Stromtarife & -netz
 - **Tarif-Integration** - Unterstützung für Tibber, Awattar, Nordpool, Octopus Energy und generische Preissensoren.
@@ -128,9 +131,11 @@ PV Excess Control wurde entwickelt, um dir dabei zu helfen, deine Stromrechnung 
 
 PRs sind gerne gesehen! Bitte eröffne zuerst ein Issue, um geplante Änderungen zu besprechen. Pull Requests sollten Tests für neue Logik enthalten und die bestehende Test-Suite erfolgreich durchlaufen.
 
+Entwicklungstests benötigen Python 3.14.2+; die festgelegte Testumgebung verwendet Home Assistant 2026.8.0. Details zu den Änderungen stehen in der [Dokumentation zu Steuerung und Neustarts](docs/stabilization.md).
+
 ```bash
 pip install -r requirements_test.txt
-python3 -m pytest tests/ --ignore=tests/playwright --ignore=tests/ha_integration_test.py
+python3 -m pytest tests/ -q
 ```
 
 ## Lizenz

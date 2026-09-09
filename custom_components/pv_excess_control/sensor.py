@@ -28,8 +28,9 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_APPLIANCE_NAME, DOMAIN, MANUFACTURER
+from .const import CONF_APPLIANCE_NAME, CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, DOMAIN
 from .coordinator import PvExcessCoordinator
+from .entity_lifecycle import add_entities_by_subentry, device_info
 from .models import BatteryDischargeAction
 from .status_formatter import FormattedStatus, format_status
 
@@ -45,6 +46,7 @@ async def async_setup_entry(
     coordinator: PvExcessCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
     entities: list[SensorEntity] = [
+        PvExcessStatusSensor(coordinator),
         PvExcessPowerSensor(coordinator),
         PvPlanConfidenceSensor(coordinator),
     ]
@@ -61,7 +63,7 @@ async def async_setup_entry(
             PvApplianceStatusSensor(coordinator, subentry_id, appliance_name),
         ])
 
-    async_add_entities(entities)
+    add_entities_by_subentry(async_add_entities, entities)
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +89,11 @@ class PvExcessBaseSensor(CoordinatorEntity[PvExcessCoordinator], SensorEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Associate all sensors with the PV Excess Control device."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.config_entry.entry_id)},
-            name="PV Excess Control",
-            manufacturer=MANUFACTURER,
+        """Associate sensors with the root or their appliance device."""
+        return device_info(
+            self.coordinator.config_entry,
+            getattr(self, "_appliance_id", None),
+            getattr(self, "_appliance_name", None),
         )
 
     @property
@@ -127,6 +129,16 @@ class PvExcessPowerSensor(PvExcessBaseSensor):
         return power_state.excess_power
 
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Explain the difference between measured surplus and policy budget."""
+        if self._data is None:
+            return None
+        return {key: self._data.get(key) for key in (
+            "available_excess_power_w", "battery_charge_reserve_w", "battery_priority_status",
+        )}
+
+
 class PvPlanConfidenceSensor(PvExcessBaseSensor):
     """Sensor reporting planner confidence as a percentage."""
 
@@ -154,9 +166,12 @@ class PvPlanConfidenceSensor(PvExcessBaseSensor):
         data = self.coordinator.data
         if data is None:
             return None
+        attrs = {key: data.get(key) for key in (
+            "forecast_status", "forecast_error", "forecast_sources", "forecast_tomorrow_sources",
+            "forecast_remaining_today_kwh", "forecast_tomorrow_total_kwh", "forecast_interval_count")}
         plan = data.get("current_plan")
         if plan is None or not plan.entries:
-            return None
+            return {**attrs, "plan_entries": [], "plan_entry_count": 0}
         configs = data.get("appliance_configs") or {}
         entries = []
         for entry in plan.entries:
@@ -170,7 +185,57 @@ class PvPlanConfidenceSensor(PvExcessBaseSensor):
                 e["window_start"] = entry.window.start.isoformat() if entry.window.start else None
                 e["window_end"] = entry.window.end.isoformat() if entry.window.end else None
             entries.append(e)
-        return {"plan_entries": entries, "plan_entry_count": len(plan.entries)}
+        return {**attrs, "plan_entries": entries, "plan_entry_count": len(plan.entries)}
+
+
+class PvExcessStatusSensor(PvExcessBaseSensor):
+    """Top-level integration status sensor exposing coordinator state."""
+
+    _attr_icon = "mdi:solar-power-variant"
+
+    def __init__(self, coordinator: PvExcessCoordinator) -> None:
+        super().__init__(coordinator, "status", "Status")
+
+    @property
+    def native_value(self) -> str:
+        """Return a simple ready/unavailable state string."""
+        return "ok" if self._data is not None else "unavailable"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose integration and dynamic-battery-charge state."""
+        attrs: dict[str, Any] = {}
+
+        if self.coordinator.config_entry.data.get(
+            CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False
+        ):
+            if getattr(self.coordinator, "_dyn_charge_self_disabled_reason", None):
+                status = f"disabled: {self.coordinator._dyn_charge_self_disabled_reason}"
+            elif getattr(self.coordinator, "force_charge", False):
+                status = "paused: forced_charge"
+            elif getattr(self.coordinator, "_grid_charge_engaged", False):
+                status = "paused: grid_charge_engaged"
+            elif getattr(self.coordinator, "_forecast_status", "not_configured") in ("unavailable", "pending", "planner_error"):
+                status = "paused: forecast_unavailable"
+            elif getattr(self.coordinator, "_dyn_charge_loop_active", False):
+                status = "active"
+            else:
+                status = "idle"
+            attrs["dynamic_battery_charge_status"] = status
+            attrs["dynamic_battery_charge_release_pending"] = getattr(
+                self.coordinator, "_dyn_charge_release_pending", False
+            )
+            attrs["dynamic_battery_charge_setpoint_w"] = (
+                getattr(self.coordinator, "_dyn_charge_last_written_w", None) or 0
+            )
+            attrs["dynamic_battery_charge_planned_w"] = getattr(
+                self.coordinator, "_dyn_charge_planned_w", 0
+            )
+            attrs["dynamic_battery_charge_reactive_w"] = getattr(
+                self.coordinator, "_dyn_charge_reactive_w", 0
+            )
+
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +255,10 @@ class PvApplianceBaseSensor(PvExcessBaseSensor):
         sensor_label: str,
     ) -> None:
         unique_id_suffix = f"appliance_{appliance_id}_{suffix}"
-        name = f"{appliance_name} {sensor_label}"
+        name = sensor_label
         super().__init__(coordinator, unique_id_suffix, name)
         self._appliance_id = appliance_id
+        self._appliance_name = appliance_name
 
     def _appliance_state(self):
         """Return the ApplianceState for this appliance, or None."""
@@ -222,7 +288,7 @@ class PvAppliancePowerSensor(PvApplianceBaseSensor):
     def native_value(self) -> float | None:
         """Return current power draw in Watts."""
         state = self._appliance_state()
-        if state is None:
+        if state is None or not state.current_power_available:
             return None
         return state.current_power
 
@@ -346,6 +412,22 @@ class PvApplianceStatusSensor(PvApplianceBaseSensor):
         """Uncached compose body. Always called via `_compose`."""
         if data is None:
             return None
+
+        mode_text = None
+        if self._appliance_id in data.get("pending_stop_appliances", ()):
+            mode_text = "Shutdown pending: waiting for device to confirm OFF"
+        elif not data.get("appliance_overrides", {}).get(self._appliance_id, False):
+            if data.get("paused_appliances", {}).get(self._appliance_id, False):
+                mode_text = "Paused: automatic control suspended"
+            elif not data.get("appliance_enabled", {}).get(self._appliance_id, True):
+                mode_text = "Disabled: automatic control off"
+        if mode_text is not None:
+            return FormattedStatus(
+                text=mode_text, action="off" if mode_text.startswith("Shutdown") else "idle",
+                overrides_plan=False, cooldown_seconds_remaining=None,
+                switch_deferred=False, headroom_watts=None, plan_action=None,
+                plan_window_start=None, plan_window_end=None,
+            )
 
         grace_remaining = data.get("grace_period_remaining")
         if grace_remaining is not None and grace_remaining > 0:

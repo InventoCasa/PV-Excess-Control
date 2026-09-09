@@ -1,0 +1,83 @@
+name: Public CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-tree:
+    name: Public tree and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14'
+      - name: Check tracked tree and every introduced commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          python scripts/check_public_tree.py
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            python scripts/check_public_tree.py --base "$PR_BASE" --head "$PR_HEAD"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            python scripts/check_public_tree.py --base "$PUSH_BASE" --head "$GITHUB_SHA"
+          fi
+      - name: Build and validate release package
+        run: python scripts/package_release.py --output dist/pv-excess-control.zip
+
+  tests:
+    name: HA ${{ matrix.ha }} / Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ha: '2025.8.0'
+            python: '3.13'
+            requirements: requirements-ci/ha-minimum.txt
+          - ha: '2026.8.0'
+            python: '3.14'
+            requirements: requirements-ci/ha-current.txt
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install pinned HA test dependencies
+        run: python -m pip install -r '${{ matrix.requirements }}'
+      - name: Run local tests without HA instance access
+        run: python -m pytest tests/ -q --tb=short
+
+  public-checks:
+    name: Public checks
+    if: ${{ always() }}
+    needs: [public-tree, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require successful guard, package and both HA test jobs
+        env:
+          TREE_RESULT: ${{ needs.public-tree.result }}
+          TEST_RESULT: ${{ needs.tests.result }}
+        run: |
+          test "$TREE_RESULT" = success
+          test "$TEST_RESULT" = success

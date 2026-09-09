@@ -282,3 +282,130 @@ async def test_grid_charge_independent_of_battery_strategy(
         mock_tariff_at(0.01, 0.02), mock_power_state_with_soc(70.0),
     )
     mock_inverter_controller.engage.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _apply_battery_discharge_limit clamping
+# ---------------------------------------------------------------------------
+
+
+def _stub_state(min_value=None, max_value=None):
+    from unittest.mock import MagicMock as _MM
+    s = _MM()
+    attrs = {}
+    if min_value is not None:
+        attrs["min"] = min_value
+    if max_value is not None:
+        attrs["max"] = max_value
+    s.attributes = attrs
+    return s
+
+
+@pytest.mark.asyncio
+async def test_discharge_limit_clamped_up_to_entity_min_when_below(coordinator_factory):
+    """Optimizer requests 0W block; entity's min is 100W → must write 100W, not 0W.
+
+    Reproduces the prod failure where input_number.set_sg_battery_max_discharge_power
+    rejected 0.0 (range 100.0 - 5000.0) and the inverter kept discharging.
+    """
+    from custom_components.pv_excess_control.const import (
+        CONF_BATTERY_MAX_DISCHARGE_ENTITY,
+        CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
+    )
+    from custom_components.pv_excess_control.models import BatteryDischargeAction
+
+    coord = coordinator_factory(
+        config_data={
+            CONF_BATTERY_MAX_DISCHARGE_ENTITY: "input_number.set_sg_battery_max_discharge_power",
+            CONF_BATTERY_MAX_DISCHARGE_DEFAULT: 5000.0,
+        },
+    )
+    coord.hass.states.get = lambda eid: _stub_state(min_value=100.0, max_value=5000.0)
+
+    await coord._apply_battery_discharge_limit(
+        BatteryDischargeAction(should_limit=True, max_discharge_watts=0.0)
+    )
+
+    coord.hass.services.async_call.assert_awaited_once()
+    args, kwargs = coord.hass.services.async_call.call_args
+    payload = args[2] if len(args) > 2 else kwargs.get("service_data") or kwargs
+    assert payload["value"] == 100.0
+    assert coord._last_discharge_limit == 100.0
+
+
+@pytest.mark.asyncio
+async def test_discharge_limit_passes_through_when_within_entity_range(coordinator_factory):
+    """A value inside [min, max] must not be modified."""
+    from custom_components.pv_excess_control.const import (
+        CONF_BATTERY_MAX_DISCHARGE_ENTITY,
+        CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
+    )
+    from custom_components.pv_excess_control.models import BatteryDischargeAction
+
+    coord = coordinator_factory(
+        config_data={
+            CONF_BATTERY_MAX_DISCHARGE_ENTITY: "input_number.set_sg_battery_max_discharge_power",
+            CONF_BATTERY_MAX_DISCHARGE_DEFAULT: 5000.0,
+        },
+    )
+    coord.hass.states.get = lambda eid: _stub_state(min_value=100.0, max_value=5000.0)
+
+    await coord._apply_battery_discharge_limit(
+        BatteryDischargeAction(should_limit=True, max_discharge_watts=2500.0)
+    )
+
+    args, kwargs = coord.hass.services.async_call.call_args
+    payload = args[2] if len(args) > 2 else kwargs.get("service_data") or kwargs
+    assert payload["value"] == 2500.0
+
+
+@pytest.mark.asyncio
+async def test_discharge_limit_clamped_down_to_entity_max_when_above(coordinator_factory):
+    """A value above the entity's max must be clamped down."""
+    from custom_components.pv_excess_control.const import (
+        CONF_BATTERY_MAX_DISCHARGE_ENTITY,
+        CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
+    )
+    from custom_components.pv_excess_control.models import BatteryDischargeAction
+
+    coord = coordinator_factory(
+        config_data={
+            CONF_BATTERY_MAX_DISCHARGE_ENTITY: "input_number.set_sg_battery_max_discharge_power",
+            CONF_BATTERY_MAX_DISCHARGE_DEFAULT: 5000.0,
+        },
+    )
+    coord.hass.states.get = lambda eid: _stub_state(min_value=100.0, max_value=5000.0)
+
+    await coord._apply_battery_discharge_limit(
+        BatteryDischargeAction(should_limit=True, max_discharge_watts=9999.0)
+    )
+
+    args, kwargs = coord.hass.services.async_call.call_args
+    payload = args[2] if len(args) > 2 else kwargs.get("service_data") or kwargs
+    assert payload["value"] == 5000.0
+
+
+@pytest.mark.asyncio
+async def test_discharge_limit_no_clamp_when_state_unknown(coordinator_factory):
+    """If the entity state is unavailable, write the requested value as-is (HA will reject if invalid)."""
+    from custom_components.pv_excess_control.const import (
+        CONF_BATTERY_MAX_DISCHARGE_ENTITY,
+        CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
+    )
+    from custom_components.pv_excess_control.models import BatteryDischargeAction
+
+    coord = coordinator_factory(
+        config_data={
+            CONF_BATTERY_MAX_DISCHARGE_ENTITY: "input_number.set_sg_battery_max_discharge_power",
+            CONF_BATTERY_MAX_DISCHARGE_DEFAULT: 5000.0,
+        },
+    )
+    coord.hass.states.get = lambda eid: None
+
+    await coord._apply_battery_discharge_limit(
+        BatteryDischargeAction(should_limit=True, max_discharge_watts=0.0)
+    )
+
+    args, kwargs = coord.hass.services.async_call.call_args
+    payload = args[2] if len(args) > 2 else kwargs.get("service_data") or kwargs
+    assert payload["value"] == 0.0

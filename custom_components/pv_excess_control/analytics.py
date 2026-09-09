@@ -8,6 +8,8 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from .daily_state import nonnegative_number
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -142,6 +144,41 @@ class AnalyticsTracker:
         Returns a default ApplianceStats if the appliance has no recorded data.
         """
         return self._appliance_stats.get(appliance_id, ApplianceStats())
+
+    def snapshot_daily(self) -> dict:
+        """Serialize totals alongside appliance counters for consistent summaries."""
+        return {
+            "solar_consumed_kwh": self._total_solar_consumed_kwh,
+            "solar_produced_kwh": self._total_solar_produced_kwh,
+            "grid_export_kwh": self._total_grid_export_kwh,
+            "savings": self._total_savings,
+            "appliances": {
+                key: {"energy_kwh": stats.energy_today_kwh,
+                      "runtime_seconds": stats.runtime_today.total_seconds(),
+                      "savings": stats.savings_today}
+                for key, stats in self._appliance_stats.items()
+            },
+        }
+
+    def restore_daily(self, data: object, active_ids: set[str]) -> None:
+        """Restore validated totals, excluding removed appliance records."""
+        if not isinstance(data, dict):
+            return
+        self._total_solar_consumed_kwh = nonnegative_number(data.get("solar_consumed_kwh"))
+        self._total_solar_produced_kwh = nonnegative_number(data.get("solar_produced_kwh"))
+        self._total_grid_export_kwh = nonnegative_number(data.get("grid_export_kwh"))
+        self._total_savings = nonnegative_number(data.get("savings"))
+        rows = data.get("appliances", {})
+        if isinstance(rows, dict):
+            self._appliance_stats = {
+                key: ApplianceStats(
+                    energy_today_kwh=nonnegative_number(row.get("energy_kwh")),
+                    runtime_today=timedelta(seconds=nonnegative_number(row.get("runtime_seconds"), 86400)),
+                    savings_today=nonnegative_number(row.get("savings")),
+                )
+                for key, row in rows.items()
+                if key in active_ids and isinstance(row, dict)
+            }
 
     def reset_daily(self) -> None:
         """Reset daily counters. Should be called at midnight."""

@@ -112,7 +112,7 @@ Set **Battery Discharge Override** to the maximum watts the battery should disch
 | **Protect From Preemption** | Off | When enabled, this appliance will never be shed to make room for a higher-priority appliance (requires global preemption to be enabled) |
 | **Switch Interval** | 300 s | Minimum seconds between state changes |
 | **Allow Grid Supplement** | Off | Allow a small grid draw to keep the appliance running |
-| **Max Grid Power** | -- | Maximum watts to draw from grid if grid supplement is enabled |
+| **Max Grid Power** | -- | Maximum imported watts, in addition to solar, when tariff support is eligible. Applies to both fixed and dynamic loads |
 
 > **Note:** Battery-level protection is configured in the battery settings, not per appliance. The `min_battery_soc` threshold (set during initial setup or in options) causes the optimizer to shed appliances when the battery SoC drops below the configured minimum.
 
@@ -188,3 +188,5 @@ Increase the **Switch Interval** to at least 300–600 seconds for devices sensi
 
 **Dynamic current not adjusting**
 Ensure the number entity for current is writable and that the min/max current values match your EVSE's actual limits.
+
+See [grid support and meter availability](../energy-policy.md#stable-tariff-support) for repeated-cycle behavior and power estimates.

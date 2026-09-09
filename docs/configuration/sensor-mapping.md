@@ -28,24 +28,15 @@ You need **at least one** of: `PV Power + Load Power`, `PV Power + Grid Export`,
 
 The integration calculates excess power depending on which sensors are configured:
 
-**If Import/Export sensor is provided:**
-```
-excess = grid_export - grid_import
-```
-(The import/export sensor value is split into its import and export components.)
+**Signed grid meter, no mapped battery power:** `excess = grid_export - grid_import`.
 
-**If Grid Export sensor only:**
-```
-excess = grid_export
-```
-(Falls back to `pv_production - load_power` when export reads zero.)
+**Signed grid meter with mapped battery power:** `excess = grid_export - grid_import + battery_charge - battery_discharge`.
 
-**If neither (PV + Load only):**
-```
-excess = pv_production - load_power
-```
+**Hybrid PV + Load mapping:** `excess = pv_production - load_power`. House load includes controlled appliances and excludes battery charging. This topology remains selected if a reading is zero or unavailable; unavailable required readings pause allocation.
 
-Note: Battery power is **not** added to the excess calculation. The battery's effect on excess is already reflected in the grid import/export or load values that the inverter reports.
+**Non-hybrid Grid Export mapping:** retain the measured export value when positive, with the existing PV-minus-load fallback at zero export. An export-only sensor cannot measure import.
+
+Battery power is added only when correcting net grid flow, never again to PV-minus-household-load. A separate charge/discharge channel that was configured but is unavailable is not assumed to be zero. See [budget and sensor details](../energy-policy.md).
 
 ---
 
@@ -108,7 +99,7 @@ template:
   - sensor:
       - name: "PV Grid Export"
         unit_of_measurement: W
-        state: "{{ -states('sensor.inverter_grid_power') | float(0) }}"
+        state: "{{ -(states('sensor.inverter_grid_power') | float(0)) }}"
 ```
 
 ---

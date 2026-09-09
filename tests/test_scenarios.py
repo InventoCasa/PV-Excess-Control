@@ -712,18 +712,14 @@ class TestBigConsumerBatteryProtection:
 # ---------------------------------------------------------------------------
 
 class TestHighFeedInTariff:
-    """2kW excess, 1kW appliance with allow_grid_supplement.
+    """A favorable tariff permits operation but cannot manufacture solar.
 
-    Feed-in tariff: 0.12/kWh
-    Current grid price: 0.05/kWh (cheap, below 0.10 threshold)
-
-    Since grid price (0.05) < feed-in tariff (0.12), it is more profitable
-    to export solar and buy from the grid than to use solar for the appliance.
-    Expected: appliance turns ON via grid supplement (export solar, buy from grid).
+    At one net meter, consuming 1kW from an existing 2kW surplus leaves
+    1kW export; it is not simultaneous full export and a fictitious import.
     """
 
-    def test_high_feed_in_prefers_export_over_appliance(self):
-        """Feed-in > grid price: optimizer turns appliance ON from grid, exports solar."""
+    def test_high_feed_in_accounts_for_physical_solar(self):
+        """Enough physical solar means zero imported portion, regardless of tariff."""
         optimizer = _optimizer_for_tests(grid_voltage=230)
         appliance = _make_appliance(
             id="water_heater",
@@ -748,15 +744,9 @@ class TestHighFeedInTariff:
 
         assert len(result.decisions) == 1
         decision = result.decisions[0]
-        assert decision.action == Action.ON, (
-            f"Should turn ON via grid supplement when feed-in ({tariff.feed_in_tariff}) > grid price ({tariff.current_price}), "
-            f"but got {decision.action}. Reason: {decision.reason}"
-        )
-        # Reason should indicate grid supplement logic
-        reason_lower = decision.reason.lower()
-        assert "grid supplement" in reason_lower or "export solar" in reason_lower, (
-            f"Reason should mention grid supplement but got: {decision.reason!r}"
-        )
+        assert decision.action == Action.ON
+        assert not decision.uses_grid_supplement
+        assert decision.grid_supplement_watts == 0
 
     def test_high_feed_in_does_not_apply_without_grid_supplement(self):
         """Opportunity cost only applies to allow_grid_supplement appliances.

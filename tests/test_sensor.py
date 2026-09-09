@@ -157,9 +157,10 @@ class TestSensorSetup:
 
         await async_setup_entry(hass, config_entry, capture)
 
-        # System sensors: excess_power, plan_confidence
-        assert len(added_entities) == 2
+        # System sensors: status, excess_power, plan_confidence
+        assert len(added_entities) == 3
         names = [e._attr_name for e in added_entities]
+        assert "Status" in names
         assert "Excess Power" in names
         assert "Plan Confidence" in names
 
@@ -185,8 +186,8 @@ class TestSensorSetup:
 
         await async_setup_entry(hass, config_entry, capture)
 
-        # 2 system + 5 per appliance * 2 appliances = 12
-        assert len(added_entities) == 12
+        # 3 system + 5 per appliance * 2 appliances = 13
+        assert len(added_entities) == 13
 
     @pytest.mark.asyncio
     async def test_appliance_sensor_names_use_appliance_name(self):
@@ -207,13 +208,10 @@ class TestSensorSetup:
 
         await async_setup_entry(hass, config_entry, capture)
 
-        appliance_names = [e._attr_name for e in added_entities if "Solar Charger" in e._attr_name]
-        assert len(appliance_names) == 5
-        assert "Solar Charger Power" in appliance_names
-        assert "Solar Charger Runtime Today" in appliance_names
-        assert "Solar Charger Energy Today" in appliance_names
-        assert "Solar Charger Activations Today" in appliance_names
-        assert "Solar Charger Status" in appliance_names
+        appliances = [e for e in added_entities if getattr(e, "_appliance_id", None) == "sub_1"]
+        assert len(appliances) == 5
+        assert {e.name for e in appliances} == {"Power", "Runtime Today", "Energy Today", "Activations Today", "Status"}
+        assert all(e.device_info["name"] == "Solar Charger" for e in appliances)
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,8 @@ This integration is open source because I believe in giving back to the communit
 
 ## Features
 
+The [0.4.0rc1 candidate notes](docs/release-candidate.md) explain migration and validation status. New optional [conditions, delays and controls](docs/generic-controls.md) and [forecast/runtime inputs](docs/forecast-runtime.md) keep existing configuration defaults.
+
 ### Core Optimization & Planning
 - **Smart Planning** - 24-hour forward-looking optimizer with weather-aware pre-planning and configurable plan influence.
 - **Priority-Based Appliance Control** - Manage multiple appliances with configurable priorities (1-1000).
@@ -37,6 +39,7 @@ This integration is open source because I believe in giving back to the communit
 - **Battery-Aware Optimization** - Three strategies: Battery First, Appliance First, Balanced.
 - **Minimum Battery SoC Protection** - Shed appliances when battery level drops below a configured threshold.
 - **Battery Discharge Protection** - Limit discharge rate when big consumers are running.
+- **Dynamic battery charging** — forecast-aware throttle that defers morning charging when the day's expected curtailment can fill the battery on its own, plus a reactive cap-follower that absorbs PV when measured excess approaches the export limit. Opt-in. See [docs/dynamic-battery-charging.md](docs/dynamic-battery-charging.md).
 
 ### Tariffs & Grid
 - **Tariff Integration** - Support for Tibber, Awattar, Nordpool, Octopus Energy, and generic price sensors.
@@ -129,9 +132,11 @@ PV Excess Control is designed to reduce your energy bills and maximize your sola
 
 Contributions are welcome! Please open an issue first to discuss proposed changes. Pull requests should include tests for new logic and must pass the existing test suite.
 
+Development tests require Python 3.14.2+; the pinned test environment uses Home Assistant 2026.8.0. See [control and restart behavior](docs/stabilization.md) for the stabilization changes.
+
 ```bash
 pip install -r requirements_test.txt
-python3 -m pytest tests/ --ignore=tests/playwright --ignore=tests/ha_integration_test.py
+python3 -m pytest tests/ -q
 ```
 
 

@@ -78,7 +78,7 @@ draw from grid instead of bleeding the battery you just charged.
 The block fires when ANY of these are true:
 
 1. **Any appliance decision in the current cycle is grid-supplemented** —
-   i.e. the optimizer's reason text contains `"grid supplement"`. This
+   i.e. the optimizer explicitly marks the decision as grid-supported. This
    includes the cheap-window override (Sites 1/2/3) AND the existing
    opportunity-cost path (`grid_price < feed_in_tariff`).
 2. **Manual `force_charge` switch is ON** — explicit user signal.
@@ -130,3 +130,5 @@ grid-supplement decision goes away, the integration restores
   (not the new `auto_battery_grid_charge` or `cheap_grid_target_current`).
   This is a behaviour change vs. before this version: their battery will
   no longer supplement appliances during opportunity-cost windows.
+
+See [current grid-budget semantics](energy-policy.md#stable-tariff-support): `max_grid_power` caps the imported portion, and runtime behavior no longer depends on status wording.

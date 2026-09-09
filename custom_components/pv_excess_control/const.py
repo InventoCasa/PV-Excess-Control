@@ -199,3 +199,26 @@ CONF_CURRENT_STEP = "current_step"
 CONF_ON_THRESHOLD = "on_threshold"
 CONF_COMPLETION_POWER_THRESHOLD = "completion_power_threshold"
 CONF_OFF_THRESHOLD = "off_threshold"
+
+# Dynamic battery charging
+CONF_DYNAMIC_BATTERY_CHARGE_ENABLED = "dynamic_battery_charge_enabled"
+CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY = "inverter_battery_max_charge_power_entity"
+CONF_BATTERY_MAX_CHARGE_POWER_W = "battery_max_charge_power_w"
+CONF_BATTERY_TRICKLE_CHARGE_POWER_W = "battery_trickle_charge_power_w"
+
+DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W = 100
+
+# Current command controls and timestamp history
+CONF_CURRENT_UPDATE_INTERVAL = "current_update_interval"
+CONF_CURRENT_MIN_CHANGE = "current_min_change"
+MAX_AVERAGING_WINDOW = 1800
+
+CONF_ENABLE_CONDITION_ENTITY = "enable_condition_entity"
+CONF_ENABLE_CONDITION_MODE = "enable_condition_mode"
+CONF_START_DELAY = "start_delay"
+CONF_PHASE_COUNT_ENTITY = "phase_count_entity"
+
+CONF_REMAINING_RUNTIME_ENTITY = "remaining_runtime_entity"
+CONF_REQUIRE_CONTIGUOUS_RUNTIME = "require_contiguous_runtime"
+CONF_ADDITIONAL_FORECAST_SENSORS = "additional_forecast_sensors"
+CONF_ADDITIONAL_FORECAST_TOMORROW_SENSORS = "additional_forecast_tomorrow_sensors"

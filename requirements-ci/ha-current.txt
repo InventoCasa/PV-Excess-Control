@@ -1,0 +1,5 @@
+# Validated current Home Assistant (Python 3.14).
+homeassistant==2026.8.0
+pytest==9.0.3
+pytest-asyncio==1.4.0
+pytest-homeassistant-custom-component==0.13.354

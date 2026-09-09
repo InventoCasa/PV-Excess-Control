@@ -65,12 +65,16 @@
         "data": {
           "forecast_provider": "Forecast Provider",
           "forecast_sensor": "Forecast Sensor",
-          "forecast_tomorrow_sensor": "Tomorrow Forecast Sensor (optional)"
+          "forecast_tomorrow_sensor": "Tomorrow Forecast Sensor (optional)",
+          "additional_forecast_sensors": "Additional forecast sensors",
+          "additional_forecast_tomorrow_sensors": "Additional tomorrow forecast sensors"
         },
         "data_description": {
           "forecast_provider": "Select your solar forecast provider integration.",
           "forecast_sensor": "Select the sensor entity that provides the solar forecast. For Solcast, select the forecast sensor that contains detailedForecast data (e.g., sensor.solcast_pv_forecast_forecast_today).",
-          "forecast_tomorrow_sensor": "Optional sensor for tomorrow's total forecast (e.g., sensor.solcast_pv_forecast_forecast_tomorrow). Enables weather pre-planning."
+          "forecast_tomorrow_sensor": "Optional sensor for tomorrow's total forecast (e.g., sensor.solcast_pv_forecast_forecast_tomorrow). Enables weather pre-planning.",
+          "additional_forecast_sensors": "Forecasts for additional PV arrays. Duplicate entity IDs are counted once.",
+          "additional_forecast_tomorrow_sensors": "Together with the single tomorrow sensor, these sources replace the tomorrow portion of the primary forecasts."
         }
       },
       "battery": {
@@ -93,7 +97,11 @@
           "inverter_force_charge_mode_entity": "Inverter mode entity (optional, e.g. EMS mode select)",
           "inverter_force_charge_mode_engage_value": "Mode value to engage (e.g. 'Forced mode')",
           "inverter_force_charge_mode_disengage_value": "Mode value to disengage (e.g. 'Self-consumption mode')",
-          "inverter_force_charge_power_entity": "Inverter forced-charge power entity (optional, input_number/number)"
+          "inverter_force_charge_power_entity": "Inverter forced-charge power entity (optional, input_number/number)",
+          "dynamic_battery_charge_enabled": "Enable dynamic battery charging",
+          "inverter_battery_max_charge_power_entity": "Inverter Battery Max Charge Power Entity",
+          "battery_max_charge_power_w": "Battery Max Charge Power (W)",
+          "battery_trickle_charge_power_w": "Battery Trickle Charge Power (W)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -112,7 +120,11 @@
           "inverter_force_charge_mode_entity": "Optional second entity for inverters that need a separate mode command (e.g. EMS mode selector).",
           "inverter_force_charge_mode_engage_value": "Value to write to the mode entity when engaging force-charge (e.g. 'Forced mode').",
           "inverter_force_charge_mode_disengage_value": "Value to write to the mode entity when disengaging force-charge (e.g. 'Self-consumption mode').",
-          "inverter_force_charge_power_entity": "Optional number entity to set the forced-charge power target on the inverter."
+          "inverter_force_charge_power_entity": "Optional number entity to set the forced-charge power target on the inverter.",
+          "dynamic_battery_charge_enabled": "When enabled, the integration writes a watts value to the configured inverter entity each cycle to throttle/maximize battery charging based on a forecast-derived curve and the configured export soft ceiling. Requires a forecast provider, battery capacity, battery SoC sensor, and a configured export limit. Default off.",
+          "inverter_battery_max_charge_power_entity": "Writable HA entity that accepts watts as the battery max charging power. Must be a number or input_number entity. Battery First also respects its current limit, including zero.",
+          "battery_max_charge_power_w": "Maximum battery charging power in watts. Also bounds the Battery First reservation below target SoC. A configured live charge-limit entity further caps the reservation; without a maximum, only measured charging is protected.",
+          "battery_trickle_charge_power_w": "Minimum value the integration writes when deferring charging in the morning. Default 100 W to satisfy hardware that rejects exactly 0."
         }
       },
       "settings": {
@@ -128,11 +140,12 @@
           "notification_service": "Notification Service",
           "notify_appliance_on": "Notify Appliance On",
           "notify_appliance_off": "Notify Appliance Off",
-          "notify_daily_summary": "Notify Daily Summary"
+          "notify_daily_summary": "Notify Daily Summary",
+          "on_threshold": "Default activation buffer"
         },
         "data_description": {
           "export_limit": "Maximum power allowed to export to the grid (0 = no limit).",
-          "off_threshold": "Grid draw (negative watts) tolerated before the optimizer starts shedding appliances. Default: -50 W.",
+          "off_threshold": "Shutdown threshold in watts (−500 to +500). Positive values retain an export buffer during solar starts and current adjustments.",
           "controller_interval": "How often the controller evaluates and adjusts appliances.",
           "planner_interval": "How often the planner recalculates the daily schedule.",
           "plan_influence": "Controls how the 24-hour planner influences real-time decisions. 'Light' lowers activation thresholds when the plan expects excess. 'Plan follows' actively schedules appliances based on forecast and tariff predictions. 'None' disables plan influence (pure reactive control).",
@@ -140,7 +153,8 @@
           "notification_service": "HA notification service target (e.g., notify.mobile_app_phone)",
           "notify_appliance_on": "Send a notification when an appliance is turned on by the integration.",
           "notify_appliance_off": "Send a notification when an appliance is turned off by the integration.",
-          "notify_daily_summary": "Send a daily summary notification at midnight with energy stats."
+          "notify_daily_summary": "Send a daily summary notification at midnight with energy stats.",
+          "on_threshold": "Optional global fallback in watts. Appliance-specific values take precedence. Empty keeps the defaults: 200 W for fixed loads, 50 W for dynamic loads."
         }
       }
     },
@@ -149,7 +163,11 @@
       "no_grid_sensor": "You must configure at least one of: Grid Export sensor, Combined Import/Export sensor, or Load Power sensor.",
       "missing_price_sensor": "A price sensor is required when a tariff provider is selected.",
       "missing_forecast_sensor": "A forecast sensor is required when a forecast provider is selected.",
-      "invalid_soc": "State of charge must be between 0% and 100%."
+      "invalid_soc": "State of charge must be between 0% and 100%.",
+      "missing_inverter_battery_charge_entity": "An inverter battery max charge power entity is required when dynamic battery charging is enabled.",
+      "missing_battery_max_charge_power": "Battery max charge power is required when dynamic battery charging is enabled.",
+      "battery_max_charge_below_trickle": "Battery max charge power must be greater than the trickle charge power.",
+      "missing_export_limit_for_dynamic_charge": "Export limit must be set when dynamic battery charging is enabled."
     },
     "abort": {
       "already_configured": "PV Excess Control is already configured."
@@ -192,7 +210,10 @@
             "cheap_grid_target_current": "Cheap-window target current (A)",
             "ev_soc_entity": "EV State of Charge Sensor",
             "ev_connected_entity": "EV Connected Sensor",
-            "ev_target_soc": "EV Target SoC"
+            "ev_target_soc": "EV Target SoC",
+            "current_update_interval": "Minimum interval for current increases (s)",
+            "current_min_change": "Minimum current increase (A)",
+            "phase_count_entity": "Actual phase count sensor"
           },
           "data_description": {
             "dynamic_current": "Enable to control this appliance by adjusting its current rather than simple on/off.",
@@ -203,7 +224,10 @@
             "cheap_grid_target_current": "Target current during cheap tariff windows when grid supplementation is enabled. Defaults to max_current. Capped by max_grid_power if set. Leave empty to use min_current (legacy behaviour).",
             "ev_soc_entity": "Sensor that reports the EV battery state of charge.",
             "ev_connected_entity": "Binary sensor that indicates whether the EV is connected.",
-            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)"
+            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)",
+            "current_update_interval": "Delay automatic increases after a successful current change. Reductions and manual overrides remain immediate. 0 disables the delay.",
+            "current_min_change": "Ignore automatic increases smaller than this value. Reductions remain immediate. 0 disables the minimum.",
+            "phase_count_entity": "Optional integer 1–3 for power accounting. Zero or unavailable retains the last valid count (configured phases at startup). Does not switch charger hardware."
           }
         },
         "constraints": {
@@ -228,7 +252,12 @@
             "is_big_consumer": "Big Consumer",
             "battery_discharge_override": "Battery Discharge Override (W)",
             "requires_appliance": "Requires Appliance",
-            "helper_only": "Run Only as Helper"
+            "helper_only": "Run Only as Helper",
+            "enable_condition_entity": "Enable condition",
+            "enable_condition_mode": "Condition behavior",
+            "start_delay": "Solar start delay",
+            "remaining_runtime_entity": "Remaining runtime entity (minutes)",
+            "require_contiguous_runtime": "Require continuous runtime"
           },
           "data_description": {
             "switch_interval": "Minimum time between switching this appliance on and off.",
@@ -249,7 +278,12 @@
             "is_big_consumer": "Mark as big consumer to control battery discharge when active. Set 'Battery Discharge Override' below to define the discharge limit.",
             "battery_discharge_override": "Override battery max discharge power (in watts) when this appliance is active.",
             "requires_appliance": "Select an appliance that must be running before this one can start. E.g., a pool heat pump requires the pool pump.",
-            "helper_only": "When enabled, this appliance only runs when another appliance lists it as its required dependency. It will never run on its own based on excess power."
+            "helper_only": "When enabled, this appliance only runs when another appliance lists it as its required dependency. It will never run on its own based on excess power.",
+            "enable_condition_entity": "Optional binary sensor or input boolean. Off or unavailable blocks automatic starts.",
+            "enable_condition_mode": "Start only checks before starting. While running also stops an active appliance if the condition is off or unavailable, including on-only devices. Manual override takes precedence.",
+            "start_delay": "Continuously sufficient allocated solar power before starting, in seconds. Tariff-funded operation, deadlines and manual override bypass the delay. Configure gates and delays on dependents, not helper-only devices.",
+            "remaining_runtime_entity": "Sensor or number helper reporting minutes still required. Zero completes demand; unknown prevents new starts. Cannot be combined with a positive fixed daily minimum.",
+            "require_contiguous_runtime": "After starting, continue the requested cycle through solar drops. Requires a positive daily maximum; safety limits remain effective."
           }
         },
         "reconfigure_basic": {
@@ -284,7 +318,10 @@
             "cheap_grid_target_current": "Cheap-window target current (A)",
             "ev_soc_entity": "EV State of Charge Sensor",
             "ev_connected_entity": "EV Connected Sensor",
-            "ev_target_soc": "EV Target SoC"
+            "ev_target_soc": "EV Target SoC",
+            "current_update_interval": "Minimum interval for current increases (s)",
+            "current_min_change": "Minimum current increase (A)",
+            "phase_count_entity": "Actual phase count sensor"
           },
           "data_description": {
             "dynamic_current": "Enable to control this appliance by adjusting its current rather than simple on/off.",
@@ -295,7 +332,10 @@
             "cheap_grid_target_current": "Target current during cheap tariff windows when grid supplementation is enabled. Defaults to max_current. Capped by max_grid_power if set. Leave empty to use min_current (legacy behaviour).",
             "ev_soc_entity": "Sensor that reports the EV battery state of charge.",
             "ev_connected_entity": "Binary sensor that indicates whether the EV is connected.",
-            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)"
+            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)",
+            "current_update_interval": "Delay automatic increases after a successful current change. Reductions and manual overrides remain immediate. 0 disables the delay.",
+            "current_min_change": "Ignore automatic increases smaller than this value. Reductions remain immediate. 0 disables the minimum.",
+            "phase_count_entity": "Optional integer 1–3 for power accounting. Zero or unavailable retains the last valid count (configured phases at startup). Does not switch charger hardware."
           }
         },
         "reconfigure_constraints": {
@@ -320,7 +360,12 @@
             "is_big_consumer": "Big Consumer",
             "battery_discharge_override": "Battery Discharge Override (W)",
             "requires_appliance": "Requires Appliance",
-            "helper_only": "Run Only as Helper"
+            "helper_only": "Run Only as Helper",
+            "enable_condition_entity": "Enable condition",
+            "enable_condition_mode": "Condition behavior",
+            "start_delay": "Solar start delay",
+            "remaining_runtime_entity": "Remaining runtime entity (minutes)",
+            "require_contiguous_runtime": "Require continuous runtime"
           },
           "data_description": {
             "switch_interval": "Minimum time between switching this appliance on and off.",
@@ -341,7 +386,12 @@
             "is_big_consumer": "Mark as big consumer to control battery discharge when active. Set 'Battery Discharge Override' below to define the discharge limit.",
             "battery_discharge_override": "Override battery max discharge power (in watts) when this appliance is active.",
             "requires_appliance": "Select an appliance that must be running before this one can start. E.g., a pool heat pump requires the pool pump.",
-            "helper_only": "When enabled, this appliance only runs when another appliance lists it as its required dependency. It will never run on its own based on excess power."
+            "helper_only": "When enabled, this appliance only runs when another appliance lists it as its required dependency. It will never run on its own based on excess power.",
+            "enable_condition_entity": "Optional binary sensor or input boolean. Off or unavailable blocks automatic starts.",
+            "enable_condition_mode": "Start only checks before starting. While running also stops an active appliance if the condition is off or unavailable, including on-only devices. Manual override takes precedence.",
+            "start_delay": "Continuously sufficient allocated solar power before starting, in seconds. Tariff-funded operation, deadlines and manual override bypass the delay. Configure gates and delays on dependents, not helper-only devices.",
+            "remaining_runtime_entity": "Sensor or number helper reporting minutes still required. Zero completes demand; unknown prevents new starts. Cannot be combined with a positive fixed daily minimum.",
+            "require_contiguous_runtime": "After starting, continue the requested cycle through solar drops. Requires a positive daily maximum; safety limits remain effective."
           }
         }
       },
@@ -356,7 +406,11 @@
         "suggest_big_consumer": "This appliance draws 3000W or more. Consider enabling 'Big Consumer' to prevent battery discharge when active. Submit again to keep current setting.",
         "cheap_grid_target_current_requires_dynamic": "Cheap-window target current is only available for dynamic-current appliances. Enable dynamic_current or leave this field empty.",
         "circular_dependency": "Circular dependency: the selected appliance already depends on this one.",
-        "helper_only_with_requires": "An appliance cannot be both a helper and have its own dependency. Either clear 'Requires Appliance' or uncheck 'Run Only as Helper'."
+        "helper_only_with_requires": "An appliance cannot be both a helper and have its own dependency. Either clear 'Requires Appliance' or uncheck 'Run Only as Helper'.",
+        "helper_only_with_gate": "Helper-only appliances cannot have their own enable condition or start delay. Configure these on the dependent appliance.",
+        "runtime_source_conflict": "A remaining-runtime entity cannot be combined with a positive fixed minimum.",
+        "contiguous_requires_maximum": "Continuous runtime requires a positive daily maximum.",
+        "helper_only_with_runtime": "Helper-only appliances cannot have independent runtime demand."
       },
       "abort": {
         "reconfigure_successful": "Appliance configuration updated successfully.",
@@ -430,12 +484,16 @@
         "data": {
           "forecast_provider": "Forecast Provider",
           "forecast_sensor": "Forecast Sensor",
-          "forecast_tomorrow_sensor": "Tomorrow Forecast Sensor (optional)"
+          "forecast_tomorrow_sensor": "Tomorrow Forecast Sensor (optional)",
+          "additional_forecast_sensors": "Additional forecast sensors",
+          "additional_forecast_tomorrow_sensors": "Additional tomorrow forecast sensors"
         },
         "data_description": {
           "forecast_provider": "Select your solar forecast provider integration.",
           "forecast_sensor": "Select the sensor entity that provides the solar forecast. For Solcast, select the forecast sensor that contains detailedForecast data (e.g., sensor.solcast_pv_forecast_forecast_today).",
-          "forecast_tomorrow_sensor": "Optional sensor for tomorrow's total forecast (e.g., sensor.solcast_pv_forecast_forecast_tomorrow). Enables weather pre-planning."
+          "forecast_tomorrow_sensor": "Optional sensor for tomorrow's total forecast (e.g., sensor.solcast_pv_forecast_forecast_tomorrow). Enables weather pre-planning.",
+          "additional_forecast_sensors": "Forecasts for additional PV arrays. Duplicate entity IDs are counted once.",
+          "additional_forecast_tomorrow_sensors": "Together with the single tomorrow sensor, these sources replace the tomorrow portion of the primary forecasts."
         }
       },
       "battery": {
@@ -458,7 +516,11 @@
           "inverter_force_charge_mode_entity": "Inverter mode entity (optional, e.g. EMS mode select)",
           "inverter_force_charge_mode_engage_value": "Mode value to engage (e.g. 'Forced mode')",
           "inverter_force_charge_mode_disengage_value": "Mode value to disengage (e.g. 'Self-consumption mode')",
-          "inverter_force_charge_power_entity": "Inverter forced-charge power entity (optional, input_number/number)"
+          "inverter_force_charge_power_entity": "Inverter forced-charge power entity (optional, input_number/number)",
+          "dynamic_battery_charge_enabled": "Enable dynamic battery charging",
+          "inverter_battery_max_charge_power_entity": "Inverter Battery Max Charge Power Entity",
+          "battery_max_charge_power_w": "Battery Max Charge Power (W)",
+          "battery_trickle_charge_power_w": "Battery Trickle Charge Power (W)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -477,7 +539,11 @@
           "inverter_force_charge_mode_entity": "Optional second entity for inverters that need a separate mode command (e.g. EMS mode selector).",
           "inverter_force_charge_mode_engage_value": "Value to write to the mode entity when engaging force-charge (e.g. 'Forced mode').",
           "inverter_force_charge_mode_disengage_value": "Value to write to the mode entity when disengaging force-charge (e.g. 'Self-consumption mode').",
-          "inverter_force_charge_power_entity": "Optional number entity to set the forced-charge power target on the inverter."
+          "inverter_force_charge_power_entity": "Optional number entity to set the forced-charge power target on the inverter.",
+          "dynamic_battery_charge_enabled": "When enabled, the integration writes a watts value to the configured inverter entity each cycle to throttle/maximize battery charging based on a forecast-derived curve and the configured export soft ceiling. Requires a forecast provider, battery capacity, battery SoC sensor, and a configured export limit. Default off.",
+          "inverter_battery_max_charge_power_entity": "Writable HA entity that accepts watts as the battery max charging power. Must be a number or input_number entity. Battery First also respects its current limit, including zero.",
+          "battery_max_charge_power_w": "Maximum battery charging power in watts. Also bounds the Battery First reservation below target SoC. A configured live charge-limit entity further caps the reservation; without a maximum, only measured charging is protected.",
+          "battery_trickle_charge_power_w": "Minimum value the integration writes when deferring charging in the morning. Default 100 W to satisfy hardware that rejects exactly 0."
         }
       },
       "settings": {
@@ -493,11 +559,12 @@
           "notification_service": "Notification Service",
           "notify_appliance_on": "Notify Appliance On",
           "notify_appliance_off": "Notify Appliance Off",
-          "notify_daily_summary": "Notify Daily Summary"
+          "notify_daily_summary": "Notify Daily Summary",
+          "on_threshold": "Default activation buffer"
         },
         "data_description": {
           "export_limit": "Maximum power allowed to export to the grid (0 = no limit).",
-          "off_threshold": "Grid draw (negative watts) tolerated before the optimizer starts shedding appliances. Default: -50 W.",
+          "off_threshold": "Shutdown threshold in watts (−500 to +500). Positive values retain an export buffer during solar starts and current adjustments.",
           "controller_interval": "How often the controller evaluates and adjusts appliances.",
           "planner_interval": "How often the planner recalculates the daily schedule.",
           "plan_influence": "Controls how the 24-hour planner influences real-time decisions. 'Light' lowers activation thresholds when the plan expects excess. 'Plan follows' actively schedules appliances based on forecast and tariff predictions. 'None' disables plan influence (pure reactive control).",
@@ -505,7 +572,8 @@
           "notification_service": "HA notification service target (e.g., notify.mobile_app_phone)",
           "notify_appliance_on": "Send a notification when an appliance is turned on by the integration.",
           "notify_appliance_off": "Send a notification when an appliance is turned off by the integration.",
-          "notify_daily_summary": "Send a daily summary notification at midnight with energy stats."
+          "notify_daily_summary": "Send a daily summary notification at midnight with energy stats.",
+          "on_threshold": "Optional global fallback in watts. Appliance-specific values take precedence. Empty keeps the defaults: 200 W for fixed loads, 50 W for dynamic loads."
         }
       }
     },
@@ -514,7 +582,11 @@
       "no_grid_sensor": "You must configure at least one of: Grid Export sensor, Combined Import/Export sensor, or Load Power sensor.",
       "missing_price_sensor": "A price sensor is required when a tariff provider is selected.",
       "missing_forecast_sensor": "A forecast sensor is required when a forecast provider is selected.",
-      "invalid_soc": "State of charge must be between 0% and 100%."
+      "invalid_soc": "State of charge must be between 0% and 100%.",
+      "missing_inverter_battery_charge_entity": "An inverter battery max charge power entity is required when dynamic battery charging is enabled.",
+      "missing_battery_max_charge_power": "Battery max charge power is required when dynamic battery charging is enabled.",
+      "battery_max_charge_below_trickle": "Battery max charge power must be greater than the trickle charge power.",
+      "missing_export_limit_for_dynamic_charge": "Export limit must be set when dynamic battery charging is enabled."
     }
   },
   "entity": {
@@ -524,6 +596,28 @@
       },
       "max_daily_runtime": {
         "name": "Max Daily Runtime"
+      },
+      "cheap_price_threshold": {
+        "name": "Cheap price threshold"
+      },
+      "battery_charge_price_threshold": {
+        "name": "Battery charge price threshold"
+      }
+    },
+    "switch": {
+      "appliance_paused": {
+        "name": "Paused"
+      },
+      "allow_grid_supplement": {
+        "name": "Allow grid supplement"
+      }
+    }
+  },
+  "selector": {
+    "enable_condition_mode": {
+      "options": {
+        "start_only": "Before starting only",
+        "while_running": "Before starting and while running"
       }
     }
   }

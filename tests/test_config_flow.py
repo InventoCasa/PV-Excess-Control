@@ -16,6 +16,7 @@ from custom_components.pv_excess_control.const import (
     CONF_ALLOW_GRID_CHARGING,
     CONF_BATTERY_CAPACITY,
     CONF_BATTERY_CHARGE_PRICE_THRESHOLD,
+    CONF_BATTERY_MAX_CHARGE_POWER_W,
     CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
     CONF_BATTERY_MAX_DISCHARGE_ENTITY,
     CONF_BATTERY_POWER,
@@ -23,8 +24,10 @@ from custom_components.pv_excess_control.const import (
     CONF_BATTERY_STRATEGY,
     CONF_BATTERY_TARGET_SOC,
     CONF_BATTERY_TARGET_TIME,
+    CONF_BATTERY_TRICKLE_CHARGE_POWER_W,
     CONF_CHEAP_PRICE_THRESHOLD,
     CONF_CONTROLLER_INTERVAL,
+    CONF_DYNAMIC_BATTERY_CHARGE_ENABLED,
     CONF_EXPORT_LIMIT,
     CONF_FEED_IN_TARIFF,
     CONF_FORECAST_PROVIDER,
@@ -32,12 +35,14 @@ from custom_components.pv_excess_control.const import (
     CONF_GRID_EXPORT,
     CONF_GRID_VOLTAGE,
     CONF_IMPORT_EXPORT,
+    CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY,
     CONF_INVERTER_TYPE,
     CONF_LOAD_POWER,
     CONF_PLANNER_INTERVAL,
     CONF_PRICE_SENSOR,
     CONF_PV_POWER,
     CONF_TARIFF_PROVIDER,
+    DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W,
     DEFAULT_CONTROLLER_INTERVAL,
     DEFAULT_GRID_VOLTAGE,
     DEFAULT_PLANNER_INTERVAL,
@@ -1249,3 +1254,127 @@ def test_validate_battery_section_passes_for_complete_three_step_config():
     }
     # Should NOT raise
     _validate_battery_section(good)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _validate_dynamic_charge_section
+# ---------------------------------------------------------------------------
+
+def _base_battery_input(extra: dict | None = None) -> dict:
+    """Minimal valid battery-step input (dynamic charge disabled by default)."""
+    base = {
+        CONF_BATTERY_STRATEGY: BatteryStrategy.BALANCED,
+        CONF_BATTERY_TARGET_SOC: 80,
+        CONF_BATTERY_TARGET_TIME: "16:00",
+        CONF_ALLOW_GRID_CHARGING: False,
+        CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: False,
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+class TestDynamicChargeValidation:
+    """Tests for _validate_dynamic_charge_section via async_step_battery."""
+
+    @pytest.mark.asyncio
+    async def test_dynamic_charge_disabled_with_blanks_passes(self):
+        """Feature off, blank optional fields → form accepted."""
+        flow = _make_flow()
+        flow.data[CONF_INVERTER_TYPE] = InverterType.HYBRID
+        result = await flow.async_step_battery(
+            user_input=_base_battery_input({
+                CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: False,
+            })
+        )
+        assert result["step_id"] == "settings"
+        assert not result.get("errors")
+
+    @pytest.mark.asyncio
+    async def test_dynamic_charge_enabled_missing_inverter_entity_fails(self):
+        """Feature on, no inverter entity → error redisplays."""
+        flow = _make_flow()
+        flow.data[CONF_INVERTER_TYPE] = InverterType.HYBRID
+        result = await flow.async_step_battery(
+            user_input=_base_battery_input({
+                CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: True,
+                # no CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY
+                CONF_BATTERY_MAX_CHARGE_POWER_W: 5000,
+                CONF_BATTERY_TRICKLE_CHARGE_POWER_W: 100,
+                CONF_EXPORT_LIMIT: 6000,
+            })
+        )
+        assert result["type"] == "form"
+        assert result["step_id"] == "battery"
+        assert result["errors"]["base"] == "missing_inverter_battery_charge_entity"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_charge_max_below_trickle_fails(self):
+        """max_w=100, trickle=200 → battery_max_charge_below_trickle error."""
+        flow = _make_flow()
+        flow.data[CONF_INVERTER_TYPE] = InverterType.HYBRID
+        result = await flow.async_step_battery(
+            user_input=_base_battery_input({
+                CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: True,
+                CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY: "number.batt_charge",
+                CONF_BATTERY_MAX_CHARGE_POWER_W: 100,
+                CONF_BATTERY_TRICKLE_CHARGE_POWER_W: 200,
+                CONF_EXPORT_LIMIT: 6000,
+            })
+        )
+        assert result["type"] == "form"
+        assert result["step_id"] == "battery"
+        assert result["errors"]["base"] == "battery_max_charge_below_trickle"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_charge_missing_max_power_fails(self):
+        """Feature on, inverter entity set but no max power → error."""
+        flow = _make_flow()
+        flow.data[CONF_INVERTER_TYPE] = InverterType.HYBRID
+        result = await flow.async_step_battery(
+            user_input=_base_battery_input({
+                CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: True,
+                CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY: "number.batt_charge",
+                # no CONF_BATTERY_MAX_CHARGE_POWER_W
+                CONF_BATTERY_TRICKLE_CHARGE_POWER_W: 100,
+                CONF_EXPORT_LIMIT: 6000,
+            })
+        )
+        assert result["type"] == "form"
+        assert result["step_id"] == "battery"
+        assert result["errors"]["base"] == "missing_battery_max_charge_power"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_charge_missing_export_limit_fails(self):
+        """Feature on, all present but export_limit=0 → error."""
+        flow = _make_flow()
+        flow.data[CONF_INVERTER_TYPE] = InverterType.HYBRID
+        result = await flow.async_step_battery(
+            user_input=_base_battery_input({
+                CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: True,
+                CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY: "number.batt_charge",
+                CONF_BATTERY_MAX_CHARGE_POWER_W: 5000,
+                CONF_BATTERY_TRICKLE_CHARGE_POWER_W: 100,
+                CONF_EXPORT_LIMIT: 0,
+            })
+        )
+        assert result["type"] == "form"
+        assert result["step_id"] == "battery"
+        assert result["errors"]["base"] == "missing_export_limit_for_dynamic_charge"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_charge_all_valid_passes(self):
+        """Feature on with all required fields → form accepted."""
+        flow = _make_flow()
+        flow.data[CONF_INVERTER_TYPE] = InverterType.HYBRID
+        result = await flow.async_step_battery(
+            user_input=_base_battery_input({
+                CONF_DYNAMIC_BATTERY_CHARGE_ENABLED: True,
+                CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY: "number.batt_charge",
+                CONF_BATTERY_MAX_CHARGE_POWER_W: 5000,
+                CONF_BATTERY_TRICKLE_CHARGE_POWER_W: 100,
+                CONF_EXPORT_LIMIT: 6000,
+            })
+        )
+        assert result["step_id"] == "settings"
+        assert not result.get("errors")
