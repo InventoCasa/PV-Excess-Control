@@ -145,7 +145,8 @@
           "battery_hold_release_value": "Befehlswert zum Freigeben",
           "battery_hold_feedback_entity": "Rückmeldung der Entladesperre",
           "battery_hold_feedback_engage_value": "Rückmeldewert bei Sperre (optional)",
-          "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)"
+          "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)",
+          "battery_pv_forecast_factor": "PV-Prognosefaktor für Netzladen"
         },
         "data_description": {
           "battery_strategy": "Priorität zwischen Batterieladung und Verbrauchersteuerung.",
@@ -185,7 +186,8 @@
           "battery_hold_release_value": "Wert, der normalen Eigenverbrauch wiederherstellt, etwa off.",
           "battery_hold_feedback_entity": "Physische Rückmeldung von Sperre und Freigabe. Bei Eingabehelfern erforderlich und von der Steuerentität verschieden.",
           "battery_hold_feedback_engage_value": "Erwartete physische Rückmeldung bei aktiver Sperre. Leer lassen, um den Befehlswert zum Sperren zu verwenden.",
-          "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Leer lassen, um den Befehlswert zum Freigeben zu verwenden."
+          "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Leer lassen, um den Befehlswert zum Freigeben zu verwenden.",
+          "battery_pv_forecast_factor": "Skaliert die PV-Prognose nur für die Batterie-Netzladeplanung: 0,9 bedeutet 90 % der Prognose. Bereich 0,1–1,0; Standard 1,0 lässt die Prognose unverändert. Anhand früherer, zum Planungszeitpunkt verfügbarer Prognosen und der später gemessenen Erzeugung kalibrieren. Solar- und Geräteplanung bleiben unverändert."
         }
       }
     },
@@ -261,7 +263,8 @@
           "battery_hold_release_value": "Befehlswert zum Freigeben",
           "battery_hold_feedback_entity": "Rückmeldung der Entladesperre",
           "battery_hold_feedback_engage_value": "Rückmeldewert bei Sperre (optional)",
-          "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)"
+          "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)",
+          "battery_pv_forecast_factor": "PV-Prognosefaktor für Netzladen"
         },
         "data_description": {
           "battery_strategy": "Priorität zwischen Batterieladung und Verbrauchersteuerung.",
@@ -301,7 +304,8 @@
           "battery_hold_release_value": "Wert, der normalen Eigenverbrauch wiederherstellt, etwa off.",
           "battery_hold_feedback_entity": "Physische Rückmeldung von Sperre und Freigabe. Bei Eingabehelfern erforderlich und von der Steuerentität verschieden.",
           "battery_hold_feedback_engage_value": "Erwartete physische Rückmeldung bei aktiver Sperre. Leer lassen, um den Befehlswert zum Sperren zu verwenden.",
-          "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Leer lassen, um den Befehlswert zum Freigeben zu verwenden."
+          "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Leer lassen, um den Befehlswert zum Freigeben zu verwenden.",
+          "battery_pv_forecast_factor": "Skaliert die PV-Prognose nur für die Batterie-Netzladeplanung: 0,9 bedeutet 90 % der Prognose. Bereich 0,1–1,0; Standard 1,0 lässt die Prognose unverändert. Anhand früherer, zum Planungszeitpunkt verfügbarer Prognosen und der später gemessenen Erzeugung kalibrieren. Solar- und Geräteplanung bleiben unverändert."
         }
       }
     },

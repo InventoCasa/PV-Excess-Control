@@ -18,6 +18,7 @@ from custom_components.pv_excess_control.config_flow import (
 NUMERIC_LIMITS = {
     "battery_grid_target_soc": (80, 0, 100),
     "battery_roundtrip_efficiency": (0.85, 0.5, 1),
+    "battery_pv_forecast_factor": (1, 0.1, 1),
     "battery_wear_cost_per_kwh": (0, 0, 1),
     "battery_soc_hysteresis": (2, 0, 20),
     "battery_input_max_age_seconds": (300, 30, 3600),

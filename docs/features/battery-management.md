@@ -62,6 +62,24 @@ battery; grid purchases follow expected demand and economical time windows.
 A bounded numerical search produces an approximate schedule. Forecasts and
 household demand remain estimates; projected savings are not measured savings.
 
+### Calibrating the PV forecast
+
+**PV forecast factor for grid charging** (`battery_pv_forecast_factor`) scales
+expected PV energy only for battery grid-charge planning. The default **1.0**
+uses the full forecast; **0.9** uses 90%. The supported range is 0.1–1.0.
+Reducing the factor can increase the additional grid energy planned when useful
+and economical. It does not change the provider's sensors, solar target,
+household demand profile or independent solar/appliance planning.
+
+Choose the factor from representative historical forecasts available at the
+time the charging decision would have been made, compared with actual
+production over the same intervals. A forecast updated after sunrise cannot
+reconstruct the uncertainty of an earlier overnight decision. Seasonal weather
+and shading may change the bias, so review the factor as conditions change and
+avoid applying the same correction twice if the provider already calibrates
+its estimates. A lower forecast remains an assumption, not a guarantee of
+production. Missing, invalid or stale forecast inputs still block charging.
+
 ### Costs and losses
 
 The useful-energy cost is:

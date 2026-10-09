@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from homeassistant.core import State
@@ -15,6 +16,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from .const import CONF_BATTERY_PV_FORECAST_FACTOR, DEFAULT_BATTERY_PV_FORECAST_FACTOR
 from .inverter_control import InverterGridChargeController
 from .models import InverterGridChargeConfig
 
@@ -539,6 +541,11 @@ class BatteryControlMixin:
         """Validate observations before passing immutable inputs to pure planning."""
         from .battery_planner import BatteryPlanningConfig, build_battery_grid_plan
         d = self.config_entry.data
+        factor = d.get(CONF_BATTERY_PV_FORECAST_FACTOR, DEFAULT_BATTERY_PV_FORECAST_FACTOR)
+        if (isinstance(factor, bool) or not isinstance(factor, (int, float))
+                or not math.isfinite(factor) or not .1 <= factor <= 1.):
+            self._battery_grid_plan = None
+            return "invalid_pv_forecast_factor"
         age = d.get("battery_input_max_age_seconds", 300)
         # Use the live State object: REST serialization can cache old report
         # timestamps for unchanged zero readings even while polls keep arriving.
@@ -603,7 +610,12 @@ class BatteryControlMixin:
                 wear_cost_per_kwh=d.get("battery_wear_cost_per_kwh", 0),
                 charge_price_limit=tariff_info.battery_charge_price_threshold, hold_supported=hold,
             )
-            self._battery_grid_plan = build_battery_grid_plan(now, soc, tariff_info.windows, forecast.hourly_breakdown, profile, config)
+            # Calibration belongs to grid-purchase planning only. The shared
+            # provider forecast still drives independent solar/appliance plans.
+            grid_forecast = [replace(row, expected_kwh=row.expected_kwh * factor,
+                                     expected_watts=row.expected_watts * factor)
+                             for row in forecast.hourly_breakdown]
+            self._battery_grid_plan = build_battery_grid_plan(now, soc, tariff_info.windows, grid_forecast, profile, config)
             self._battery_plan_key = key
             self._battery_plan_created = now
         return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason

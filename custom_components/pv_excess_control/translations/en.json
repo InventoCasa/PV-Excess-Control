@@ -118,7 +118,8 @@
           "battery_hold_release_value": "Hold release value",
           "battery_hold_feedback_entity": "Discharge hold readback",
           "battery_hold_feedback_engage_value": "Hold readback value (optional)",
-          "battery_hold_feedback_release_value": "Release readback value (optional)"
+          "battery_hold_feedback_release_value": "Release readback value (optional)",
+          "battery_pv_forecast_factor": "PV forecast factor for grid charging"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -158,7 +159,8 @@
           "battery_hold_release_value": "Value that restores normal self-consumption, such as off.",
           "battery_hold_feedback_entity": "Physical feedback of hold/release. Mandatory and distinct from the command when using an input helper.",
           "battery_hold_feedback_engage_value": "Expected physical readback while holding. Leave empty to use the hold command value.",
-          "battery_hold_feedback_release_value": "Expected physical readback after release. Leave empty to use the release command value."
+          "battery_hold_feedback_release_value": "Expected physical readback after release. Leave empty to use the release command value.",
+          "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged."
         }
       },
       "settings": {
@@ -577,7 +579,8 @@
           "battery_hold_release_value": "Hold release value",
           "battery_hold_feedback_entity": "Discharge hold readback",
           "battery_hold_feedback_engage_value": "Hold readback value (optional)",
-          "battery_hold_feedback_release_value": "Release readback value (optional)"
+          "battery_hold_feedback_release_value": "Release readback value (optional)",
+          "battery_pv_forecast_factor": "PV forecast factor for grid charging"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -617,7 +620,8 @@
           "battery_hold_release_value": "Value that restores normal self-consumption, such as off.",
           "battery_hold_feedback_entity": "Physical feedback of hold/release. Mandatory and distinct from the command when using an input helper.",
           "battery_hold_feedback_engage_value": "Expected physical readback while holding. Leave empty to use the hold command value.",
-          "battery_hold_feedback_release_value": "Expected physical readback after release. Leave empty to use the release command value."
+          "battery_hold_feedback_release_value": "Expected physical readback after release. Leave empty to use the release command value.",
+          "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged."
         }
       },
       "settings": {
