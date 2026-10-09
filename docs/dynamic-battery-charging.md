@@ -5,6 +5,18 @@ day to (a) absorb PV that would otherwise be curtailed by the inverter's
 export limit and (b) defer morning charging when the day's forecast
 shows enough peak production to fill the battery on its own.
 
+This feature controls the **solar charging power cap**. The separate
+[forecast-aware grid charging](features/battery-management.md#forecast-aware-grid-charging)
+feature decides whether buying energy for later household use is economical.
+Solar charging keeps its own target; the grid-charge target does not lower the
+inverter's native maximum SoC. A 100 W charging or discharging limit is not a
+complete discharge hold. Holding energy requires its own verified control.
+
+The solar charging cap is released when grid charging needs the inverter and
+when integration control is disabled or unloaded. The grid-charge controller's
+separate physical acknowledgement and recovery behavior is described in the
+battery-management documentation.
+
 ## What it does
 
 Two layers, both opt-in:

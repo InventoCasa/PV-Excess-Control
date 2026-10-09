@@ -4,6 +4,8 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call
 
+from homeassistant.core import State
+
 from custom_components.pv_excess_control.inverter_control import (
     InverterGridChargeController,
 )
@@ -13,7 +15,22 @@ from custom_components.pv_excess_control.models import InverterGridChargeConfig
 def _make_hass_with_async_call() -> MagicMock:
     hass = MagicMock()
     hass.services = MagicMock()
-    hass.services.async_call = AsyncMock(return_value=None)
+    states = {}
+
+    def get_state(entity_id):
+        return states.get(entity_id, State(entity_id, "0", {
+            "unit_of_measurement": "W", "min": 0, "max": 10000,
+        }))
+
+    async def apply_service(domain, service, data, *, blocking):
+        entity_id = data["entity_id"]
+        value = data.get("option", data.get("value"))
+        if service in {"turn_on", "turn_off"}:
+            value = "on" if service == "turn_on" else "off"
+        states[entity_id] = State(entity_id, str(value), get_state(entity_id).attributes)
+
+    hass.states.get.side_effect = get_state
+    hass.services.async_call = AsyncMock(side_effect=apply_service)
     return hass
 
 
@@ -37,13 +54,13 @@ async def test_engage_full_triple_writes_mode_then_power_then_command():
     assert hass.services.async_call.await_args_list == [
         call("input_select", "select_option",
              {"entity_id": "input_select.set_sg_ems_mode", "option": "Forced mode"},
-             blocking=False),
+             blocking=True),
         call("input_number", "set_value",
              {"entity_id": "input_number.set_sg_forced_charge_discharge_power", "value": 5000.0},
-             blocking=False),
+             blocking=True),
         call("input_select", "select_option",
              {"entity_id": "input_select.set_sg_battery_forced_charge_discharge_cmd", "option": "Forced charge"},
-             blocking=False),
+             blocking=True),
     ]
 
 
@@ -61,7 +78,7 @@ async def test_engage_skips_mode_when_not_configured():
 
     assert hass.services.async_call.await_count == 1
     assert hass.services.async_call.await_args_list[0] == call(
-        "switch", "turn_on", {"entity_id": "switch.battery_force_charge"}, blocking=False,
+        "switch", "turn_on", {"entity_id": "switch.battery_force_charge"}, blocking=True,
     )
 
 
@@ -101,9 +118,9 @@ async def test_disengage_writes_command_then_mode_in_reverse():
     assert hass.services.async_call.await_count == 2
     assert hass.services.async_call.await_args_list == [
         call("input_select", "select_option",
-             {"entity_id": "input_select.cmd", "option": "Stop"}, blocking=False),
+             {"entity_id": "input_select.cmd", "option": "Stop"}, blocking=True),
         call("input_select", "select_option",
-             {"entity_id": "input_select.mode", "option": "Self"}, blocking=False),
+             {"entity_id": "input_select.mode", "option": "Self"}, blocking=True),
     ]
 
 
@@ -138,7 +155,7 @@ async def test_service_derivation_select_like(domain):
     last = hass.services.async_call.await_args
     assert last.args[:2] == (domain, "select_option")
     assert last.args[2] == {"entity_id": f"{domain}.cmd", "option": "Forced charge"}
-    assert last.kwargs == {"blocking": False}
+    assert last.kwargs == {"blocking": True}
 
 
 @pytest.mark.asyncio
@@ -203,7 +220,7 @@ async def test_service_derivation_power_writes_set_value_with_float(domain):
     )
     assert power_call.args[:2] == (domain, "set_value")
     assert power_call.args[2] == {"entity_id": f"{domain}.power", "value": 4321.0}
-    assert power_call.kwargs == {"blocking": False}
+    assert power_call.kwargs == {"blocking": True}
 
 
 def test_unsupported_enable_domain_raises_value_error_at_construction():

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import Platform, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_change
 
@@ -37,7 +37,7 @@ _RUNTIME_STATE_KEYS = frozenset({
     CONF_PLAN_INFLUENCE, CONF_CHEAP_PRICE_THRESHOLD, CONF_BATTERY_CHARGE_PRICE_THRESHOLD,
     "disabled_appliances", "overridden_appliances", "paused_appliances",
     "_pending_stop_appliances",
-    "_grid_charge_engaged",
+    "_grid_charge_engaged", "_grid_charge_cleanup_pending", "_battery_hold_cleanup_pending",
 })
 
 
@@ -103,6 +103,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up PV Excess Control from a config entry."""
     coordinator = PvExcessCoordinator(hass, entry)
+    await coordinator.async_restore_battery_load()
     await coordinator.async_restore_daily_state()
     await coordinator.async_config_entry_first_refresh()
 
@@ -128,6 +129,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_track_time_change(hass, _midnight_reset, hour=0, minute=0, second=0)
     )
 
+    async def _stop_battery(event):
+        await coordinator.async_prepare_battery_unload()
+
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop_battery))
+
     async_reconcile_appliance_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -138,7 +144,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     coord = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if coord is not None:
+        released = await coord.async_prepare_battery_unload()
         await coord.async_save_daily_state()
+        if not released:
+            _LOGGER.error("Battery release unconfirmed; keeping integration loaded for retry")
+            return False
     if coord is not None and entry.data.get(CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False):
         max_w = int(entry.data.get(CONF_BATTERY_MAX_CHARGE_POWER_W, 0) or 0)
         if max_w > 0:

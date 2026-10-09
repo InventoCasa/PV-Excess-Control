@@ -129,6 +129,7 @@ def _coordinator_with_dyn_charge_enabled(**overrides):
     """Build a coordinator stub with dyn-charge enabled and supporting state."""
     coord = MagicMock()
     coord.async_save_daily_state = AsyncMock()
+    coord.async_prepare_battery_unload = AsyncMock(return_value=True)
     coord.config_entry = MagicMock()
     coord.config_entry.entry_id = "test_entry_id"
     coord.config_entry.data = {
@@ -141,6 +142,7 @@ def _coordinator_with_dyn_charge_enabled(**overrides):
     coord.config_entry.data.update(overrides)
     coord.force_charge = False
     coord._grid_charge_engaged = False
+    coord._battery_hold_engaged = False
     # Startup grace fully elapsed by default — set _startup_time far in the past.
     coord._startup_time = datetime(2020, 1, 1)
     coord._dyn_charge_self_disabled_reason = None

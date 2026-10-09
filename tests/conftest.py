@@ -106,6 +106,11 @@ def mock_inverter_controller():
     ctl = MagicMock()
     ctl.engage = AsyncMock(return_value=None)
     ctl.disengage = AsyncMock(return_value=None)
+    ctl.verify_engaged = AsyncMock(return_value=None)
+    ctl.verify_disengaged = AsyncMock(return_value=None)
+    ctl.confirmation_level = "physical"
+    from custom_components.pv_excess_control.models import InverterGridChargeConfig
+    ctl.config = InverterGridChargeConfig("switch.charge", "on", "off")
     return ctl
 
 
@@ -281,6 +286,10 @@ def coordinator_factory():
         else:
             coord._inverter_ctl = None
 
+        with _patch("custom_components.pv_excess_control.battery_journal.BatteryOwnershipJournal"):
+            coord._init_battery_control()
+        coord._battery_storage_ready = True
+        coord._battery_journal = AsyncMock()
         return coord
 
     return _build

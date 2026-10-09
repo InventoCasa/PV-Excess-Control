@@ -154,6 +154,32 @@ CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY = "inverter_force_charge_power_entity"
 
 DEFAULT_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES = 5
 
+# Forecast-aware grid charging and acknowledged battery holding.
+CONF_BATTERY_GRID_TARGET_SOC = "battery_grid_target_soc"
+CONF_BATTERY_ROUNDTRIP_EFFICIENCY = "battery_roundtrip_efficiency"
+CONF_BATTERY_WEAR_COST_PER_KWH = "battery_wear_cost_per_kwh"
+CONF_BATTERY_SOC_HYSTERESIS = "battery_soc_hysteresis"
+CONF_BATTERY_INPUT_MAX_AGE_SECONDS = "battery_input_max_age_seconds"
+CONF_BATTERY_FORECAST_MAX_AGE_SECONDS = "battery_forecast_max_age_seconds"
+CONF_BATTERY_LOAD_PROFILE_W = "battery_load_profile_w"
+CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY = "inverter_force_charge_enable_feedback_entity"
+CONF_INVERTER_FORCE_CHARGE_MODE_FEEDBACK_ENTITY = "inverter_force_charge_mode_feedback_entity"
+CONF_INVERTER_FORCE_CHARGE_POWER_FEEDBACK_ENTITY = "inverter_force_charge_power_feedback_entity"
+CONF_BATTERY_HOLD_ENTITY = "battery_hold_entity"
+CONF_BATTERY_HOLD_ENGAGE_VALUE = "battery_hold_engage_value"
+CONF_BATTERY_HOLD_RELEASE_VALUE = "battery_hold_release_value"
+CONF_BATTERY_HOLD_FEEDBACK_ENTITY = "battery_hold_feedback_entity"
+CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE = "battery_hold_feedback_engage_value"
+CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE = "battery_hold_feedback_release_value"
+CONF_BATTERY_HOLD_VERIFIED = "battery_hold_verified"
+
+DEFAULT_BATTERY_GRID_TARGET_SOC = 80.0
+DEFAULT_BATTERY_ROUNDTRIP_EFFICIENCY = 0.85
+DEFAULT_BATTERY_WEAR_COST_PER_KWH = 0.0
+DEFAULT_BATTERY_SOC_HYSTERESIS = 2.0
+DEFAULT_BATTERY_INPUT_MAX_AGE_SECONDS = 300
+DEFAULT_BATTERY_FORECAST_MAX_AGE_SECONDS = 21600
+
 CONF_EXPORT_LIMIT = "export_limit"
 CONF_CONTROLLER_INTERVAL = "controller_interval"
 CONF_PLANNER_INTERVAL = "planner_interval"

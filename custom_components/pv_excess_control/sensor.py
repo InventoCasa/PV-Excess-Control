@@ -205,6 +205,9 @@ class PvExcessStatusSensor(PvExcessBaseSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose integration and dynamic-battery-charge state."""
         attrs: dict[str, Any] = {}
+        diagnostics = getattr(self.coordinator, "battery_control_diagnostics", None)
+        if callable(diagnostics):
+            attrs.update(diagnostics())
 
         if self.coordinator.config_entry.data.get(
             CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, False

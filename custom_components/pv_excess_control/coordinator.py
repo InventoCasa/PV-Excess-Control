@@ -20,8 +20,10 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
+from .battery_control import BatteryControlMixin
 from .daily_state import nonnegative_number
 from .power_policy import battery_first_budget
 
@@ -286,10 +288,14 @@ def _dyn_charge_should_run(coordinator) -> bool:
         return False
     if getattr(coordinator, "_grid_charge_engaged", False):
         return False
+    if getattr(coordinator, "_battery_hold_engaged", False):
+        return False
+    if getattr(coordinator, "enabled", True) is False:
+        return False
     return True
 
 
-class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator for PV Excess Control.
 
     Periodically reads sensor data, runs the optimizer and planner,
@@ -377,6 +383,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._force_charge_prev: bool = self.force_charge
         self._latest_tariff = None
         self._latest_power_state = None
+        self._init_battery_control()
 
         # Restore persisted enabled/override state from config_entry.data
         self.appliance_paused = {aid: True for aid in config_entry.data.get("paused_appliances", [])}
@@ -595,7 +602,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._restored_appliance_ids = set()
         try:
             data = await self._daily_state_store.async_load()
-        except (OSError, ValueError, TypeError):
+        except (HomeAssistantError, OSError, ValueError, TypeError):
             _LOGGER.exception("Could not restore daily counters; storage disabled until reload")
             # Do not overwrite unread counters after a transient read failure.
             self._daily_state_store = None
@@ -679,7 +686,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._daily_state_store is not None:
             try:
                 await self._daily_state_store.async_save(self._daily_state_data())
-            except (OSError, ValueError, TypeError):
+            except (HomeAssistantError, OSError, ValueError, TypeError):
                 _LOGGER.exception("Could not save daily counters")
             finally:
                 self._daily_save_pending = False
@@ -702,6 +709,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             mode_engage_value=d.get(CONF_INVERTER_FORCE_CHARGE_MODE_ENGAGE_VALUE),
             mode_disengage_value=d.get(CONF_INVERTER_FORCE_CHARGE_MODE_DISENGAGE_VALUE),
             power_entity_id=d.get(CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY),
+            enable_feedback_entity_id=d.get("inverter_force_charge_enable_feedback_entity"),
+            mode_feedback_entity_id=d.get("inverter_force_charge_mode_feedback_entity"),
+            power_feedback_entity_id=d.get("inverter_force_charge_power_feedback_entity"),
         )
         try:
             return InverterGridChargeController(self.hass, cfg)
@@ -770,90 +780,6 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 entity_id,
             )
 
-    def _persist_grid_charge_state(self, engaged: bool) -> None:
-        """Persist the engagement flag to config_entry.data via async_update_entry.
-
-        Uses the runtime-state-key bypass so this does not trigger a reload.
-        """
-        new_data = dict(self.config_entry.data)
-        new_data["_grid_charge_engaged"] = engaged
-        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
-
-    def auto_should_engage_now(self) -> bool:
-        """Evaluate the auto-engage gate against the latest snapshots."""
-        d = self.config_entry.data
-        if not d.get(CONF_AUTO_BATTERY_GRID_CHARGE, False):
-            return False
-        if self._latest_tariff is None or self._latest_power_state is None:
-            return False
-        target_soc = d.get(CONF_BATTERY_TARGET_SOC, 80)
-        cheap_now = self._latest_tariff.current_price <= self._latest_tariff.battery_charge_price_threshold
-        soc = self._latest_power_state.battery_soc
-        soc_below_target = soc is None or soc < target_soc
-        return cheap_now and soc_below_target
-
-    async def _run_grid_charge_state_machine(
-        self, tariff_info, power_state,
-    ) -> None:
-        """Engage / disengage forced grid charge based on price + SoC + force_charge.
-
-        Idempotent. Safe to call without _inverter_ctl.
-        """
-        d = self.config_entry.data
-        power_w = d.get(CONF_BATTERY_GRID_CHARGE_POWER_W)
-        if self._inverter_ctl is None or power_w is None:
-            return  # nothing to drive
-
-        auto_flag = d.get(CONF_AUTO_BATTERY_GRID_CHARGE, False)
-        target_soc = d.get(CONF_BATTERY_TARGET_SOC, 80)
-        min_dur_s = d.get(
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES,
-            DEFAULT_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES,
-        ) * 60
-
-        cheap_now = (
-            tariff_info is not None
-            and tariff_info.current_price <= tariff_info.battery_charge_price_threshold
-        )
-        soc = getattr(power_state, "battery_soc", None) if power_state is not None else None
-        soc_below_target = soc is None or soc < target_soc
-
-        auto_should_engage = auto_flag and cheap_now and soc_below_target
-        should_engage = self.force_charge or auto_should_engage
-
-        force_off_edge = self._force_charge_prev and not self.force_charge
-        self._force_charge_prev = self.force_charge
-
-        if should_engage and not self._grid_charge_engaged:
-            await self._inverter_ctl.engage(power_w)
-            self._grid_charge_engaged = True
-            self._grid_charge_engage_ts = _time.monotonic()
-            self._persist_grid_charge_state(True)
-            method = getattr(self.notifications, "notify_battery_grid_charge_engaged", None)
-            if method is not None:
-                try:
-                    await method(power_w)
-                except Exception:
-                    _LOGGER.exception("Failed to send grid_charge_engaged notification")
-
-        elif (not should_engage) and self._grid_charge_engaged:
-            elapsed = _time.monotonic() - (self._grid_charge_engage_ts or 0.0)
-            if elapsed >= min_dur_s or force_off_edge:
-                await self._inverter_ctl.disengage()
-                self._grid_charge_engaged = False
-                self._grid_charge_engage_ts = None
-                self._persist_grid_charge_state(False)
-                reason = (
-                    "manual force_charge switch off" if force_off_edge
-                    else "price above threshold or SoC reached target"
-                )
-                method = getattr(self.notifications, "notify_battery_grid_charge_disengaged", None)
-                if method is not None:
-                    try:
-                        await method(reason)
-                    except Exception:
-                        _LOGGER.exception("Failed to send grid_charge_disengaged notification")
-
     @property
     def enabled(self) -> bool:
         """Return whether the controller is enabled."""
@@ -915,6 +841,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._retry_pending_stops()
         # 1. Collect power state from sensors
         power_state = self._collect_power_state()
+        await self._battery_preflight(power_state)
         def _fmt(val: float | None, suffix: str = "W") -> str:
             return f"{val:.0f}{suffix}" if val is not None else "unavailable"
 

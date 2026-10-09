@@ -1251,6 +1251,10 @@ def test_validate_battery_section_passes_for_complete_three_step_config():
         CONF_INVERTER_FORCE_CHARGE_MODE_ENTITY: "input_select.mode",
         CONF_INVERTER_FORCE_CHARGE_MODE_ENGAGE_VALUE: "Forced",
         CONF_INVERTER_FORCE_CHARGE_MODE_DISENGAGE_VALUE: "Self",
+        "inverter_force_charge_enable_feedback_entity": "sensor.charge_command",
+        "inverter_force_charge_mode_feedback_entity": "sensor.ems_mode",
+        "inverter_force_charge_power_entity": "number.grid_charge_power",
+        "battery_max_charge_power_w": 5000.0,
     }
     # Should NOT raise
     _validate_battery_section(good)

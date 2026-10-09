@@ -256,6 +256,13 @@ def _make_coordinator(
         hass, notification_settings=None, notification_service=None,
     )
 
+    with patch(
+        "custom_components.pv_excess_control.battery_journal.BatteryOwnershipJournal",
+        autospec=True,
+    ) as journal:
+        journal.return_value.async_load.return_value = (None, None)
+        coord._init_battery_control()
+
     return coord
 
 
@@ -1537,12 +1544,19 @@ class TestSetupAndUnload:
         ) as mock_forward, patch.object(
             PvExcessCoordinator, "async_restore_daily_state", new_callable=AsyncMock,
         ) as mock_restore, patch(
+            "custom_components.pv_excess_control.coordinator.PvExcessCoordinator.async_restore_battery_load",
+            new_callable=AsyncMock,
+        ) as mock_restore_battery, patch(
+            "custom_components.pv_excess_control.battery_journal.BatteryOwnershipJournal",
+            autospec=True,
+        ), patch(
             "custom_components.pv_excess_control.async_reconcile_appliance_entities",
         ), patch(
             "custom_components.pv_excess_control.async_track_time_change",
         ):
             result = await async_setup_entry(hass, entry)
             mock_restore.assert_awaited_once()
+            mock_restore_battery.assert_awaited_once()
 
         assert result is True
         assert DOMAIN in hass.data

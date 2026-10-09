@@ -1,287 +1,196 @@
-"""Tests for PvExcessCoordinator grid-charge state machine.
-
-Uses the same mock-coordinator helper pattern as test_init.py.
-"""
+"""Tests for economic grid-charge decisions and native discharge controls."""
 from __future__ import annotations
 
-import pytest
+from datetime import timedelta
+from unittest.mock import AsyncMock
 
-from custom_components.pv_excess_control.const import (
-    CONF_AUTO_BATTERY_GRID_CHARGE,
-    CONF_BATTERY_GRID_CHARGE_POWER_W,
-    CONF_BATTERY_TARGET_SOC,
-    CONF_BATTERY_STRATEGY,
-    CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES,
-    CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY,
-    CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE,
-    CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE,
+import pytest
+from homeassistant.core import State
+from homeassistant.util import dt as dt_util
+
+from custom_components.pv_excess_control.models import (
+    ForecastData, HourlyForecast, TariffInfo, TariffWindow,
 )
 
 
-@pytest.mark.asyncio
-async def test_grid_charge_engages_when_price_below_threshold_and_soc_below_target(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc,
-):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "Forced charge",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "Stop",
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: 5,
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
-    coordinator._latest_tariff = mock_tariff_at(current_price=0.01, battery_charge_price_threshold=0.02)
-    coordinator._latest_power_state = mock_power_state_with_soc(battery_soc=70.0)
-
-    await coordinator._run_grid_charge_state_machine(
-        coordinator._latest_tariff, coordinator._latest_power_state,
-    )
-
-    mock_inverter_controller.engage.assert_awaited_once_with(5000.0)
-    assert coordinator._grid_charge_engaged is True
-
-
-@pytest.mark.asyncio
-async def test_grid_charge_does_not_re_engage_while_already_engaged(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc,
-):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "Forced charge",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "Stop",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
-    coordinator._latest_tariff = mock_tariff_at(0.01, 0.02)
-    coordinator._latest_power_state = mock_power_state_with_soc(70.0)
-
-    await coordinator._run_grid_charge_state_machine(coordinator._latest_tariff, coordinator._latest_power_state)
-    await coordinator._run_grid_charge_state_machine(coordinator._latest_tariff, coordinator._latest_power_state)
-
-    assert mock_inverter_controller.engage.await_count == 1
+def _grid_inputs(coordinator_factory, controller, **overrides):
+    """Supply fresh physical observations and complete economic planning inputs."""
+    coordinator = coordinator_factory(config_data={
+        "auto_battery_grid_charge": True,
+        "allow_grid_charging": True,
+        "battery_soc": "sensor.soc",
+        "battery_capacity": 10,
+        "battery_grid_charge_power_w": 5000,
+        "battery_max_charge_power_w": 5000,
+        "battery_grid_target_soc": 80,
+        "battery_target_soc": 100,
+        "price_sensor": "sensor.price",
+        "battery_load_profile_w": [2000.] * 24,
+        "inverter_force_charge_enable_entity": "switch.charge",
+        "inverter_force_charge_enable_engage_value": "on",
+        "inverter_force_charge_enable_disengage_value": "off",
+        "inverter_force_charge_power_entity": "number.charge_power",
+        "grid_charge_engage_min_duration_minutes": 5,
+        **overrides,
+    }, inverter_ctl=controller)
+    now = dt_util.now()
+    states = {
+        "sensor.soc": State("sensor.soc", "10"),
+        "sensor.load_power": State("sensor.load_power", "2000", {"unit_of_measurement": "W"}),
+        "sensor.pv_power": State("sensor.pv_power", "0", {"unit_of_measurement": "W"}),
+        "sensor.price": State("sensor.price", ".1"),
+        "sensor.forecast": State("sensor.forecast", "0"),
+        "number.charge_power": State("number.charge_power", "2500", {"min": 0, "max": 5000, "step": .001, "unit_of_measurement": "W"}),
+    }
+    coordinator.hass.states.get.side_effect = states.get
+    coordinator._forecast_entities = ["sensor.forecast"]
+    coordinator._forecast_tomorrow_entities = []
+    coordinator._forecast_data = ForecastData(0, [HourlyForecast(now, now + timedelta(hours=4), 0, 0)])
+    tariff = TariffInfo(.1, 0, .2, .2, [
+        TariffWindow(now, now + timedelta(hours=1), .1, True),
+        TariffWindow(now + timedelta(hours=1), now + timedelta(hours=4), .5, False),
+    ])
+    if controller is not None:
+        controller.confirmation_level = "physical"
+        controller.verify_engaged = AsyncMock()
+    return coordinator, states, tariff
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_no_inverter_configured_no_calls(
-    coordinator_factory, mock_tariff_at, mock_power_state_with_soc,
+async def test_grid_charge_engages_when_forecast_plan_finds_useful_cheap_energy(
+    coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-        },
-        inverter_ctl=None,  # not configured
-    )
-    coordinator._latest_tariff = mock_tariff_at(0.01, 0.02)
-    coordinator._latest_power_state = mock_power_state_with_soc(70.0)
-
-    # Must not raise
-    await coordinator._run_grid_charge_state_machine(coordinator._latest_tariff, coordinator._latest_power_state)
-
-    assert coordinator._grid_charge_engaged is False
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    try:
+        mock_inverter_controller.engage.assert_awaited_once()
+        assert mock_inverter_controller.engage.await_args.args[0] == pytest.approx(5000.0)
+        assert coordinator._grid_charge_engaged
+        assert coordinator._battery_grid_plan.estimated_savings > 0
+        assert coordinator._battery_grid_plan.grid_target_soc < 80
+    finally:
+        await coordinator.async_stop_battery_controls()
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_disengages_when_price_rises_above_threshold(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc, freeze_time,
+async def test_grid_charge_cheap_price_without_forecast_does_not_start(
+    coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: 5,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
+    coordinator._forecast_data = None
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    mock_inverter_controller.engage.assert_not_awaited()
+    assert not coordinator._grid_charge_engaged
 
-    with freeze_time() as ft:
-        # Engage
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.01, 0.02), mock_power_state_with_soc(70.0),
-        )
-        ft.tick(seconds=6 * 60)  # past hysteresis
-        # Price rises
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.10, 0.02), mock_power_state_with_soc(70.0),
-        )
 
+@pytest.mark.asyncio
+async def test_grid_charge_verifies_existing_charge_without_reengaging(
+    coordinator_factory, mock_inverter_controller,
+):
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    mock_inverter_controller.engage.assert_awaited_once()
+    mock_inverter_controller.verify_engaged.assert_awaited_once()
+    await coordinator.async_stop_battery_controls()
+
+
+@pytest.mark.asyncio
+async def test_grid_charge_no_inverter_configured_no_calls(coordinator_factory):
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, None)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    assert not coordinator._grid_charge_engaged
+
+
+@pytest.mark.asyncio
+async def test_grid_charge_price_rise_stops_without_minimum_run_delay(
+    coordinator_factory, mock_inverter_controller,
+):
+    coordinator, states, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    assert coordinator._grid_charge_engaged
+    tariff.current_price = .3
+    tariff.windows[0] = TariffWindow(tariff.windows[0].start, tariff.windows[0].end, .3, False)
+    states["sensor.price"] = State("sensor.price", ".3")
+    await coordinator._run_grid_charge_state_machine(tariff, None)
     mock_inverter_controller.disengage.assert_awaited_once()
-    assert coordinator._grid_charge_engaged is False
+    assert not coordinator._grid_charge_engaged
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_disengages_when_soc_reaches_target(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc, freeze_time,
+async def test_grid_charge_stops_at_the_planned_soc_before_the_pv_target(
+    coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: 5,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
-    with freeze_time() as ft:
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.01, 0.02), mock_power_state_with_soc(70.0),
-        )
-        ft.tick(seconds=6 * 60)
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.01, 0.02), mock_power_state_with_soc(100.0),
-        )
+    coordinator, states, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    target = coordinator._current_battery_slot().soc_end
+    assert target < coordinator.config_entry.data["battery_target_soc"]
+    states["sensor.soc"] = State("sensor.soc", str(target))
+    await coordinator._run_grid_charge_state_machine(tariff, None)
     mock_inverter_controller.disengage.assert_awaited_once()
+    assert not coordinator._grid_charge_engaged
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_hysteresis_holds_disengage_for_min_duration(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc, freeze_time,
+async def test_grid_charge_missing_soc_stops_without_minimum_run_delay(
+    coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: 5,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
-    with freeze_time() as ft:
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.01, 0.02), mock_power_state_with_soc(70.0),
-        )
-        ft.tick(seconds=2 * 60)  # within hysteresis
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.10, 0.02), mock_power_state_with_soc(70.0),
-        )
-    mock_inverter_controller.disengage.assert_not_awaited()
-    assert coordinator._grid_charge_engaged is True
+    coordinator, states, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    assert coordinator._grid_charge_engaged
+    states["sensor.soc"] = State("sensor.soc", "unavailable")
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    mock_inverter_controller.disengage.assert_awaited_once()
+    assert not coordinator._grid_charge_engaged
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_force_charge_switch_bypasses_price_gate(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc,
+async def test_grid_charge_manual_request_bypasses_price_gate_with_fresh_soc(
+    coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: False,  # auto OFF
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller, auto_battery_grid_charge=False)
     coordinator.force_charge = True
-    coordinator._force_charge_prev = False  # simulate fresh ON edge
-
-    await coordinator._run_grid_charge_state_machine(
-        mock_tariff_at(0.50, 0.02),  # very expensive
-        mock_power_state_with_soc(70.0),
-    )
-
+    tariff.current_price = .5
+    coordinator._forecast_data = None
+    await coordinator._run_grid_charge_state_machine(tariff, None)
     mock_inverter_controller.engage.assert_awaited_once_with(5000.0)
+    await coordinator.async_stop_battery_controls()
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_force_charge_off_bypasses_hysteresis(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc, freeze_time,
+async def test_grid_charge_manual_request_off_stops_without_minimum_run_delay(
+    coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: False,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: 5,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller, auto_battery_grid_charge=False)
     coordinator.force_charge = True
-    coordinator._force_charge_prev = False
-    with freeze_time() as ft:
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.50, 0.02), mock_power_state_with_soc(70.0),
-        )
-        ft.tick(seconds=60)  # well within hysteresis
-        # User flips off
-        coordinator.force_charge = False
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.50, 0.02), mock_power_state_with_soc(70.0),
-        )
+    await coordinator._run_grid_charge_state_machine(tariff, None)
+    assert coordinator._grid_charge_engaged
+    coordinator.force_charge = False
+    await coordinator._run_grid_charge_state_machine(tariff, None)
     mock_inverter_controller.disengage.assert_awaited_once()
-    assert coordinator._grid_charge_engaged is False
+    assert not coordinator._grid_charge_engaged
 
 
 @pytest.mark.asyncio
-async def test_grid_charge_state_persisted_across_restart_disengages_when_conditions_clear(
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc, freeze_time,
+async def test_grid_charge_persisted_ownership_is_released_before_replanning(
+    coordinator_factory, mock_inverter_controller,
 ):
-    """Persisted engaged=True, fresh restart, conditions cleared → disengage."""
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: 5,
-            "_grid_charge_engaged": True,  # persisted from prior session
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
-    # Fresh restart: engage_ts is None, so elapsed = monotonic() - 0 ≈ huge → past hysteresis
-    with freeze_time() as ft:
-        await coordinator._run_grid_charge_state_machine(
-            mock_tariff_at(0.10, 0.02),  # not cheap
-            mock_power_state_with_soc(70.0),
-        )
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller, _grid_charge_engaged=True)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
     mock_inverter_controller.disengage.assert_awaited_once()
-    assert coordinator._grid_charge_engaged is False
+    mock_inverter_controller.engage.assert_not_awaited()
+    assert not coordinator._grid_charge_engaged
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("strategy", ["balanced", "battery_first", "appliance_first"])
 async def test_grid_charge_independent_of_battery_strategy(
-    strategy,
-    coordinator_factory, mock_inverter_controller, mock_tariff_at, mock_power_state_with_soc,
+    strategy, coordinator_factory, mock_inverter_controller,
 ):
-    coordinator = coordinator_factory(
-        config_data={
-            CONF_AUTO_BATTERY_GRID_CHARGE: True,
-            CONF_BATTERY_GRID_CHARGE_POWER_W: 5000.0,
-            CONF_BATTERY_TARGET_SOC: 100,
-            CONF_BATTERY_STRATEGY: strategy,
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY: "input_select.cmd",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE: "x",
-            CONF_INVERTER_FORCE_CHARGE_ENABLE_DISENGAGE_VALUE: "y",
-        },
-        inverter_ctl=mock_inverter_controller,
-    )
-    await coordinator._run_grid_charge_state_machine(
-        mock_tariff_at(0.01, 0.02), mock_power_state_with_soc(70.0),
-    )
+    coordinator, _, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller, battery_strategy=strategy)
+    await coordinator._run_grid_charge_state_machine(tariff, None)
     mock_inverter_controller.engage.assert_awaited_once()
+    await coordinator.async_stop_battery_controls()
 
 
 # ---------------------------------------------------------------------------

@@ -329,3 +329,10 @@ class InverterGridChargeConfig:
     mode_disengage_value: str | None = None
 
     power_entity_id: str | None = None
+    enable_feedback_entity_id: str | None = None
+    mode_feedback_entity_id: str | None = None
+    power_feedback_entity_id: str | None = None
+    timeout_seconds: float = 15.0
+    power_tolerance_w: float = 100.0
+    enable_feedback_engage_value: str | None = None
+    enable_feedback_disengage_value: str | None = None

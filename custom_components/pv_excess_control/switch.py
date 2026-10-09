@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import time as _time
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
@@ -11,7 +10,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_APPLIANCE_NAME, CONF_BATTERY_GRID_CHARGE_POWER_W, DOMAIN
+from .const import CONF_APPLIANCE_NAME, DOMAIN
 from .coordinator import PvExcessCoordinator
 from .entity_lifecycle import add_entities_by_subentry, device_info
 
@@ -93,7 +92,9 @@ class ControlEnabledSwitch(_PvExcessSwitchBase):
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.enabled = False
-        self._persist("control_enabled", False)
+        self.coordinator.force_charge = False
+        self._persist("control_enabled", False, force_charge=False)
+        await self.coordinator.async_stop_battery_controls("disabled")
         self.async_write_ha_state()
 
 
@@ -112,32 +113,19 @@ class ForceChargeSwitch(_PvExcessSwitchBase):
         return self.coordinator.force_charge
 
     async def async_turn_on(self, **kwargs) -> None:
+        if not self.coordinator.enabled:
+            return
         self.coordinator.force_charge = True
         self._persist("force_charge", True)
-        if (
-            self.coordinator._inverter_ctl is not None
-            and not self.coordinator._grid_charge_engaged
-        ):
-            power_w = self.coordinator.config_entry.data.get(CONF_BATTERY_GRID_CHARGE_POWER_W)
-            if power_w is not None:
-                await self.coordinator._inverter_ctl.engage(power_w)
-                self.coordinator._grid_charge_engaged = True
-                self.coordinator._grid_charge_engage_ts = _time.monotonic()
-                self.coordinator._persist_grid_charge_state(True)
+        await self.coordinator._run_grid_charge_state_machine(
+            self.coordinator._latest_tariff, self.coordinator._latest_power_state,
+        )
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.force_charge = False
         self._persist("force_charge", False)
-        if (
-            self.coordinator._grid_charge_engaged
-            and self.coordinator._inverter_ctl is not None
-            and not self.coordinator.auto_should_engage_now()
-        ):
-            await self.coordinator._inverter_ctl.disengage()
-            self.coordinator._grid_charge_engaged = False
-            self.coordinator._grid_charge_engage_ts = None
-            self.coordinator._persist_grid_charge_state(False)
+        await self.coordinator.async_stop_battery_controls("manual_stop")
         self.async_write_ha_state()
 
 

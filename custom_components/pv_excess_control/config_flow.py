@@ -12,7 +12,9 @@ Also provides ApplianceSubentryFlow for managing appliances as subentries.
 """
 from __future__ import annotations
 
+import json
 import logging
+import math
 from typing import Any
 
 import voluptuous as vol
@@ -47,6 +49,23 @@ except ImportError:
     SubentryFlowResult = dict  # type: ignore[assignment, misc]
 
 from .const import (
+    CONF_BATTERY_GRID_TARGET_SOC,
+    CONF_BATTERY_ROUNDTRIP_EFFICIENCY,
+    CONF_BATTERY_WEAR_COST_PER_KWH,
+    CONF_BATTERY_SOC_HYSTERESIS,
+    CONF_BATTERY_INPUT_MAX_AGE_SECONDS,
+    CONF_BATTERY_FORECAST_MAX_AGE_SECONDS,
+    CONF_BATTERY_LOAD_PROFILE_W,
+    CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY,
+    CONF_INVERTER_FORCE_CHARGE_MODE_FEEDBACK_ENTITY,
+    CONF_INVERTER_FORCE_CHARGE_POWER_FEEDBACK_ENTITY,
+    CONF_BATTERY_HOLD_ENTITY,
+    CONF_BATTERY_HOLD_ENGAGE_VALUE,
+    CONF_BATTERY_HOLD_RELEASE_VALUE,
+    CONF_BATTERY_HOLD_FEEDBACK_ENTITY,
+    CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE,
+    CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE,
+    CONF_BATTERY_HOLD_VERIFIED,
     CONF_ACTUAL_POWER_ENTITY,
     CONF_ALLOW_GRID_CHARGING,
     CONF_ALLOW_GRID_SUPPLEMENT,
@@ -683,11 +702,69 @@ def _forecast_schema(
     return vol.Schema(schema_dict)
 
 
+# Defaults, bounds and selector units for independent grid-charge planning.
+_BATTERY_PLANNING_NUMBERS = {
+    CONF_BATTERY_GRID_TARGET_SOC: (80, 0, 100, 1, "%"),
+    CONF_BATTERY_ROUNDTRIP_EFFICIENCY: (0.85, 0.5, 1, 0.01, None),
+    CONF_BATTERY_WEAR_COST_PER_KWH: (0, 0, 1, 0.001, "€/kWh"),
+    CONF_BATTERY_SOC_HYSTERESIS: (2, 0, 20, 0.1, "%"),
+    CONF_BATTERY_INPUT_MAX_AGE_SECONDS: (300, 30, 3600, 1, "s"),
+    CONF_BATTERY_FORECAST_MAX_AGE_SECONDS: (21600, 300, 172800, 60, "s"),
+}
+_BATTERY_FEEDBACK_KEYS = (
+    CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY,
+    CONF_INVERTER_FORCE_CHARGE_MODE_FEEDBACK_ENTITY,
+    CONF_INVERTER_FORCE_CHARGE_POWER_FEEDBACK_ENTITY,
+    CONF_BATTERY_HOLD_FEEDBACK_ENTITY,
+)
+_BATTERY_PLANNING_OPTIONAL_KEYS = (
+    *_BATTERY_FEEDBACK_KEYS,
+    CONF_BATTERY_LOAD_PROFILE_W,
+    CONF_BATTERY_HOLD_ENTITY,
+    CONF_BATTERY_HOLD_ENGAGE_VALUE,
+    CONF_BATTERY_HOLD_RELEASE_VALUE,
+    CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE,
+    CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE,
+)
+
+
+def _battery_planning_schema(defaults: dict[str, Any]) -> dict:
+    """Add conservative opt-in planning and physically verified control fields."""
+    fields = {}
+    for key, (default, lower, upper, step, unit) in _BATTERY_PLANNING_NUMBERS.items():
+        selector_config = NumberSelectorConfig(
+            min=lower, max=upper, step=step, mode=NumberSelectorMode.BOX,
+        )
+        if unit is not None:
+            selector_config["unit_of_measurement"] = unit
+        fields[vol.Required(key, default=defaults.get(key, default))] = NumberSelector(selector_config)
+    profile = defaults.get(CONF_BATTERY_LOAD_PROFILE_W)
+    fields[vol.Optional(CONF_BATTERY_LOAD_PROFILE_W, description={
+        "suggested_value": json.dumps(profile) if isinstance(profile, list) else profile,
+    })] = TextSelector(TextSelectorConfig(multiline=True))
+    for key in _BATTERY_FEEDBACK_KEYS:
+        fields[vol.Optional(key, description={"suggested_value": defaults.get(key)})] = EntitySelector(
+            EntitySelectorConfig(domain=["sensor", "binary_sensor", "select", "switch", "number"])
+        )
+    fields[vol.Required(CONF_BATTERY_HOLD_VERIFIED, default=defaults.get(
+        CONF_BATTERY_HOLD_VERIFIED, False))] = BooleanSelector()
+    fields[vol.Optional(CONF_BATTERY_HOLD_ENTITY, description={
+        "suggested_value": defaults.get(CONF_BATTERY_HOLD_ENTITY),
+    })] = EntitySelector(EntitySelectorConfig(
+        domain=["select", "switch", "input_select", "input_boolean"],
+    ))
+    for key in (CONF_BATTERY_HOLD_ENGAGE_VALUE, CONF_BATTERY_HOLD_RELEASE_VALUE,
+                CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE, CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE):
+        fields[vol.Optional(key, description={"suggested_value": defaults.get(key)})] = TextSelector()
+    return fields
+
+
 def _battery_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     """Build the battery strategy schema."""
     d = defaults or {}
     return vol.Schema(
         {
+            **_battery_planning_schema(d),
             vol.Required(
                 CONF_BATTERY_STRATEGY,
                 default=d.get(CONF_BATTERY_STRATEGY, BatteryStrategy.BALANCED),
@@ -825,6 +902,10 @@ BATTERY_SCHEMA = _battery_schema()
 
 def _validate_battery_section(data: dict) -> None:
     """Validate the battery section's grid-charge wiring. Raises vol.Invalid on bad input."""
+    for key in _BATTERY_PLANNING_OPTIONAL_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and not value.strip():
+            data.pop(key, None)
     enable_entity = data.get(CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY)
     if enable_entity:
         if not data.get(CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE):
@@ -857,9 +938,94 @@ def _validate_battery_section(data: dict) -> None:
                 "auto_battery_grid_charge=true requires battery_grid_charge_power_w"
             )
 
-    pw = data.get(CONF_BATTERY_GRID_CHARGE_POWER_W)
-    if pw is not None and pw < 0:
-        raise vol.Invalid("battery_grid_charge_power_w must be >= 0")
+    limits = {key: (values[1], values[2]) for key, values in _BATTERY_PLANNING_NUMBERS.items()}
+    limits.update({
+        CONF_BATTERY_GRID_CHARGE_POWER_W: (0, 20000),
+        CONF_BATTERY_MAX_CHARGE_POWER_W: (0, 100000),
+        CONF_BATTERY_TARGET_SOC: (0, 100),
+        CONF_MIN_BATTERY_SOC: (0, 100),
+        CONF_BATTERY_CAPACITY: (0, 100000),
+        CONF_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES: (1, 60),
+    })
+    for key, (lower, upper) in limits.items():
+        value = data.get(key)
+        if value is None:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not lower <= value <= upper):
+            raise vol.Invalid(f"{key} must be finite and between {lower} and {upper}", path=[key])
+    if data.get(CONF_BATTERY_CAPACITY) is not None and data[CONF_BATTERY_CAPACITY] <= 0:
+        raise vol.Invalid("battery_capacity must be greater than zero", path=[CONF_BATTERY_CAPACITY])
+    reserve = data.get(CONF_MIN_BATTERY_SOC)
+    if reserve is not None:
+        for key in (CONF_BATTERY_TARGET_SOC, CONF_BATTERY_GRID_TARGET_SOC):
+            if data.get(key) is not None and data[key] < reserve:
+                raise vol.Invalid(f"{key} must not be below min_battery_soc", path=[key])
+
+    if data.get(CONF_AUTO_BATTERY_GRID_CHARGE):
+        if not data.get(CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY):
+            raise vol.Invalid(
+                "inverter_force_charge_power_entity is required for automatic charging",
+                path=[CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY],
+            )
+        native_power = data.get(CONF_BATTERY_MAX_CHARGE_POWER_W)
+        if native_power is None or native_power <= 0:
+            raise vol.Invalid(
+                "battery_max_charge_power_w must be positive for automatic charging",
+                path=[CONF_BATTERY_MAX_CHARGE_POWER_W],
+            )
+        if data[CONF_BATTERY_GRID_CHARGE_POWER_W] <= 0:
+            raise vol.Invalid("battery_grid_charge_power_w must be greater than zero", path=[CONF_BATTERY_GRID_CHARGE_POWER_W])
+        for entity_key, feedback_key in (
+            (CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY, CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY),
+            (CONF_INVERTER_FORCE_CHARGE_MODE_ENTITY, CONF_INVERTER_FORCE_CHARGE_MODE_FEEDBACK_ENTITY),
+            (CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY, CONF_INVERTER_FORCE_CHARGE_POWER_FEEDBACK_ENTITY),
+        ):
+            _validate_physical_feedback(data, entity_key, feedback_key)
+
+    profile = data.get(CONF_BATTERY_LOAD_PROFILE_W)
+    if isinstance(profile, str):
+        if not profile.strip():
+            data.pop(CONF_BATTERY_LOAD_PROFILE_W, None)
+            profile = None
+        else:
+            try:
+                profile = json.loads(profile)
+                if not isinstance(profile, list):
+                    raise ValueError("expected a list")
+            except (ValueError, TypeError) as exc:
+                raise vol.Invalid("battery_load_profile_w must be a JSON list of 24 numbers", path=[CONF_BATTERY_LOAD_PROFILE_W]) from exc
+    if profile is not None:
+        if (not isinstance(profile, list) or len(profile) != 24
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or v < 0 for v in profile)):
+            raise vol.Invalid("battery_load_profile_w requires 24 finite nonnegative hourly watts", path=[CONF_BATTERY_LOAD_PROFILE_W])
+        data[CONF_BATTERY_LOAD_PROFILE_W] = [float(v) for v in profile]
+
+    if data.get(CONF_BATTERY_HOLD_VERIFIED):
+        for key in (CONF_BATTERY_HOLD_ENTITY, CONF_BATTERY_HOLD_ENGAGE_VALUE, CONF_BATTERY_HOLD_RELEASE_VALUE):
+            if not data.get(key) or not str(data[key]).strip():
+                raise vol.Invalid(f"{key} is required for verified battery_hold", path=[key])
+        if data[CONF_BATTERY_HOLD_ENGAGE_VALUE] == data[CONF_BATTERY_HOLD_RELEASE_VALUE]:
+            raise vol.Invalid("battery_hold engage and release values must differ", path=[CONF_BATTERY_HOLD_ENGAGE_VALUE])
+        engage_feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE) or data[CONF_BATTERY_HOLD_ENGAGE_VALUE]
+        release_feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE) or data[CONF_BATTERY_HOLD_RELEASE_VALUE]
+        if engage_feedback == release_feedback:
+            raise vol.Invalid("battery_hold feedback engage and release values must differ", path=[CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE])
+        _validate_physical_feedback(data, CONF_BATTERY_HOLD_ENTITY, CONF_BATTERY_HOLD_FEEDBACK_ENTITY)
+
+
+def _validate_physical_feedback(data: dict, entity_key: str, feedback_key: str) -> None:
+    """A helper state acknowledges a local request, not the physical device."""
+    entity = data.get(entity_key, "")
+    feedback = data.get(feedback_key, "")
+    if not entity:
+        return
+    helper = str(entity).split(".", 1)[0].startswith("input_")
+    if helper and (not feedback or feedback == entity):
+        raise vol.Invalid(f"{feedback_key} must provide distinct physical feedback for {entity_key}", path=[feedback_key])
+    if feedback and str(feedback).split(".", 1)[0] not in {"sensor", "binary_sensor", "select", "switch", "number"}:
+        raise vol.Invalid(f"{feedback_key} must be a physical feedback entity", path=[feedback_key])
 
 
 def _validate_dynamic_charge_section(data: dict) -> dict[str, str]:
@@ -961,6 +1127,20 @@ def _settings_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
 
 # Keep module-level constant for backwards compatibility in tests
 SETTINGS_SCHEMA = _settings_schema()
+
+
+# Include conditional fields so clearing a hidden form field remains effective.
+_CONFIGURATION_FIELDS = {CONF_INVERTER_TYPE, CONF_GRID_VOLTAGE} | {
+    field.schema
+    for schema in (
+        _sensor_schema(True),
+        _energy_schema(TariffProvider.GENERIC),
+        _forecast_schema(ForecastProvider.GENERIC),
+        BATTERY_SCHEMA,
+        SETTINGS_SCHEMA,
+    )
+    for field in schema.schema
+}
 
 
 class PvExcessControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -1172,7 +1352,22 @@ class PvExcessControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 try:
                     _validate_battery_section(user_input)
                 except vol.Invalid as exc:
-                    errors["base"] = str(exc)
+                    if exc.path:
+                        field = str(exc.path[0])
+                        error = "invalid_battery_setting"
+                        if field == CONF_BATTERY_LOAD_PROFILE_W:
+                            error = "invalid_battery_load_profile"
+                        elif field == CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY:
+                            error = "missing_battery_grid_power_entity"
+                        elif field == CONF_BATTERY_MAX_CHARGE_POWER_W:
+                            error = "invalid_battery_native_charge_power"
+                        elif field in _BATTERY_FEEDBACK_KEYS:
+                            error = "missing_physical_battery_feedback"
+                        elif field.startswith("battery_hold"):
+                            error = "invalid_battery_hold"
+                        errors[field] = error
+                    else:
+                        errors["base"] = str(exc)
 
             if not errors:
                 errors = _validate_dynamic_charge_section(user_input)
@@ -1183,7 +1378,7 @@ class PvExcessControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="battery",
-            data_schema=_battery_schema(defaults=self.data),
+            data_schema=_battery_schema(defaults={**self.data, **(user_input or {})}),
             errors=errors,
             last_step=False,
         )
@@ -1429,7 +1624,22 @@ class PvExcessControlOptionsFlow(config_entries.OptionsFlow):
                 try:
                     _validate_battery_section(user_input)
                 except vol.Invalid as exc:
-                    errors["base"] = str(exc)
+                    if exc.path:
+                        field = str(exc.path[0])
+                        error = "invalid_battery_setting"
+                        if field == CONF_BATTERY_LOAD_PROFILE_W:
+                            error = "invalid_battery_load_profile"
+                        elif field == CONF_INVERTER_FORCE_CHARGE_POWER_ENTITY:
+                            error = "missing_battery_grid_power_entity"
+                        elif field == CONF_BATTERY_MAX_CHARGE_POWER_W:
+                            error = "invalid_battery_native_charge_power"
+                        elif field in _BATTERY_FEEDBACK_KEYS:
+                            error = "missing_physical_battery_feedback"
+                        elif field.startswith("battery_hold"):
+                            error = "invalid_battery_hold"
+                        errors[field] = error
+                    else:
+                        errors["base"] = str(exc)
 
             if not errors:
                 errors = _validate_dynamic_charge_section(user_input)
@@ -1437,14 +1647,14 @@ class PvExcessControlOptionsFlow(config_entries.OptionsFlow):
             if not errors:
                 self.data.update(user_input)
                 # Clean optional battery fields not present in user_input
-                for key in [CONF_MIN_BATTERY_SOC, CONF_BATTERY_MAX_DISCHARGE_ENTITY, CONF_BATTERY_MAX_DISCHARGE_DEFAULT]:
+                for key in [CONF_MIN_BATTERY_SOC, CONF_BATTERY_MAX_DISCHARGE_ENTITY, CONF_BATTERY_MAX_DISCHARGE_DEFAULT, *_BATTERY_PLANNING_OPTIONAL_KEYS]:
                     if key not in user_input:
                         self.data.pop(key, None)
                 return await self.async_step_settings()
 
         return self.async_show_form(
             step_id="battery",
-            data_schema=_battery_schema(defaults=self.data),
+            data_schema=_battery_schema(defaults={**self.data, **(user_input or {})}),
             errors=errors,
             last_step=False,
         )
@@ -1500,6 +1710,18 @@ class PvExcessControlOptionsFlow(config_entries.OptionsFlow):
                     CONF_MIN_BATTERY_SOC,
                 ]:
                     self.data.pop(key, None)
+
+            # Device ownership and runtime controls can change while this form is
+            # open. Keep their current values, including additions and removals.
+            candidate = self.data
+            self.data = {
+                key: value for key, value in self.config_entry.data.items()
+                if key not in _CONFIGURATION_FIELDS
+            }
+            self.data.update({
+                key: value for key, value in candidate.items()
+                if key in _CONFIGURATION_FIELDS
+            })
 
             # Update the config entry's data directly (OptionsFlow.async_create_entry
             # saves to .options, but our integration reads from .data)

@@ -37,6 +37,8 @@ def _make_coordinator(
     """Return a mock PvExcessCoordinator."""
     coord = MagicMock()
     coord.async_stop_appliance = AsyncMock()
+    coord.async_stop_battery_controls = AsyncMock(return_value=True)
+    coord._run_grid_charge_state_machine = AsyncMock()
     coord.config_entry = MagicMock()
     coord.config_entry.entry_id = "test_entry_id"
 
