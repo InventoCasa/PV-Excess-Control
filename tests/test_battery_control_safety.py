@@ -352,9 +352,12 @@ async def test_failed_durable_save_never_starts_hardware(coordinator_factory, mo
     await coord.async_stop_battery_controls()
 
 
-async def test_verified_hold_is_released_on_disable(coordinator_factory, mock_inverter_controller):
+async def test_verified_hold_is_released_on_disable(coordinator_factory, mock_inverter_controller, freezer):
     from unittest.mock import MagicMock
     from custom_components.pv_excess_control.models import InverterGridChargeConfig
+    # A partial hour can change the bounded planner's first action. Keep this
+    # lifecycle test's hold schedule stable.
+    freezer.move_to("2026-10-09T12:00:00Z")
     coord, _, tariff = planned(coordinator_factory, mock_inverter_controller, soc=50)
     tariff.battery_charge_price_threshold = 0  # Only preserve existing energy.
     hold = MagicMock()
@@ -373,7 +376,9 @@ async def test_verified_hold_is_released_on_disable(coordinator_factory, mock_in
     assert not coord._battery_hold_cleanup_pending
 
 
-async def test_profile_learning_keeps_zero_and_does_not_reset_at_midnight(coordinator_factory, mock_inverter_controller):
+async def test_profile_learning_keeps_zero_and_does_not_reset_at_midnight(coordinator_factory, mock_inverter_controller, freezer):
+    # Learning accepts observation pairs only within the same local hour.
+    freezer.move_to("2026-10-09T12:30:00Z")
     coord, states = prepared(coordinator_factory, mock_inverter_controller)
     states["sensor.load_power"] = State("sensor.load_power", "0")
     now = dt_util.now()

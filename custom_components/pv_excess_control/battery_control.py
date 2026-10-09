@@ -22,6 +22,10 @@ from .models import InverterGridChargeConfig
 
 _LOGGER = logging.getLogger(__name__)
 
+# Some tariff providers round future-window EUR/kWh prices to four decimals
+# while retaining full precision in the live sensor. Permit half that step.
+_FOUR_DECIMAL_PRICE_TOLERANCE = .00005 + 1e-12
+
 
 def _finite(value):
     try:
@@ -567,7 +571,8 @@ class BatteryControlMixin:
             return "price_snapshot_changed"
         now = dt_util.now()
         price_now = [w for w in tariff_info.windows if w.start <= now < w.end]
-        if len(price_now) != 1 or abs(price_now[0].price - tariff_info.current_price) > .00001:
+        if (len(price_now) != 1
+                or abs(price_now[0].price - tariff_info.current_price) > _FOUR_DECIMAL_PRICE_TOLERANCE):
             self._battery_grid_plan = None
             return "price_window_mismatch"
         forecast = getattr(self, "_forecast_data", None)
