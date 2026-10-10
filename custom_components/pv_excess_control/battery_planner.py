@@ -18,6 +18,27 @@ _EPS = 1e-8
 
 
 @dataclass(frozen=True)
+class BatteryLoadCommitment:
+    """Bounded major-load demand and its battery constraints.
+
+    ``power_w`` is external AC demand excluded from the historical household
+    profile. It reserves PV before household/battery allocation. Remaining
+    external and household demand share the actual global discharge limit;
+    only a zero limit fully prevents battery supply. ``household_power_floor_w``
+    describes total house demand
+    already represented in that profile: it raises the profile by taking the
+    maximum, never by addition. An optional discharge limit also constrains
+    native household supply during this interval.
+    """
+
+    start: datetime
+    end: datetime
+    power_w: float
+    max_discharge_power_w: float | None = None
+    household_power_floor_w: float | None = None
+
+
+@dataclass(frozen=True)
 class BatteryPlanningConfig:
     """Physical limits and prices, expressed in kWh, W, percent and EUR/kWh.
 
@@ -47,7 +68,7 @@ class BatteryPlanningConfig:
 
 @dataclass(frozen=True)
 class BatteryGridSlot:
-    """A UTC interval; charge and discharge energies are measured on the AC side."""
+    """A UTC interval with AC energies and PV remaining after external loads."""
 
     start: datetime
     end: datetime
@@ -59,6 +80,8 @@ class BatteryGridSlot:
     discharge_kwh: float
     soc_end: float
     action: str
+    reserved_pv_kwh: float = 0.0
+    external_load_kwh: float = 0.0
 
     @property
     def charge_power_w(self) -> float:
@@ -88,10 +111,28 @@ class _Interval:
     price: float
     pv: float
     load: float
+    reserved_pv: float = 0.0
+    max_discharge_power_w: float | None = None
+    external_load: float = 0.0
 
     @property
     def hours(self) -> float:
         return (self.end - self.start).total_seconds() / 3600
+
+    @property
+    def external_grid_deficit_kwh(self) -> float:
+        return max(0.0, self.external_load - self.reserved_pv)
+
+    @property
+    def deficit_kwh(self) -> float:
+        """Both load classes share the physical battery's discharge limit."""
+        return max(0.0, self.load - self.pv) + self.external_grid_deficit_kwh
+
+    def discharge_limit(self, config: BatteryPlanningConfig) -> float:
+        """The tightest native or concurrently active external-load limit."""
+        if self.max_discharge_power_w is None:
+            return config.max_discharge_power_w
+        return min(config.max_discharge_power_w, self.max_discharge_power_w)
 
 
 @dataclass(frozen=True)
@@ -145,6 +186,7 @@ def _timeline(
     forecast: list[HourlyForecast],
     load_w: list[float],
     horizon_hours: float,
+    load_commitments: tuple[BatteryLoadCommitment, ...] = (),
 ) -> list[_Interval]:
     start = _utc(now)
     if len(load_w) != 24 or not all(_finite(value) and value >= 0 for value in load_w):
@@ -157,6 +199,23 @@ def _timeline(
     if end <= start:
         raise ValueError("missing_future_data")
     boundaries = {start, end}
+    commitments = []
+    for row in load_commitments:
+        row_start, row_end = _utc(row.start), _utc(row.end)
+        cap = row.max_discharge_power_w
+        floor = row.household_power_floor_w
+        if (
+            row_end <= row_start
+            or not _finite(row.power_w)
+            or row.power_w < 0
+            or (cap is not None and (not _finite(cap) or cap < 0))
+            or (floor is not None and (not _finite(floor) or floor < 0))
+        ):
+            raise ValueError("invalid_load_commitment")
+        if row_end > start and row_start < end:
+            clipped_start, clipped_end = max(start, row_start), min(end, row_end)
+            commitments.append((clipped_start, clipped_end, row.power_w, cap, floor))
+            boundaries.update((clipped_start, clipped_end))
     normalized = []
     for rows, kind in ((prices, "tariff"), (solar, "forecast")):
         relevant = [row for row in rows if row[1] > start and row[0] < end]
@@ -193,9 +252,17 @@ def _timeline(
             si += 1
         duration = (right - left).total_seconds()
         solar_duration = (solar[si][1] - solar[si][0]).total_seconds()
+        pv = solar[si][2] * duration / solar_duration
+        active = [row for row in commitments if row[0] <= left < row[1]]
+        external_load = sum(row[2] for row in active) * duration / 3_600_000
+        reserved_pv = min(pv, external_load)
+        caps = [row[3] for row in active if row[3] is not None]
+        floors = [row[4] for row in active if row[4] is not None]
+        household_power = max(load_w[left.astimezone(now.tzinfo).hour], max(floors, default=0))
         result.append(_Interval(
-            left, right, prices[pi][2], solar[si][2] * duration / solar_duration,
-            load_w[left.astimezone(now.tzinfo).hour] * duration / 3_600_000,
+            left, right, prices[pi][2], pv - reserved_pv,
+            household_power * duration / 3_600_000,
+            reserved_pv, min(caps) if caps else None, external_load,
         ))
     return result
 
@@ -212,18 +279,19 @@ def _transition(
     capacity = config.capacity_kwh
     reserve = capacity * config.reserve_soc / 100
     surplus = max(0.0, interval.pv - interval.load)
-    deficit = max(0.0, interval.load - interval.pv)
+    deficit = interval.deficit_kwh
     solar_stored = min(surplus, config.native_charge_power_w * interval.hours / 1000, max(0.0, capacity - node.energy) / efficiency) * efficiency
     energy = node.energy + solar_stored + grid_charge * efficiency
     discharge = 0.0
     if action == "self_consumption":
-        discharge = min(deficit, config.max_discharge_power_w * interval.hours / 1000, max(0.0, energy - reserve) * efficiency)
+        discharge = min(deficit, interval.discharge_limit(config) * interval.hours / 1000, max(0.0, energy - reserve) * efficiency)
         energy -= discharge / efficiency
     import_kwh = deficit - discharge + grid_charge
     cost = import_kwh * interval.price + discharge * config.wear_cost_per_kwh
     slot = BatteryGridSlot(
         interval.start, interval.end, interval.price, interval.pv, interval.load,
         grid_charge, solar_stored / efficiency, discharge, energy / capacity * 100, action,
+        interval.reserved_pv, interval.external_load,
     )
     return _Node(energy, node.cost + cost, node.grid_energy + grid_charge, node, slot), solar_stored
 
@@ -243,6 +311,8 @@ def build_battery_grid_plan(
     forecast: list[HourlyForecast],
     hourly_load_w: list[float],
     config: BatteryPlanningConfig,
+    *,
+    load_commitments: tuple[BatteryLoadCommitment, ...] = (),
 ) -> BatteryGridPlan:
     """Plan useful grid energy within contiguous, complete future input data.
 
@@ -254,10 +324,18 @@ def build_battery_grid_plan(
     unused energy at the horizon. This excludes negative-price waste and export
     arbitrage. Export revenue is not modeled. When holding is unavailable, every
     non-charging interval follows native self consumption.
+
+    Bounded external loads reserve their share of forecast PV exactly once.
+    Their remaining demand can receive native battery discharge up to the actual
+    global limit, including any residual leakage under a small nonzero cap.
+    Their grid purchases are included in candidate and baseline costs. They do
+    not become permanent household demand after their bounded interval ends.
+    Known house demand can raise the historical profile for a bounded interval;
+    overlapping total house floors combine by maximum to avoid double counting.
     """
     try:
         _validate_config(config, soc)
-        timeline = _timeline(now, tariff_windows, forecast, hourly_load_w, config.horizon_hours)
+        timeline = _timeline(now, tariff_windows, forecast, hourly_load_w, config.horizon_hours, load_commitments)
     except (ValueError, TypeError, AttributeError) as exc:
         return BatteryGridPlan((), 0.0, 0.0, str(exc), 0.0, valid=False)
 
@@ -275,7 +353,7 @@ def build_battery_grid_plan(
     bounds[-1] = baseline.energy
     for i in range(len(timeline) - 1, -1, -1):
         interval = timeline[i]
-        discharge = min(max(0.0, interval.load - interval.pv), config.max_discharge_power_w * interval.hours / 1000) / efficiency
+        discharge = min(interval.deficit_kwh, interval.discharge_limit(config) * interval.hours / 1000) / efficiency
         bounds[i] = min(config.capacity_kwh, max(0.0, bounds[i + 1] + discharge - baseline_solar[i]))
 
     # Bound CPU/memory for large batteries without rounding physical balances.
@@ -304,7 +382,7 @@ def build_battery_grid_plan(
         for node in states.values():
             native, solar = _transition(interval, node, config, efficiency, "self_consumption")
             retain(native, solar)
-            if config.hold_supported and interval.load > interval.pv and native.energy < node.energy - _EPS:
+            if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
                 retained, solar = _transition(interval, node, config, efficiency, "hold")
                 retain(retained, solar)
             if interval.price > config.charge_price_limit:

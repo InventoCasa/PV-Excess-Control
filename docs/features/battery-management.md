@@ -80,6 +80,37 @@ avoid applying the same correction twice if the provider already calibrates
 its estimates. A lower forecast remains an assumption, not a guarantee of
 production. Missing, invalid or stale forecast inputs still block charging.
 
+### Consumers and available solar energy
+
+A forecast of PV production is not automatically a forecast of battery charging.
+The battery planner accounts for current consumers before assigning solar energy
+to storage. Mapped EV charging is tracked separately because it is excluded from
+the learned household profile. Other household loads raise a **total demand
+floor** when observed consumption exceeds the historical estimate; the planner
+uses the larger demand rather than adding the same appliance twice.
+
+Currently running consumers with a defensible operating limit can occupy solar
+energy through that limit. Examples include the end of their continuous eligible
+cheap-price window or a configured remaining-runtime/maximum-runtime limit.
+Minimum daily runtime, an advisory plan or an advisory planning deadline alone
+do not establish a switch-off time. A cheap window provides a stopping estimate
+only when the configured policy and available solar do not permit continuation. Starting, stopping or changing a consumer's policy causes the
+battery schedule to be reconsidered.
+
+Unmapped or otherwise unbounded non-EV household consumption is a near-term
+estimate: measured load persists for a bounded 30-minute observation window and
+is updated as new measurements arrive. It is not assumed to run unchanged for
+24 hours. An active EV excluded from the household history needs valid power and
+a credible duration bound; if these are unavailable, automatic purchases are
+blocked with a diagnostic reason instead of assuming that its solar demand is
+zero.
+
+The calculation also respects the discharge limit expected while those loads
+run. A device whose minimum setting is 100 W is modeled with that remaining
+power, not as a complete discharge hold. The integration's existing appliance
+safety rules still determine actual operation; the battery forecast does not
+create new appliance start commands.
+
 ### Costs and losses
 
 The useful-energy cost is:
@@ -115,7 +146,7 @@ Automatic charging requires:
 
 The household profile can be entered as **Hourly household demand**, a JSON list
 of 24 nonnegative average watt values, ordered from local hour 00 to 23. Exclude
-EV charging and other demand scheduled separately. A constant 500 W example is:
+mapped EV charging, but include the usual non-EV household consumers. A constant 500 W example is:
 
 ```json
 [500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500,

@@ -9,7 +9,7 @@ import asyncio
 import logging
 import math
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from homeassistant.core import State
 from homeassistant.exceptions import HomeAssistantError
@@ -69,6 +69,11 @@ class BatteryControlMixin:
         self._battery_load_store = None
         self._battery_load_hours = [[0., 0., None] for _ in range(24)]
         self._battery_load_last = None
+        self._battery_observed_load_until = None
+        self._battery_observed_load_floor = 0.
+        self._battery_observed_limits = ()
+        self._battery_load_commitments = ()
+        self._battery_load_assumptions = ()
         if data.get("battery_hold_verified") and data.get("battery_hold_entity"):
             try:
                 self._battery_hold_ctl = InverterGridChargeController(self.hass, InverterGridChargeConfig(
@@ -541,6 +546,290 @@ class BatteryControlMixin:
         value = minimum + math.floor((value - minimum + 1e-9) / step) * step
         return value * multiplier if value >= minimum else None
 
+    def _battery_load_policy_allows_run(self, appliance_id, data, now):
+        """Mirror immediate gates relevant to an already observed active run."""
+        if self.appliance_overrides.get(appliance_id, False) or data.get("helper_only"):
+            return True
+        for key in ("ev_connected_entity", "enable_condition_entity"):
+            if key == "enable_condition_entity" and data.get("enable_condition_mode", "start_only") != "while_running":
+                continue
+            if entity := data.get(key):
+                state = self.hass.states.get(entity)
+                if not isinstance(state, State) or state.state not in ("on", "true", "True", "1"):
+                    return False
+        target = _finite(data.get("ev_target_soc"))
+        soc = self._battery_read_number(data.get("ev_soc_entity"), max_age=300)
+        if target is not None and soc is not None and soc >= target:
+            return False
+        if data.get("on_only") and not data.get("dynamic_current"):
+            return True  # Fixed on-only runs bypass the operating-time gate.
+        try:
+            start = time.fromisoformat(data["start_after"]) if data.get("start_after") else None
+            end = time.fromisoformat(data["end_before"]) if data.get("end_before") else None
+        except (TypeError, ValueError):
+            return False
+        return self.optimizer._is_within_time_window(now.time(), start, end)
+
+    def _battery_load_funding(self, appliance_id, data, now, tariff):
+        """Identify the present funding policy and its next known transition."""
+        threshold = _finite(data.get("cheap_price_threshold"))
+        if threshold is None:
+            threshold = _finite(tariff.cheap_price_threshold)
+        funded = bool(not self.appliance_overrides.get(appliance_id, False)
+                      and not data.get("helper_only")
+                      and not (data.get("on_only") and not data.get("dynamic_current"))
+                      and data.get("allow_grid_supplement") and threshold is not None
+                      and (tariff.current_price <= threshold or tariff.current_price < tariff.feed_in_tariff))
+        if not funded:
+            return False, None
+        cursor = now
+        for window in sorted(tariff.windows, key=lambda row: row.start):
+            if window.end <= now:
+                continue
+            if window.start > cursor:
+                break
+            if not (window.price <= threshold or window.price < tariff.feed_in_tariff):
+                return True, cursor
+            cursor = max(cursor, window.end)
+        # The end of supplied data does not promise the end of cheap funding.
+        return True, None
+
+    def _battery_load_solar_cannot_continue(self, appliance_id, data, when):
+        """Allow a tariff stop estimate only when forecast solar cannot sustain it."""
+        forecast = getattr(self, "_forecast_data", None)
+        profile = self._battery_load_profile()
+        if forecast is None or profile is None:
+            return False
+        rows = [row for row in forecast.hourly_breakdown if row.start <= when < row.end]
+        if len(rows) != 1:
+            return False
+        row = rows[0]
+        duration = (row.end.astimezone(timezone.utc) - row.start.astimezone(timezone.utc)).total_seconds()
+        solar = _finite(row.expected_kwh)
+        factor = _finite(self.config_entry.data.get(CONF_BATTERY_PV_FORECAST_FACTOR, DEFAULT_BATTERY_PV_FORECAST_FACTOR))
+        if duration <= 0 or solar is None or solar < 0 or factor is None or not .1 <= factor <= 1:
+            return False
+        minimum = _finite(data.get("nominal_power"))
+        if data.get("dynamic_current"):
+            amps = _finite(data.get("min_current", 6))
+            voltage = _finite(self.config_entry.data.get("grid_voltage", 230))
+            phases = self._effective_phases(appliance_id, data)
+            minimum = amps * voltage * phases if amps is not None and voltage is not None else None
+        if minimum is None or minimum <= 0:
+            return False
+        available = solar * factor * 3_600_000 / duration - profile[when.astimezone(dt_util.now().tzinfo).hour]
+        return available + 1e-6 < minimum
+
+    def _battery_load_run_end(self, appliance_id, data, now, tariff):
+        """Bound an observed run by actual stopping rules, never minimum demand.
+
+        Cheap-window continuation is an estimate for a currently running load.
+        An advisory appliance plan does not promise a future run or a stop.
+        """
+        bounds = []
+        override = self.appliance_overrides.get(appliance_id, False)
+        on_only = data.get("on_only", False)
+        helper_only = data.get("helper_only", False)
+        runtime_entity = data.get("remaining_runtime_entity")
+        if runtime_entity and not override and not on_only and not helper_only:
+            remaining = self._battery_read_number(runtime_entity, max_age=300)
+            if remaining is None or remaining <= 0:
+                return None, False
+            state = self.hass.states.get(runtime_entity)
+            stamp = getattr(state, "last_reported", None) or state.last_updated
+            bounds.append(stamp + timedelta(minutes=remaining))
+        maximum = self.appliance_max_daily_runtime.get(appliance_id, data.get("max_daily_runtime"))
+        if maximum is not None:
+            maximum = _finite(maximum)
+            state = self.appliance_states.get(appliance_id)
+            if maximum is None or state is None:
+                return None, False
+            end = now.astimezone(timezone.utc) + timedelta(minutes=maximum) - state.runtime_today
+            midnight = datetime.combine(now.date() + timedelta(days=1), time(), tzinfo=now.tzinfo)
+            # The daily counter resets at local midnight; today's remaining
+            # allowance cannot promise a stop on the following day.
+            if end < midnight:
+                bounds.append(end)
+        if not override and not helper_only and not (on_only and not data.get("dynamic_current")) and data.get("end_before"):
+            try:
+                end_time = time.fromisoformat(data["end_before"])
+                end = datetime.combine(now.date(), end_time, tzinfo=now.tzinfo)
+                start_time = time.fromisoformat(data["start_after"]) if data.get("start_after") else None
+            except (TypeError, ValueError):
+                return None, False
+            if start_time is not None and start_time >= end_time and now.time() >= start_time:
+                end += timedelta(days=1)
+            bounds.append(end)
+        funded, funding_end = self._battery_load_funding(appliance_id, data, now, tariff)
+        if (funding_end is not None and not on_only
+                and self._battery_load_solar_cannot_continue(appliance_id, data, funding_end)):
+            bounds.append(funding_end)
+        end = min(bounds) if bounds else None
+        if on_only and funded and funding_end is not None and (end is None or end > funding_end):
+            # Dynamic on-only loads can continue at another current after cheap
+            # funding ends. Do not invent that future demand or retain its cap.
+            return None, funded
+        return (end if end is not None and end > now else None), funded
+
+    def _battery_load_context(self, now, tariff, profile):
+        """Project observed major loads without adding household history twice.
+
+        Unmapped house demand persists for an explicitly assumed thirty minutes.
+        Managed metered runs can extend to a known policy boundary. EV demand is
+        separate because it was excluded when learning the household profile.
+        """
+        from .battery_planner import BatteryLoadCommitment
+
+        self._battery_load_commitments = ()
+        self._battery_load_assumptions = ()
+        age = self.config_entry.data.get("battery_input_max_age_seconds", 300)
+        total = self._battery_read_number(self.config_entry.data.get("load_power"), max_age=age, power=True)
+        if total is None:
+            return (), (), "load_power_missing_or_stale"
+        ev_total = 0.0
+        metered_house = 0.0
+        ev_runs = []
+        house_runs = []
+        limited_runs = []
+        signature = []
+        assumptions = set()
+
+        # The normal discharge controller clamps its zero request to this native
+        # minimum. This is a rate limit, not verified full hold capability.
+        cap = None
+        cap_maximum = None
+        cap_entity = self.config_entry.data.get("battery_max_discharge_entity")
+        cap_state = self.hass.states.get(cap_entity) if cap_entity else None
+        if isinstance(cap_state, State) and _finite(cap_state.state) is not None:
+            unit = str(cap_state.attributes.get("unit_of_measurement", "W")).lower()
+            minimum = _finite(cap_state.attributes.get("min"))
+            if minimum is not None and minimum >= 0 and unit in ("w", "kw"):
+                multiplier = 1000 if unit == "kw" else 1
+                cap = minimum * multiplier
+                maximum = _finite(cap_state.attributes.get("max"))
+                cap_maximum = maximum * multiplier if maximum is not None else None
+
+        for appliance_id, subentry in getattr(self.config_entry, "subentries", {}).items():
+            data = subentry.data
+            is_ev = bool(data.get("ev_soc_entity") or data.get("ev_connected_entity"))
+            entity_id = data.get("appliance_entity")
+            state = self.hass.states.get(entity_id) if entity_id else None
+            off = isinstance(state, State) and state.state in ("off", "0", "false", "False")
+            watts = self._battery_read_number(data.get("actual_power_entity"), max_age=age, power=True)
+            if watts is None or watts < 0:
+                if is_ev and not off:
+                    return (), (), "active_ev_power_missing_or_stale"
+                continue  # Non-EV draw is still captured in aggregate house power.
+            if is_ev:
+                ev_total += watts
+            else:
+                metered_house += watts
+            if watts <= 0:
+                continue
+            managed = (self.appliance_enabled.get(appliance_id, True)
+                       and not getattr(self, "appliance_paused", {}).get(appliance_id, False))
+            override = self.appliance_overrides.get(appliance_id, False)
+            managed = managed or override
+            if is_ev and (not managed or off):
+                return (), (), "active_ev_unmanaged"
+            policy_allows = managed and self._battery_load_policy_allows_run(appliance_id, data, now)
+            if is_ev and (not policy_allows or not isinstance(state, State) or state.state in ("unknown", "unavailable")):
+                return (), (), "active_ev_policy_uncertain"
+            end, funded = self._battery_load_run_end(appliance_id, data, now, tariff) if policy_allows else (None, False)
+            if is_ev and end is None:
+                return (), (), "active_ev_duration_unknown"
+            funding_end = self._battery_load_funding(appliance_id, data, now, tariff)[1] if funded else None
+            limit = None
+            after_limit = None
+            after_requested = (_finite(data.get("battery_discharge_override"))
+                               if policy_allows and data.get("is_big_consumer") else None)
+            requested = 0. if funded else after_requested
+            if requested is not None and cap_entity:
+                if cap is None:
+                    return (), (), "load_discharge_limit_unavailable"
+                if requested != 0 and unit == "kw":
+                    # The existing writer sends watts without converting a
+                    # nonzero request to kW. Do not predict an unsupported cap.
+                    return (), (), "load_discharge_limit_units_unsupported"
+                limit = max(requested, cap)
+                if cap_maximum is not None:
+                    limit = min(limit, cap_maximum)
+                if after_requested is not None:
+                    if after_requested != 0 and unit == "kw":
+                        return (), (), "load_discharge_limit_units_unsupported"
+                    after_limit = max(after_requested, cap)
+                    if cap_maximum is not None:
+                        after_limit = min(after_limit, cap_maximum)
+            # Ignore normal meter jitter, while a real start/stop or material
+            # power/policy change immediately invalidates a cached battery plan.
+            projected_w = max(100., round(watts / 100) * 100.)
+            signature.append((appliance_id, projected_w, managed, override, end, funded, limit, after_limit,
+                              tuple((key, repr(value)) for key, value in sorted(data.items()))))
+            if is_ev:
+                if funding_end is not None and funding_end < end and limit != after_limit:
+                    ev_runs.append(BatteryLoadCommitment(now, funding_end, projected_w, limit))
+                    ev_runs.append(BatteryLoadCommitment(funding_end, end, projected_w, after_limit))
+                else:
+                    ev_runs.append(BatteryLoadCommitment(now, end, projected_w, limit))
+            elif end is not None:
+                house_runs.append((end, projected_w))
+            if not is_ev and limit is not None:
+                limited_runs.append((appliance_id, end, limit, funding_end))
+                if funding_end is not None and end is not None and funding_end < end and after_limit is not None:
+                    ev_runs.append(BatteryLoadCommitment(funding_end, end, 0., after_limit))
+            if end is not None:
+                assumptions.add("active_run_until_policy_or_runtime_bound")
+
+        # Inconsistent simultaneous meters must not invent negative base demand.
+        if ev_total > total + 100:
+            return (), (), "active_ev_power_exceeds_house_load"
+        observed_house = max(0., total - ev_total)
+        observed_floor = max(0., round(observed_house / 100) * 100.)
+        unmetered_base = max(0., observed_house - metered_house)
+        floor_active = observed_floor > profile[now.hour]
+        floor_level = observed_floor if floor_active else 0.
+        unknown_limits = tuple((app_id, limit, funding_end) for app_id, end, limit, funding_end in limited_runs if end is None)
+        until = self._battery_observed_load_until
+        if floor_active or unknown_limits:
+            if (until is None or until <= now or floor_level > self._battery_observed_load_floor
+                    or unknown_limits != self._battery_observed_limits):
+                until = now.astimezone(timezone.utc) + timedelta(minutes=30)
+        else:
+            until = None
+        self._battery_observed_load_until = until
+        self._battery_observed_load_floor = floor_level
+        self._battery_observed_limits = unknown_limits
+        commitments = list(ev_runs)
+        for _, end, limit, funding_end in limited_runs:
+            limit_end = end or until
+            if funding_end is not None:
+                limit_end = min(limit_end, funding_end)
+            commitments.append(BatteryLoadCommitment(now, limit_end, 0., limit))
+        if floor_active:
+            commitments.append(BatteryLoadCommitment(now, until, 0., household_power_floor_w=observed_floor))
+            assumptions.add("observed_30_minute_persistence")
+        if unknown_limits:
+            assumptions.add("observed_30_minute_discharge_limit")
+        # Combine simultaneous metered household runs into a TOTAL household
+        # floor. Taking max(profile, floor) keeps their historical contribution
+        # from being charged twice. Unmapped excess is not projected all day.
+        boundaries = {now, *(end for end, _ in house_runs)}
+        hour = now.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc) + timedelta(hours=1)
+        last = max(boundaries)
+        while hour < last:
+            boundaries.add(hour)
+            hour += timedelta(hours=1)
+        boundaries = sorted(boundaries)
+        for left, right in zip(boundaries, boundaries[1:]):
+            active_w = sum(watts for end, watts in house_runs if end > left)
+            floor = active_w + min(unmetered_base, profile[left.astimezone(now.tzinfo).hour])
+            commitments.append(BatteryLoadCommitment(left, right, 0., household_power_floor_w=floor))
+        self._battery_load_commitments = tuple(commitments)
+        self._battery_load_assumptions = tuple(sorted(assumptions))
+        base_key = round(unmetered_base / 100) * 100. if house_runs else None
+        key = (tuple(signature), observed_floor if until is not None else None, until, cap, base_key)
+        return self._battery_load_commitments, key, None
+
     def _refresh_battery_grid_plan(self, tariff_info, power_state):
         """Validate observations before passing immutable inputs to pure planning."""
         from .battery_planner import BatteryPlanningConfig, build_battery_grid_plan
@@ -593,13 +882,17 @@ class BatteryControlMixin:
         if profile is None:
             self._battery_grid_plan = None
             return "household_profile_incomplete"
+        commitments, load_key, load_error = self._battery_load_context(now, tariff_info, profile)
+        if load_error:
+            self._battery_grid_plan = None
+            return load_error
         soc = self._battery_soc_now()
         hold = bool(self._battery_hold_ctl and self._battery_hold_ctl.confirmation_level == "physical")
         # Keep the chosen slot target stable between planner runs; re-evaluate
         # immediately when any tariff/forecast/configuration input changes.
         key = (tuple((w.start, w.end, w.price) for w in tariff_info.windows),
                tuple((f.start, f.end, f.expected_kwh) for f in forecast.hourly_breakdown),
-               hold,
+               hold, load_key,
                tuple((k, repr(v)) for k, v in sorted(d.items()) if k.startswith("battery_") or k == "min_battery_soc"),
                tariff_info.battery_charge_price_threshold)
         slot = self._current_battery_slot()
@@ -620,7 +913,10 @@ class BatteryControlMixin:
             grid_forecast = [replace(row, expected_kwh=row.expected_kwh * factor,
                                      expected_watts=row.expected_watts * factor)
                              for row in forecast.hourly_breakdown]
-            self._battery_grid_plan = build_battery_grid_plan(now, soc, tariff_info.windows, grid_forecast, profile, config)
+            self._battery_grid_plan = build_battery_grid_plan(
+                now, soc, tariff_info.windows, grid_forecast, profile, config,
+                load_commitments=commitments,
+            )
             self._battery_plan_key = key
             self._battery_plan_created = now
         return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason
@@ -720,6 +1016,13 @@ class BatteryControlMixin:
             "battery_grid_target_soc": round(plan.grid_target_soc, 1) if plan and plan.valid else None,
             "battery_estimated_savings": round(plan.estimated_savings, 3) if plan and plan.valid else None,
             "battery_load_profile_ready": self._battery_load_profile() is not None,
+            "battery_load_assumptions": list(self._battery_load_assumptions),
+            "battery_load_commitments": [
+                {"start": row.start.isoformat(), "end": row.end.isoformat(),
+                 "external_power_w": row.power_w, "household_power_floor_w": row.household_power_floor_w,
+                 "max_discharge_power_w": row.max_discharge_power_w}
+                for row in self._battery_load_commitments
+            ],
             "battery_plan": [{"start": s.start.isoformat(), "end": s.end.isoformat(), "action": s.action,
                               "grid_charge_kwh": round(s.grid_charge_kwh, 3), "soc_end": round(s.soc_end, 1)}
                              for s in plan.slots] if plan and plan.valid else [],
