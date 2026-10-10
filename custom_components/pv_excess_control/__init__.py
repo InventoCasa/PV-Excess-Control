@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant
+from homeassistant.const import Platform
+from homeassistant.core import HassJob, HomeAssistant
 from homeassistant.helpers.event import async_track_time_change
 
 from .const import (
@@ -103,6 +103,14 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up PV Excess Control from a config entry."""
     coordinator = PvExcessCoordinator(hass, entry)
+
+    async def _stop_battery():
+        await coordinator.async_prepare_battery_unload()
+
+    # Shutdown jobs are awaited before STOP tears down automations/Modbus.
+    # Register before first refresh, which may already control a running core.
+    entry.async_on_unload(hass.async_add_shutdown_job(HassJob(_stop_battery)))
+    entry.async_on_unload(coordinator._cancel_battery_startup_recovery)
     await coordinator.async_restore_battery_load()
     await coordinator.async_restore_daily_state()
     await coordinator.async_config_entry_first_refresh()
@@ -128,11 +136,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(
         async_track_time_change(hass, _midnight_reset, hour=0, minute=0, second=0)
     )
-
-    async def _stop_battery(event):
-        await coordinator.async_prepare_battery_unload()
-
-    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop_battery))
 
     async_reconcile_appliance_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

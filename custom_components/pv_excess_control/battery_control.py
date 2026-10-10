@@ -11,9 +11,10 @@ import math
 from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 
-from homeassistant.core import State
+from homeassistant.core import CoreState, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_BATTERY_PV_FORECAST_FACTOR, DEFAULT_BATTERY_PV_FORECAST_FACTOR
@@ -50,6 +51,7 @@ class BatteryControlMixin:
         self._battery_hold_engaged = False
         self._battery_hold_ctl = None
         self._battery_watchdog = None
+        self._battery_startup_unsub = None
         self._battery_retry_after = None
         self._battery_hold_retry_after = None
         self._battery_target_latched = None
@@ -170,6 +172,36 @@ class BatteryControlMixin:
             self._battery_watchdog.cancel()
             self._battery_watchdog = None
 
+    def _battery_waiting_for_startup(self):
+        """Helper bridges attach automation triggers only after core startup."""
+        return getattr(self.hass, "state", None) in (CoreState.not_running, CoreState.starting)
+
+    def _cancel_battery_startup_recovery(self):
+        if self._battery_startup_unsub is not None:
+            self._battery_startup_unsub()
+            self._battery_startup_unsub = None
+
+    def _defer_battery_startup_recovery(self):
+        """Keep ownership pending without consuming a helper state transition."""
+        if not (self._battery_recovery or self._grid_charge_engaged
+                or self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending):
+            return
+        self._battery_recovery = True
+        self._battery_control_state = "idle"
+        self._battery_control_reason = "startup_recovery_pending"
+        if self._battery_startup_unsub is not None:
+            return
+
+        async def recover(_hass):
+            self._battery_startup_unsub = None
+            # Even a failed unload during startup still owns its cleanup. The
+            # unloading flag remains set, so this callback can only release.
+            if (self._battery_recovery or self._grid_charge_engaged
+                    or self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending):
+                await self.async_stop_battery_controls("startup_recovery")
+
+        self._battery_startup_unsub = async_at_started(self.hass, recover)
+
     def _arm_battery_watchdog(self, end=None):
         """A stalled update loop must not leave an owned charge/hold running."""
         self._cancel_battery_watchdog()
@@ -187,6 +219,10 @@ class BatteryControlMixin:
 
     async def _release_battery_locked(self, reason):
         """Cancellation also leaves an independently retryable cleanup."""
+        if self._battery_waiting_for_startup():
+            self._cancel_battery_watchdog()
+            self._defer_battery_startup_recovery()
+            return not self._battery_recovery
         try:
             return await self._release_battery_locked_impl(reason)
         except asyncio.CancelledError:
@@ -271,12 +307,17 @@ class BatteryControlMixin:
         self._init_battery_control()
         self._battery_unloading = True
         result = await self.async_stop_battery_controls("unload")
+        if result:
+            self._cancel_battery_startup_recovery()
         await self.async_save_battery_load()
         return result
 
     async def _battery_preflight(self, power_state=None):
         self._init_battery_control()
         self._observe_battery_load()
+        if self._battery_waiting_for_startup():
+            self._defer_battery_startup_recovery()
+            return
         if self._battery_recovery or not self.enabled or self._battery_unloading:
             await self.async_stop_battery_controls("startup_recovery" if self._battery_recovery else "disabled")
         elif (self._grid_charge_engaged or self._battery_hold_engaged) and self._battery_soc_now() is None:
@@ -284,7 +325,7 @@ class BatteryControlMixin:
 
     def auto_should_engage_now(self):
         self._init_battery_control()
-        if (not self.enabled or self._battery_unloading or not self._battery_storage_ready
+        if (self._battery_waiting_for_startup() or not self.enabled or self._battery_unloading or not self._battery_storage_ready
                 or not self.config_entry.data.get("auto_battery_grid_charge")
                 or not self.config_entry.data.get("allow_grid_charging")):
             return False
@@ -300,6 +341,9 @@ class BatteryControlMixin:
 
     async def _run_grid_charge_state_machine(self, tariff_info, power_state):
         self._init_battery_control()
+        if self._battery_waiting_for_startup():
+            self._defer_battery_startup_recovery()
+            return
         async with self._battery_lock:
             if self._battery_recovery:
                 await self._release_battery_locked("startup_recovery")

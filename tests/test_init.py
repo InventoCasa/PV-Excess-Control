@@ -122,6 +122,7 @@ class MockHass:
         # bus needed by DataUpdateCoordinator
         self.bus = MagicMock()
         self.bus.async_listen_once = MagicMock(return_value=MagicMock())
+        self.async_add_shutdown_job = MagicMock(return_value=MagicMock())
         # async_add_job needed for scheduling
         self.async_add_job = MagicMock()
         self.loop = asyncio.get_event_loop()

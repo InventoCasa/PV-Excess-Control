@@ -180,9 +180,12 @@ Turning **Control Enabled** off, unloading the integration, losing required
 inputs or encountering an unconfirmed command releases control started by this
 integration. Stop and the configured return-to-self-consumption mode are both
 attempted after a partial failure. Ownership and pending cleanup persist so a
-restart can recover unfinished release. New automatic charging waits while
-cleanup is unresolved. If communication is unavailable, software cannot confirm
-that the inverter stopped; pending cleanup remains visible and is retried.
+restart can recover unfinished release. Shutdown requests release before Home
+Assistant stops its automation and hardware services. Restored ownership is
+recovered after startup completes so helper-based command bridges can process
+the request. New automatic charging waits while cleanup is unresolved. If
+communication is unavailable, software cannot confirm that the inverter stopped;
+pending cleanup remains visible and is retried.
 
 ## Holding energy for expensive hours
 
