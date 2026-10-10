@@ -15,6 +15,7 @@ from .models import HourlyForecast, TariffWindow
 
 
 _EPS = 1e-8
+_ECONOMIC_TIE_EPS = 1e-9
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ class _Interval:
     reserved_pv: float = 0.0
     max_discharge_power_w: float | None = None
     external_load: float = 0.0
+    elapsed_hours: float = 0.0
 
     @property
     def hours(self) -> float:
@@ -142,6 +144,20 @@ class _Node:
     grid_energy: float
     previous: _Node | None
     slot: BatteryGridSlot | None
+    charge_moment: float = 0.0
+
+
+def _prefer_economic_node(candidate: _Node, previous: _Node) -> bool:
+    """Break numerical economic ties by earlier useful grid purchases.
+
+    Constant external-load costs must not rearrange equivalent schedules through
+    float summation noise. Cost and total grid energy remain primary; the timing
+    moment is measured from this horizon's start, not from an absolute epoch.
+    """
+    for left, right in ((candidate.cost, previous.cost), (candidate.grid_energy, previous.grid_energy)):
+        if abs(left - right) > _ECONOMIC_TIE_EPS:
+            return left < right
+    return candidate.charge_moment < previous.charge_moment
 
 
 def _finite(value: object) -> bool:
@@ -263,6 +279,7 @@ def _timeline(
             left, right, prices[pi][2], pv - reserved_pv,
             household_power * duration / 3_600_000,
             reserved_pv, min(caps) if caps else None, external_load,
+            (left - start).total_seconds() / 3600,
         ))
     return result
 
@@ -293,7 +310,10 @@ def _transition(
         grid_charge, solar_stored / efficiency, discharge, energy / capacity * 100, action,
         interval.reserved_pv, interval.external_load,
     )
-    return _Node(energy, node.cost + cost, node.grid_energy + grid_charge, node, slot), solar_stored
+    return _Node(
+        energy, node.cost + cost, node.grid_energy + grid_charge, node, slot,
+        node.charge_moment + grid_charge * interval.elapsed_hours,
+    ), solar_stored
 
 
 def _slots(node: _Node) -> tuple[BatteryGridSlot, ...]:
@@ -369,14 +389,15 @@ def build_battery_grid_plan(
             bucket = round(candidate.energy / step)
             key = (bucket, 0)
             previous = following.get(key)
-            if previous is None or (candidate.cost, candidate.grid_energy) < (previous.cost, previous.grid_energy):
+            if previous is None or _prefer_economic_node(candidate, previous):
                 following[key] = candidate
             # Preserve exact upper endpoints as well as the cheapest state in a
             # bucket. Otherwise a partial current slot or a precise demand gap
             # can lose its physically available last few Wh through pruning.
             key = (bucket, 1)
             previous = following.get(key)
-            if previous is None or (-candidate.energy, candidate.cost, candidate.grid_energy) < (-previous.energy, previous.cost, previous.grid_energy):
+            if (previous is None or candidate.energy > previous.energy
+                    or (candidate.energy == previous.energy and _prefer_economic_node(candidate, previous))):
                 following[key] = candidate
 
         for node in states.values():
@@ -407,7 +428,10 @@ def build_battery_grid_plan(
             # fabricated profitable schedule or make valid input unsafe.
             return BatteryGridPlan(_slots(baseline), 0.0, 0.0, "no_economic_benefit", soc)
 
-    best = min(states.values(), key=lambda node: (node.cost, node.grid_energy))
+    best = next(iter(states.values()))
+    for candidate in states.values():
+        if _prefer_economic_node(candidate, best):
+            best = candidate
     savings = baseline.cost - best.cost
     if savings <= 1e-6:
         return BatteryGridPlan(_slots(baseline), 0.0, 0.0, "no_economic_benefit", soc)

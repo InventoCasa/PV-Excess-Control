@@ -59,8 +59,11 @@ A sunny forecast may therefore result in little or no overnight charging. The
 solar target time is not a requirement to buy enough grid energy to fill the
 battery; grid purchases follow expected demand and economical time windows.
 
-A bounded numerical search produces an approximate schedule. Forecasts and
-household demand remain estimates; projected savings are not measured savings.
+A bounded numerical search produces an approximate schedule. When cost and
+total purchased energy are otherwise equal, it prefers earlier useful charging
+to avoid arbitrary shifts between equally priced windows. Lower prices and
+solar headroom retain their priority. Forecasts and household demand remain
+estimates; projected savings are not measured savings.
 
 ### Calibrating the PV forecast
 
