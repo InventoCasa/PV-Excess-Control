@@ -27,6 +27,14 @@ _LOGGER = logging.getLogger(__name__)
 # while retaining full precision in the live sensor. Permit half that step.
 _FOUR_DECIMAL_PRICE_TOLERANCE = .00005 + 1e-12
 
+# Announcements describe sustained measured flow, independently of commands.
+_GRID_NOTICE_START_W = 100.
+_GRID_NOTICE_STOP_W = 50.
+_GRID_NOTICE_START_SECONDS = 30
+_GRID_NOTICE_STOP_SECONDS = 60
+_GRID_NOTICE_MAX_AGE_SECONDS = 60
+_GRID_NOTICE_DELIVERY_TIMEOUT_SECONDS = 2
+
 
 def _finite(value):
     try:
@@ -60,6 +68,9 @@ class BatteryControlMixin:
         self._battery_plan_key = None
         self._battery_plan_created = None
         self._battery_charge_power = None
+        self._battery_grid_notice_active = False
+        self._battery_grid_notice_since = None
+        self._battery_grid_notice_last_observed = None
         self._battery_slot_target = None
         self._battery_control_state = "idle"
         self._battery_control_reason = "automation_disabled"
@@ -234,7 +245,7 @@ class BatteryControlMixin:
         """Try every owned release; retain ownership until confirmed."""
         self._cancel_battery_watchdog()
         ok = True
-        was_engaged = self._grid_charge_engaged
+        self._battery_grid_notice_since = None
         had_charge = self._grid_charge_cleanup_pending or self._grid_charge_engaged
         had_hold = self._battery_hold_cleanup_pending
         if had_charge:
@@ -286,17 +297,123 @@ class BatteryControlMixin:
             self._battery_watchdog = self.hass.loop.call_later(
                 30, lambda: self.hass.async_create_task(self.async_stop_battery_controls(reason)),
             )
-        if ok and was_engaged:
-            await self._notify_grid_charge("disengaged", reason)
+        if ok:
+            await self._finish_grid_charge_notification(reason)
         return ok
 
     async def _notify_grid_charge(self, event, value):
         method = getattr(getattr(self, "notifications", None), f"notify_battery_grid_charge_{event}", None)
         if method is not None:
             try:
-                await method(value)
+                # Delivery failure must not hold the battery safety lock open.
+                async with asyncio.timeout(_GRID_NOTICE_DELIVERY_TIMEOUT_SECONDS):
+                    return bool(await method(value))
             except Exception:
                 _LOGGER.exception("Battery charging notification failed")
+        return False
+
+    def _measured_battery_grid_flow(self):
+        """Return grid contribution, charge timestamp and latest evidence time.
+
+        Export-only grid import is a placeholder, so use fresh PV/load/battery
+        balance when no signed meter is configured. A directional charging
+        sensor is sufficient: its complementary zero-discharge template may
+        legitimately remain unchanged for hours.
+        """
+        d = self.config_entry.data
+        max_age = d.get("battery_input_max_age_seconds", 300)
+        stamps = []
+
+        def read(key):
+            entity_id = d.get(key)
+            value = self._battery_read_number(entity_id, power=True, max_age=max_age)
+            if value is not None:
+                state = self.hass.states.get(entity_id)
+                stamps.append(getattr(state, "last_reported", None) or state.last_updated)
+            return value
+
+        grid = read("import_export_power") if d.get("import_export_power") else None
+        export = read("grid_export") if not d.get("import_export_power") else None
+        if d.get("import_export_power") and grid is None:
+            return None  # Never silently change topology after a meter outage.
+        no_import = ((grid is not None and grid >= 0)
+                     or (export is not None and export > _GRID_NOTICE_STOP_W))
+        if no_import:
+            # Fresh zero import/export proves no grid charging independently of
+            # the battery channel. Other fresh readings may confirm persistence.
+            read("battery_power" if d.get("battery_power") else "battery_charge_power")
+            read("pv_power")
+            read("load_power")
+            return 0., None, max(stamps)
+
+        battery = read("battery_power" if d.get("battery_power") else "battery_charge_power")
+        if battery is None or (not d.get("battery_power") and battery < 0):
+            return None
+        charge_stamp = stamps[-1]
+        if battery <= 0:
+            read("pv_power")
+            read("load_power")
+            return 0., charge_stamp, max(stamps)
+        # Positive starts need a recent primary charge sample. Stable zero
+        # templates and balance inputs retain the configured freshness limit,
+        # so controller jitter cannot expire a zero before the stop debounce.
+        if (dt_util.utcnow() - charge_stamp).total_seconds() > min(max_age, _GRID_NOTICE_MAX_AGE_SECONDS):
+            return None
+        if not d.get("battery_power"):
+            # Simultaneously positive directions are conflicting telemetry.
+            # Missing/stale complementary values do not override fresh charge.
+            discharge = self._battery_read_number(d.get("battery_discharge_power"), power=True, max_age=max_age)
+            if discharge is not None and discharge > _GRID_NOTICE_STOP_W:
+                return None
+        if grid is not None:
+            contribution = min(battery, -grid)
+        else:
+            pv, load = read("pv_power"), read("load_power")
+            if pv is None or load is None or pv < 0 or load < 0:
+                return None
+            contribution = min(battery, max(0., load + battery - pv))
+        return contribution, charge_stamp, max(stamps)
+
+    async def _finish_grid_charge_notification(self, reason):
+        """Close only a successfully announced measured charging episode."""
+        self._battery_grid_notice_since = None
+        if self._battery_grid_notice_active:
+            await self._notify_grid_charge("disengaged", reason)
+            self._battery_grid_notice_active = False
+
+    async def _observe_grid_charge_notification(self):
+        """Debounce measured flow without affecting inverter control decisions."""
+        now = dt_util.utcnow()
+        previous = self._battery_grid_notice_last_observed
+        self._battery_grid_notice_last_observed = now
+        if previous is not None and not 0 <= (now - previous).total_seconds() <= 90:
+            self._battery_grid_notice_since = None
+        flow = self._measured_battery_grid_flow()
+        if not self._grid_charge_engaged or flow is None:
+            self._battery_grid_notice_since = None
+            return
+        power, charge_stamp, latest_stamp = flow
+        active = self._battery_grid_notice_active
+        stamp = latest_stamp if active else charge_stamp
+        qualifies = power <= _GRID_NOTICE_STOP_W if active else power > _GRID_NOTICE_START_W
+        if not qualifies:
+            self._battery_grid_notice_since = None
+            return
+        since = self._battery_grid_notice_since
+        if since is None or stamp < since[1] or now < since[0]:
+            self._battery_grid_notice_since = now, stamp
+            return
+        duration = _GRID_NOTICE_STOP_SECONDS if active else _GRID_NOTICE_START_SECONDS
+        # Starts require advancing primary charge samples as well as elapsed
+        # observation time. Stops can use fresh grid/balance evidence even when
+        # a directional zero-charge template itself stays unchanged.
+        if min((now - since[0]).total_seconds(), (stamp - since[1]).total_seconds()) < duration:
+            return
+        if active:
+            await self._finish_grid_charge_notification("measured_grid_charging_ended")
+        else:
+            self._battery_grid_notice_active = await self._notify_grid_charge("engaged", power)
+            self._battery_grid_notice_since = None
 
     async def async_stop_battery_controls(self, reason="disabled"):
         self._init_battery_control()
@@ -431,7 +548,6 @@ class BatteryControlMixin:
                 if self._battery_hold_cleanup_pending and not await self._release_battery_locked("leave_hold"):
                     return
                 try:
-                    was_engaged = self._grid_charge_engaged
                     if self._grid_charge_engaged and self._battery_charge_power == requested_power:
                         await self._inverter_ctl.verify_engaged(requested_power)
                     else:
@@ -477,8 +593,7 @@ class BatteryControlMixin:
                     self._battery_control_state = "charging"
                     self._battery_control_reason = "manual" if manual else "economic_plan"
                     self._arm_battery_watchdog(slot.end if slot else None)
-                    if not was_engaged:
-                        await self._notify_grid_charge("engaged", requested_power)
+                    await self._observe_grid_charge_notification()
                 except asyncio.CancelledError:
                     self._battery_recovery = True
                     self._arm_battery_watchdog(dt_util.utcnow())
@@ -1049,9 +1164,11 @@ class BatteryControlMixin:
     def battery_control_diagnostics(self):
         self._init_battery_control()
         plan = self._battery_grid_plan
+        measured_flow = self._measured_battery_grid_flow()
         return {
             "battery_control_state": self._battery_control_state,
             "battery_control_reason": self._battery_control_reason,
+            "battery_grid_charge_observed_power_w": round(measured_flow[0], 1) if measured_flow else None,
             "battery_charge_cleanup_pending": self._grid_charge_cleanup_pending,
             "battery_hold_cleanup_pending": self._battery_hold_cleanup_pending,
             "battery_hold_supported": bool(self._battery_hold_ctl and self._battery_hold_ctl.confirmation_level == "physical"),

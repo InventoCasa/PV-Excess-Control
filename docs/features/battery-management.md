@@ -224,6 +224,24 @@ retain their existing safety precedence. The inverter's native reserve is an
 independent hardware setting; configuring a planning reserve does not change it.
 Set the planning reserve consistently with the native reserve.
 
+## Grid-charge notifications
+
+Start messages require an owned charging command and sustained evidence of an
+actual grid contribution to battery charging. The displayed power is the grid
+contribution estimated from current readings. A configured signed grid meter
+supplies import evidence; export-only installations use household, PV and battery
+power balance, with fresh export evidence excluding grid charging. Unknown or
+stale required inputs cannot confirm a start. The primary positive charging
+reading must be at most 60 seconds old; other required readings follow the
+configured battery-input freshness limit.
+
+A start requires more than 100 W for at least 30 seconds. Once announced, a grid
+contribution of at most 50 W for 60 seconds ends the episode. A confirmed release
+of owned charging can close the episode immediately. These observation rules
+filter short fluctuations without changing inverter control or the charging plan.
+A stop is sent only for an announced start; its delivery is not suppressed by the
+start-message rate limit. Notification failures do not change battery control.
+
 ## Status and troubleshooting
 
 The integration's status sensor includes:
@@ -231,6 +249,7 @@ The integration's status sensor includes:
 | Attribute | Meaning |
 |---|---|
 | `battery_control_state`, `battery_control_reason` | Current action or reason control is blocked/releasing |
+| `battery_grid_charge_observed_power_w` | Current grid contribution estimated from fresh power readings; `null` when evidence is unavailable |
 | `battery_confirmation` | Physical, helper-only or unconfigured acknowledgement |
 | `battery_charge_cleanup_pending`, `battery_hold_cleanup_pending` | Release still needs confirmation |
 | `battery_hold_supported` | Verified hold mapping with physical acknowledgement is available |

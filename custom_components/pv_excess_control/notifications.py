@@ -26,21 +26,26 @@ class NotificationManager:
         self.service = notification_service  # e.g., "notify.mobile_app_phone"
         self._last_sent: dict[str, datetime] = {}
         self._rate_limit_seconds = 300  # 5 minutes
+        self._battery_grid_charge_notified = False
 
     async def async_notify(
         self,
         event_type: str,
         message: str,
         title: str = "PV Excess Control",
+        *,
+        bypass_rate_limit: bool = False,
+        blocking: bool = False,
     ) -> bool:
         """Send notification if event is enabled and not rate-limited."""
         if not self.settings.get(event_type, False):
             return False
-        if self._is_rate_limited(event_type):
+        if not bypass_rate_limit and self._is_rate_limited(event_type):
             return False
 
         # Set BEFORE the call to avoid TOCTOU race
-        self._last_sent[event_type] = datetime.now()
+        if not bypass_rate_limit:
+            self._last_sent[event_type] = datetime.now()
 
         if self.service:
             if "." not in self.service:
@@ -51,6 +56,7 @@ class NotificationManager:
                 domain,
                 service_name,
                 {"message": message, "title": title},
+                **({"blocking": True} if blocking else {}),
             )
         else:
             await self.hass.services.async_call(
@@ -61,6 +67,7 @@ class NotificationManager:
                     "title": title,
                     "notification_id": f"pv_excess_{event_type}",
                 },
+                **({"blocking": True} if blocking else {}),
             )
 
         return True
@@ -106,18 +113,31 @@ class NotificationManager:
         )
 
     async def notify_battery_grid_charge_engaged(self, power_w: float) -> bool:
-        """Send notification when the integration commands the inverter to grid-charge."""
-        return await self.async_notify(
+        """Announce qualified measured grid flow, remembering successful delivery."""
+        if self._battery_grid_charge_notified:
+            return False
+        sent = await self.async_notify(
             NotificationEvent.FORCE_CHARGE,
-            f"Battery grid charge started: {power_w:.0f}W",
+            f"Battery grid charge started: about {power_w:.0f}W grid contribution",
+            blocking=True,
         )
+        self._battery_grid_charge_notified = sent
+        return sent
 
     async def notify_battery_grid_charge_disengaged(self, reason: str) -> bool:
-        """Send notification when the integration releases the inverter from grid-charge."""
-        return await self.async_notify(
+        """Close an announced episode even within the start rate-limit window."""
+        if not self._battery_grid_charge_notified:
+            return False
+        # Consume the pair even if this attempt fails; a delivery error must
+        # never leave later charging episodes permanently suppressed.
+        self._battery_grid_charge_notified = False
+        sent = await self.async_notify(
             NotificationEvent.FORCE_CHARGE,
-            f"Battery grid charge stopped: {reason}",
+            "Battery grid charge stopped",
+            bypass_rate_limit=True,
+            blocking=True,
         )
+        return sent
 
     async def notify_sensor_unavailable(self, sensor_name: str) -> bool:
         """Send notification that a required sensor is unavailable."""
