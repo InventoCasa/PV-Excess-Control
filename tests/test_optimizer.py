@@ -3431,6 +3431,7 @@ class TestHelperOnlyMode:
         assert helper_dec.action == Action.ON
         assert "helper-only" in helper_dec.reason.lower() or "dependent is running" in helper_dec.reason.lower()
 
+    @pytest.mark.freeze_time("2026-03-22 12:00:00+00:00")
     def test_helper_safety_only_path_dependent_safety_off(self):
         """Safety-only path: helper currently ON, dependent has time window
         forcing OFF -> helper sees dependent OFF in decisions -> helper OFF."""
@@ -3615,6 +3616,7 @@ class TestHelperOnlyMode:
         state_by_id = {"dep": _make_state(id="dep", is_on=True)}
         assert optimizer._has_running_dependent("helper", decisions, state_by_id) is False
 
+    @pytest.mark.freeze_time("2026-03-22 12:00:00+00:00")
     def test_helper_off_when_dependent_forced_off_by_safety_rule(self):
         """Dep safety rule forces OFF → helper mirrors OFF (OFF is authoritative)."""
         from datetime import time as dtime
@@ -4780,4 +4782,3 @@ class TestPhase4CheapTariffDischargeBlock:
         # SoC-protection sheds → decision was replaced with Action.OFF.
         assert decisions[0].action == Action.OFF
         assert "Battery SoC protection" in decisions[0].reason
-

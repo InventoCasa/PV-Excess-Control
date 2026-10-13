@@ -213,6 +213,41 @@ Configure hold/release command values and feedback, with separate expected
 feedback values when the inverter reports different text from the command.
 Helper controls require a distinct physical feedback entity.
 
+Numeric `number` and `input_number` controls are also supported. Enter command
+values in the control entity's native units and, when needed, separate numeric
+feedback values in the feedback entity's units. For example, a kW control and a
+W sensor need explicit corresponding values. Numeric feedback must match the
+setpoint closely; the wider charging-power tolerance cannot confirm a hold.
+Invalid, non-finite, negative or identical engage/release values are rejected.
+
+For a numeric helper whose device writer listens only to state changes, configure
+an optional **hold command bridge automation**. If a previous write was not
+physically confirmed and the helper already shows the desired value, the
+controller can explicitly trigger that automation again. It respects the
+configured automation conditions and never pulses a different setpoint to force
+an event. Select only the existing automation that writes this helper's current
+value to the inverter. This mapping is retained with cleanup ownership so retries
+still work after reload or options changes.
+
+
+Some Sungrow installations can stop battery discharge using a **10 W** maximum
+discharge setpoint while retaining self-consumption mode; the
+[mkaiser configuration](https://github.com/mkaiser/Sungrow-SHx-Inverter-Modbus-Home-Assistant/blob/310635c6e2c1122f5adb54fba7fdf33a7cb85142/modbus_sungrow.yaml#L2364-L2368)
+provides such a scene. This does not establish that a zero register value is
+supported. Check the protocol, installed helper limits and measured battery
+power/current on the actual inverter. Confirm normal supply resumes after
+release and that PV charging remains available. Changing a helper's minimum
+alone is not proof of a working hold.
+
+When the hold uses the same numeric discharge channel as appliance protection,
+a single serialized writer combines both requests. Holding retains priority;
+normal release applies the current consumer limit directly instead of briefly
+restoring unrestricted discharge. Every owned restriction on that channel has a
+persisted release mapping, including consumer restrictions. Disabling control,
+unloading or recovering after restart restores the recorded fallback; an
+unconfirmed release stays pending and is retried.
+
+
 Verify both that the command prevents discharge and that release restores
 self-consumption before opting in. A maximum discharge setting with a minimum
 of **100 W does not provide a complete hold**. A control name such as “Stop”
@@ -265,7 +300,7 @@ The integration's status sensor includes:
 | `battery_control_state`, `battery_control_reason` | Current action or reason control is blocked/releasing |
 | `battery_grid_charge_observed_power_w` | Current grid contribution estimated from fresh power readings; `null` when evidence is unavailable |
 | `battery_confirmation` | Physical, helper-only or unconfigured acknowledgement |
-| `battery_charge_cleanup_pending`, `battery_hold_cleanup_pending` | Release still needs confirmation |
+| `battery_charge_cleanup_pending`, `battery_hold_cleanup_pending`, `battery_discharge_cleanup_pending` | Release still needs confirmation |
 | `battery_hold_supported` | Verified hold mapping with physical acknowledgement is available |
 | `battery_load_profile_ready` | All required hourly household demand values are available |
 | `battery_grid_energy_kwh`, `battery_grid_target_soc` | Planned purchased energy and computed grid target |

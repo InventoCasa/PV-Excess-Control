@@ -13,7 +13,7 @@ import os
 from homeassistant.core import HomeAssistant, valid_entity_id
 from homeassistant.helpers.storage import Store
 
-from .inverter_control import SUPPORTED_ENABLE_DOMAINS, SUPPORTED_POWER_DOMAINS
+from .inverter_control import SUPPORTED_ENABLE_DOMAINS, SUPPORTED_POWER_DOMAINS, _validate_numeric_mapping
 from .models import InverterGridChargeConfig
 
 
@@ -78,6 +78,19 @@ def _decode_config(raw: object) -> InverterGridChargeConfig | None:
                 raise ValueError("Battery ownership binary commands must select opposite states")
     if config.power_entity_id and config.power_entity_id.split(".", 1)[0] not in SUPPORTED_POWER_DOMAINS:
         raise ValueError("Unsupported battery ownership power entity")
+    _validate_numeric_mapping(config)
+    return config
+
+
+def _decode_discharge_config(raw: object) -> InverterGridChargeConfig | None:
+    config = _decode_config(raw)
+    feedback = (config.enable_feedback_entity_id or config.enable_entity_id) if config else None
+    if config is not None and (
+        config.enable_entity_id.split(".", 1)[0] not in SUPPORTED_POWER_DOMAINS
+        or config.mode_entity_id is not None or config.power_entity_id is not None
+        or feedback.split(".", 1)[0] in {"input_number", "input_select", "input_boolean"}
+    ):
+        raise ValueError("Invalid shared discharge ownership mapping")
     return config
 
 
@@ -89,6 +102,18 @@ class BatteryOwnershipJournal:
         self._key = f"pv_excess_control.{entry_id}.battery_ownership"
         self._store = Store(hass, 1, self._key)
         self._loaded_record_exists = False
+        self._discharge_config: InverterGridChargeConfig | None = None
+        self._discharge_mapping: InverterGridChargeConfig | None = None
+
+    @property
+    def discharge_config(self) -> InverterGridChargeConfig | None:
+        """Return the optional shared discharge owner from the last load."""
+        return self._discharge_config
+
+    @property
+    def discharge_mapping(self) -> InverterGridChargeConfig | None:
+        """Keep an established consumer-cap actuator independent of hold options."""
+        return self._discharge_mapping
 
     @property
     def loaded_record_exists(self) -> bool:
@@ -98,15 +123,20 @@ class BatteryOwnershipJournal:
     async def async_load(self) -> tuple[InverterGridChargeConfig | None, InverterGridChargeConfig | None]:
         """Restore original mappings, failing closed for an unreadable record."""
         self._loaded_record_exists = False
+        self._discharge_config = None
+        self._discharge_mapping = None
         existed = await self._hass.async_add_executor_job(_validate_existing_json, self._store.path)
         saved = await self._store.async_load()
         if saved is None:
             if existed:
                 raise ValueError("Battery ownership journal is unreadable")
             return None, None
-        if not isinstance(saved, dict) or set(saved) != {"charge", "hold"}:
+        if (not isinstance(saved, dict) or not {"charge", "hold"} <= set(saved)
+                or set(saved) - {"charge", "hold", "discharge", "discharge_mapping"}):
             raise ValueError("Invalid battery ownership journal structure")
         restored = _decode_config(saved["charge"]), _decode_config(saved["hold"])
+        self._discharge_config = _decode_discharge_config(saved.get("discharge"))
+        self._discharge_mapping = _decode_discharge_config(saved.get("discharge_mapping"))
         self._loaded_record_exists = True
         return restored
 
@@ -114,6 +144,9 @@ class BatteryOwnershipJournal:
         self,
         charge_config: InverterGridChargeConfig | None,
         hold_config: InverterGridChargeConfig | None,
+        *,
+        discharge_config: InverterGridChargeConfig | None = None,
+        discharge_mapping: InverterGridChargeConfig | None = None,
     ) -> None:
         """Await storage and confirm persistence before allowing hardware writes.
 
@@ -128,6 +161,12 @@ class BatteryOwnershipJournal:
             raw = asdict(config) if config is not None else None
             _decode_config(raw)
             payload[name] = raw
+        for key, mapping in (("discharge", discharge_config), ("discharge_mapping", discharge_mapping)):
+            if mapping is not None:
+                if not isinstance(mapping, InverterGridChargeConfig):
+                    raise ValueError("Invalid shared discharge ownership configuration")
+                payload[key] = asdict(mapping)
+                _decode_discharge_config(payload[key])
         await self._store.async_save(payload)
         readback = Store(self._hass, 1, self._key)
         await self._hass.async_add_executor_job(_validate_existing_json, readback.path)

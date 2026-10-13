@@ -20,7 +20,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import callback
+from homeassistant.core import callback, valid_entity_id
 from homeassistant.helpers.selector import (
     BooleanSelector,
     EntitySelector,
@@ -66,6 +66,7 @@ from .const import (
     CONF_BATTERY_HOLD_FEEDBACK_ENTITY,
     CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE,
     CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE,
+    CONF_BATTERY_HOLD_REASSERT_ENTITY,
     CONF_BATTERY_HOLD_VERIFIED,
     CONF_ACTUAL_POWER_ENTITY,
     CONF_ALLOW_GRID_CHARGING,
@@ -727,6 +728,7 @@ _BATTERY_PLANNING_OPTIONAL_KEYS = (
     CONF_BATTERY_HOLD_RELEASE_VALUE,
     CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE,
     CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE,
+    CONF_BATTERY_HOLD_REASSERT_ENTITY,
 )
 
 
@@ -753,8 +755,11 @@ def _battery_planning_schema(defaults: dict[str, Any]) -> dict:
     fields[vol.Optional(CONF_BATTERY_HOLD_ENTITY, description={
         "suggested_value": defaults.get(CONF_BATTERY_HOLD_ENTITY),
     })] = EntitySelector(EntitySelectorConfig(
-        domain=["select", "switch", "input_select", "input_boolean"],
+        domain=["select", "switch", "input_select", "input_boolean", "number", "input_number"],
     ))
+    fields[vol.Optional(CONF_BATTERY_HOLD_REASSERT_ENTITY, description={
+        "suggested_value": defaults.get(CONF_BATTERY_HOLD_REASSERT_ENTITY),
+    })] = EntitySelector(EntitySelectorConfig(domain=["automation"]))
     for key in (CONF_BATTERY_HOLD_ENGAGE_VALUE, CONF_BATTERY_HOLD_RELEASE_VALUE,
                 CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE, CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE):
         fields[vol.Optional(key, description={"suggested_value": defaults.get(key)})] = TextSelector()
@@ -1004,17 +1009,68 @@ def _validate_battery_section(data: dict) -> None:
             raise vol.Invalid("battery_load_profile_w requires 24 finite nonnegative hourly watts", path=[CONF_BATTERY_LOAD_PROFILE_W])
         data[CONF_BATTERY_LOAD_PROFILE_W] = [float(v) for v in profile]
 
-    if data.get(CONF_BATTERY_HOLD_VERIFIED):
+    hold_entity = data.get(CONF_BATTERY_HOLD_ENTITY, "")
+    numeric_hold = str(hold_entity).split(".", 1)[0] in {"number", "input_number"}
+    reassert_entity = data.get(CONF_BATTERY_HOLD_REASSERT_ENTITY)
+    if reassert_entity is not None:
+        if (not isinstance(reassert_entity, str) or not valid_entity_id(reassert_entity)
+                or reassert_entity.split(".", 1)[0] != "automation" or not numeric_hold):
+            raise vol.Invalid("battery_hold reassertion requires an automation and numeric command", path=[CONF_BATTERY_HOLD_REASSERT_ENTITY])
+        feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_ENTITY)
+        if not isinstance(feedback, str) or not valid_entity_id(feedback) or feedback == hold_entity:
+            raise vol.Invalid("battery_hold reassertion requires separate physical feedback", path=[CONF_BATTERY_HOLD_FEEDBACK_ENTITY])
+        _validate_physical_feedback(data, CONF_BATTERY_HOLD_ENTITY, CONF_BATTERY_HOLD_FEEDBACK_ENTITY)
+
+    shared_numeric_hold = numeric_hold and hold_entity == data.get(CONF_BATTERY_MAX_DISCHARGE_ENTITY)
+    if data.get(CONF_BATTERY_HOLD_VERIFIED) or shared_numeric_hold:
         for key in (CONF_BATTERY_HOLD_ENTITY, CONF_BATTERY_HOLD_ENGAGE_VALUE, CONF_BATTERY_HOLD_RELEASE_VALUE):
-            if not data.get(key) or not str(data[key]).strip():
-                raise vol.Invalid(f"{key} is required for verified battery_hold", path=[key])
-        if data[CONF_BATTERY_HOLD_ENGAGE_VALUE] == data[CONF_BATTERY_HOLD_RELEASE_VALUE]:
+            value = data.get(key)
+            if value is None or not str(value).strip() or (not numeric_hold and not value):
+                raise vol.Invalid(f"{key} is required for verified or shared numeric battery_hold", path=[key])
+        engage = data[CONF_BATTERY_HOLD_ENGAGE_VALUE]
+        release = data[CONF_BATTERY_HOLD_RELEASE_VALUE]
+        engage_feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE)
+        release_feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE)
+        if numeric_hold:
+            # Compare numeric meanings, without converting the entity's units
+            # or changing the user's stored command/readback values.
+            engage = _numeric_battery_hold_value(engage, CONF_BATTERY_HOLD_ENGAGE_VALUE)
+            release = _numeric_battery_hold_value(release, CONF_BATTERY_HOLD_RELEASE_VALUE)
+            engage_feedback = _numeric_battery_hold_value(
+                engage if engage_feedback is None else engage_feedback,
+                CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE,
+            )
+            release_feedback = _numeric_battery_hold_value(
+                release if release_feedback is None else release_feedback,
+                CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE,
+            )
+        else:
+            engage_feedback = engage_feedback or engage
+            release_feedback = release_feedback or release
+        if engage == release:
             raise vol.Invalid("battery_hold engage and release values must differ", path=[CONF_BATTERY_HOLD_ENGAGE_VALUE])
-        engage_feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE) or data[CONF_BATTERY_HOLD_ENGAGE_VALUE]
-        release_feedback = data.get(CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE) or data[CONF_BATTERY_HOLD_RELEASE_VALUE]
         if engage_feedback == release_feedback:
             raise vol.Invalid("battery_hold feedback engage and release values must differ", path=[CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE])
         _validate_physical_feedback(data, CONF_BATTERY_HOLD_ENTITY, CONF_BATTERY_HOLD_FEEDBACK_ENTITY)
+        if numeric_hold:
+            # The UI and durable ownership mapping use text for command states.
+            for key in (CONF_BATTERY_HOLD_ENGAGE_VALUE, CONF_BATTERY_HOLD_RELEASE_VALUE,
+                        CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE, CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE):
+                if data.get(key) is not None and not isinstance(data[key], str):
+                    data[key] = str(data[key])
+
+
+def _numeric_battery_hold_value(value: Any, key: str) -> float:
+    """Require a finite nonnegative setpoint in command/readback units."""
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError("not a number")
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("not finite and nonnegative")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise vol.Invalid(f"{key} must be a finite nonnegative number in its entity's native units", path=[key]) from exc
+    return number
 
 
 def _validate_physical_feedback(data: dict, entity_key: str, feedback_key: str) -> None:

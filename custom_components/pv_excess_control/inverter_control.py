@@ -1,7 +1,7 @@
 """Generic inverter forced grid-charge controller with bounded readback checks.
 
 Engage order: mode → power → command. Release always attempts both command
-and mode, even if one fails. Number setpoints remain unchanged on release.
+and mode, even if one fails. Charging-power setpoints remain unchanged on release.
 Helpers confirm only their own state unless separate physical readback entities
 are configured; diagnostics distinguish these levels of confirmation.
 """
@@ -11,17 +11,57 @@ import asyncio
 import logging
 import math
 
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, valid_entity_id
 
 from .models import InverterGridChargeConfig
 
 _LOGGER = logging.getLogger(__name__)
 
-SUPPORTED_ENABLE_DOMAINS = frozenset({"input_select", "select", "switch", "input_boolean"})
+SUPPORTED_ENABLE_DOMAINS = frozenset({"input_select", "select", "switch", "input_boolean", "number", "input_number"})
 SUPPORTED_POWER_DOMAINS = frozenset({"input_number", "number"})
 _HELPER_DOMAINS = frozenset({"input_select", "input_number", "input_boolean"})
 _TRUTHY_STRINGS = frozenset({"on", "true", "1", "yes"})
 _UNAVAILABLE = frozenset({"unknown", "unavailable", "none", ""})
+
+
+def _numeric_value(value: object) -> float:
+    """Parse a nonnegative native-unit command, never a truthy string."""
+    if isinstance(value, bool):
+        raise ValueError("Invalid numeric inverter command")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid numeric inverter command") from error
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("Invalid numeric inverter command")
+    return number
+
+
+def _validate_numeric_mapping(config: InverterGridChargeConfig) -> None:
+    """Validate numeric mappings independently of live HA state and storage."""
+    if config.enable_reassert_entity_id is not None:
+        bridge = config.enable_reassert_entity_id
+        feedback = config.enable_feedback_entity_id
+        if (not isinstance(bridge, str) or not valid_entity_id(bridge)
+                or bridge.split(".", 1)[0] != "automation"
+                or config.enable_entity_id.split(".", 1)[0] not in SUPPORTED_POWER_DOMAINS
+                or not feedback or feedback == config.enable_entity_id
+                or feedback.split(".", 1)[0] in _HELPER_DOMAINS):
+            raise ValueError("Numeric bridge reassertion needs an automation and separate physical feedback")
+    for entity, engage, release in (
+        (config.enable_entity_id, config.enable_engage_value, config.enable_disengage_value),
+        (config.mode_entity_id, config.mode_engage_value, config.mode_disengage_value),
+    ):
+        if entity and entity.split(".", 1)[0] in SUPPORTED_POWER_DOMAINS:
+            if _numeric_value(engage) == _numeric_value(release):
+                raise ValueError("Numeric inverter commands must differ")
+    if config.enable_entity_id.split(".", 1)[0] in SUPPORTED_POWER_DOMAINS:
+        engage = config.enable_feedback_engage_value
+        release = config.enable_feedback_disengage_value
+        engage = config.enable_engage_value if engage is None else engage
+        release = config.enable_disengage_value if release is None else release
+        if _numeric_value(engage) == _numeric_value(release):
+            raise ValueError("Numeric inverter feedback values must differ")
 
 
 class InverterConfirmationError(RuntimeError):
@@ -35,6 +75,7 @@ class InverterGridChargeController:
         self._hass = hass
         self._config = config
         self._validate_domains()
+        _validate_numeric_mapping(config)
         if not math.isfinite(config.timeout_seconds) or config.timeout_seconds <= 0:
             raise ValueError("Inverter confirmation timeout must be finite and positive")
         if not math.isfinite(config.power_tolerance_w) or config.power_tolerance_w < 0:
@@ -87,6 +128,13 @@ class InverterGridChargeController:
         config = self._config
         # Validate the complete power request before changing inverter mode.
         power_value = self._power_value(power_w)
+        for entity, engage, release in (
+            (config.enable_entity_id, config.enable_engage_value, config.enable_disengage_value),
+            (config.mode_entity_id, config.mode_engage_value, config.mode_disengage_value),
+        ):
+            if entity and self._domain(entity) in SUPPORTED_POWER_DOMAINS:
+                self._validate_numeric_setpoint(entity, engage)
+                self._validate_numeric_setpoint(entity, release)
         try:
             if config.mode_entity_id is not None:
                 await self._write(config.mode_entity_id, config.mode_engage_value)
@@ -196,6 +244,15 @@ class InverterGridChargeController:
             except (TypeError, ValueError):
                 return False
             return math.isfinite(actual_w) and abs(actual_w - float(value)) <= self._config.power_tolerance_w
+        if self._domain(command) in SUPPORTED_POWER_DOMAINS:
+            # A numeric hold setpoint must not inherit the much wider measured
+            # charging-power tolerance. Overrides are in the feedback's native
+            # unit; no implicit W/kW conversion is safe for generic commands.
+            try:
+                actual, expected = _numeric_value(state.state), _numeric_value(value)
+            except ValueError:
+                return False
+            return math.isclose(actual, expected, rel_tol=0., abs_tol=1e-6)
         expected = str(value).strip()
         if normalize_switch and self._domain(command) in {"switch", "input_boolean"}:
             expected = "on" if expected.lower() in _TRUTHY_STRINGS else "off"
@@ -230,14 +287,47 @@ class InverterGridChargeController:
             return 1000.0
         raise ValueError(f"Unsupported inverter power unit: {unit}")
 
+    def _validate_numeric_setpoint(self, entity_id: str, value: object) -> float:
+        """Reject unavailable, out-of-range or unrepresentable commands."""
+        number = _numeric_value(value)
+        state = self._hass.states.get(entity_id)
+        if not isinstance(state, State) or state.state.strip().lower() in _UNAVAILABLE:
+            raise ValueError("Numeric inverter control is unavailable")
+        minimum = state.attributes.get("min")
+        maximum = state.attributes.get("max")
+        step = state.attributes.get("step")
+        if minimum is not None:
+            minimum = _numeric_value(minimum)
+            if number < minimum:
+                raise ValueError("Numeric inverter command below minimum")
+        if maximum is not None:
+            maximum = _numeric_value(maximum)
+            if number > maximum or (minimum is not None and minimum > maximum):
+                raise ValueError("Numeric inverter command above maximum")
+        if step is not None:
+            step = _numeric_value(step)
+            if step <= 0:
+                raise ValueError("Invalid numeric inverter step")
+            steps = (number - (minimum or 0.)) / step
+            if not math.isfinite(steps) or not math.isclose(steps, round(steps), rel_tol=0., abs_tol=1e-6):
+                raise ValueError("Numeric inverter command outside step lattice")
+        return number
+
     async def _write(self, entity_id: str, value: object) -> None:
         domain = self._domain(entity_id)
+        bridge = self._config.enable_reassert_entity_id if entity_id == self._config.enable_entity_id else None
+        unchanged_numeric = bool(bridge and self._matches(entity_id, entity_id, value, False))
         if domain in {"input_select", "select"}:
             service = "select_option"
             data = {"entity_id": entity_id, "option": str(value)}
         elif domain in {"input_number", "number"}:
             service = "set_value"
-            data = {"entity_id": entity_id, "value": float(value)}
+            # Existing power-channel requests have their own watt conversion;
+            # strict numeric command validation applies to enable/mode maps.
+            number = (self._validate_numeric_setpoint(entity_id, value)
+                      if entity_id in {self._config.enable_entity_id, self._config.mode_entity_id}
+                      else float(value))
+            data = {"entity_id": entity_id, "value": number}
         elif domain in {"switch", "input_boolean"}:
             service = "turn_on" if str(value).strip().lower() in _TRUTHY_STRINGS else "turn_off"
             data = {"entity_id": entity_id}
@@ -245,6 +335,27 @@ class InverterGridChargeController:
             raise ValueError(f"Unsupported entity domain for inverter grid charge: {domain}")
         async with asyncio.timeout(self._config.timeout_seconds):
             await self._hass.services.async_call(domain, service, data, blocking=True)
+            if bridge and unchanged_numeric:
+                # A YAML input_number bridge commonly listens to state_changed.
+                # Repeating an already-matching helper value emits no such event.
+                # Explicitly rerun only its configured bridge when the physical
+                # setpoint still differs, without pulsing any alternate value.
+                config = self._config
+                if _numeric_value(value) == _numeric_value(config.enable_engage_value):
+                    expected = config.enable_feedback_engage_value
+                else:
+                    expected = config.enable_feedback_disengage_value
+                expected = value if expected is None else expected
+                if not self._matches(config.enable_feedback_entity_id, entity_id, expected, False):
+                    if not self._matches(entity_id, entity_id, value, False):
+                        raise InverterConfirmationError("Numeric helper changed before bridge reassertion")
+                    state = self._hass.states.get(bridge)
+                    if not isinstance(state, State) or state.state.strip().lower() in _UNAVAILABLE:
+                        raise ValueError("Numeric command bridge is unavailable")
+                    await self._hass.services.async_call(
+                        "automation", "trigger",
+                        {"entity_id": bridge, "skip_condition": False}, blocking=True,
+                    )
 
     @staticmethod
     def _domain(entity_id: str) -> str:

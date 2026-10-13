@@ -319,6 +319,7 @@ class InverterGridChargeConfig:
     - Single switch / input_boolean (only enable_entity_id; engage/disengage values "on"/"off").
     - Two-step: select-mode + select-command (mode_entity_id + enable_entity_id, no power).
     - Three-step (e.g. Sungrow mkaiser): select-mode + select-command + number-power.
+    - Numeric discharge limit with exact native-unit readback and optional bridge retry.
     """
     enable_entity_id: str
     enable_engage_value: str
@@ -336,3 +337,4 @@ class InverterGridChargeConfig:
     power_tolerance_w: float = 100.0
     enable_feedback_engage_value: str | None = None
     enable_feedback_disengage_value: str | None = None
+    enable_reassert_entity_id: str | None = None

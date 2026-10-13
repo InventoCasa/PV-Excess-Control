@@ -119,7 +119,8 @@
           "battery_hold_feedback_entity": "Discharge hold readback",
           "battery_hold_feedback_engage_value": "Hold readback value (optional)",
           "battery_hold_feedback_release_value": "Release readback value (optional)",
-          "battery_pv_forecast_factor": "PV forecast factor for grid charging"
+          "battery_pv_forecast_factor": "PV forecast factor for grid charging",
+          "battery_hold_reassert_entity": "Command retry automation (optional)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -154,13 +155,14 @@
           "inverter_force_charge_mode_feedback_entity": "Physical inverter readback of forced or self-consumption mode. Required for charging when the mode uses an input helper.",
           "inverter_force_charge_power_feedback_entity": "Physical readback of the inverter power setpoint in watts, not the instantaneous battery flow. Required when charging uses an input_number helper.",
           "battery_hold_verified": "Enable only after verifying that the mapped command truly prevents battery discharge and that release restores self-consumption. A 100 W discharge limit is not a complete hold. Default off.",
-          "battery_hold_entity": "Optional dedicated command for holding energy until expensive hours. Must have separate engage and release values.",
-          "battery_hold_engage_value": "Value that prevents battery discharge, such as on. Only use a physically verified mapping.",
-          "battery_hold_release_value": "Value that restores normal self-consumption, such as off.",
+          "battery_hold_entity": "Optional dedicated switch, select, or numeric command for holding energy until expensive hours. Must have distinct engage and release values. When shared with the consumer discharge limit, the complete mapping is required even while hold is disabled.",
+          "battery_hold_engage_value": "Value that prevents battery discharge, such as on. Numeric commands use a finite nonnegative value in the command entity’s own unit. Only use a physically verified mapping.",
+          "battery_hold_release_value": "Value that restores normal self-consumption, such as off. Numeric commands use the command entity’s own unit.",
           "battery_hold_feedback_entity": "Physical feedback of hold/release. Mandatory and distinct from the command when using an input helper.",
-          "battery_hold_feedback_engage_value": "Expected physical readback while holding. Leave empty to use the hold command value.",
-          "battery_hold_feedback_release_value": "Expected physical readback after release. Leave empty to use the release command value.",
-          "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged."
+          "battery_hold_feedback_engage_value": "Expected physical readback while holding. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
+          "battery_hold_feedback_release_value": "Expected physical readback after release. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
+          "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged.",
+          "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units."
         }
       },
       "settings": {
@@ -580,7 +582,8 @@
           "battery_hold_feedback_entity": "Discharge hold readback",
           "battery_hold_feedback_engage_value": "Hold readback value (optional)",
           "battery_hold_feedback_release_value": "Release readback value (optional)",
-          "battery_pv_forecast_factor": "PV forecast factor for grid charging"
+          "battery_pv_forecast_factor": "PV forecast factor for grid charging",
+          "battery_hold_reassert_entity": "Command retry automation (optional)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -615,13 +618,14 @@
           "inverter_force_charge_mode_feedback_entity": "Physical inverter readback of forced or self-consumption mode. Required for charging when the mode uses an input helper.",
           "inverter_force_charge_power_feedback_entity": "Physical readback of the inverter power setpoint in watts, not the instantaneous battery flow. Required when charging uses an input_number helper.",
           "battery_hold_verified": "Enable only after verifying that the mapped command truly prevents battery discharge and that release restores self-consumption. A 100 W discharge limit is not a complete hold. Default off.",
-          "battery_hold_entity": "Optional dedicated command for holding energy until expensive hours. Must have separate engage and release values.",
-          "battery_hold_engage_value": "Value that prevents battery discharge, such as on. Only use a physically verified mapping.",
-          "battery_hold_release_value": "Value that restores normal self-consumption, such as off.",
+          "battery_hold_entity": "Optional dedicated switch, select, or numeric command for holding energy until expensive hours. Must have distinct engage and release values. When shared with the consumer discharge limit, the complete mapping is required even while hold is disabled.",
+          "battery_hold_engage_value": "Value that prevents battery discharge, such as on. Numeric commands use a finite nonnegative value in the command entity’s own unit. Only use a physically verified mapping.",
+          "battery_hold_release_value": "Value that restores normal self-consumption, such as off. Numeric commands use the command entity’s own unit.",
           "battery_hold_feedback_entity": "Physical feedback of hold/release. Mandatory and distinct from the command when using an input helper.",
-          "battery_hold_feedback_engage_value": "Expected physical readback while holding. Leave empty to use the hold command value.",
-          "battery_hold_feedback_release_value": "Expected physical readback after release. Leave empty to use the release command value.",
-          "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged."
+          "battery_hold_feedback_engage_value": "Expected physical readback while holding. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
+          "battery_hold_feedback_release_value": "Expected physical readback after release. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
+          "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged.",
+          "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units."
         }
       },
       "settings": {

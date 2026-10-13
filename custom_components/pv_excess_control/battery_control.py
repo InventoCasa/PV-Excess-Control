@@ -55,7 +55,14 @@ class BatteryControlMixin:
         self._battery_unloading = False
         self._grid_charge_cleanup_pending = bool(data.get("_grid_charge_cleanup_pending") or data.get("_grid_charge_engaged"))
         self._battery_hold_cleanup_pending = bool(data.get("_battery_hold_cleanup_pending"))
-        self._battery_recovery = self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+        self._battery_discharge_cleanup_pending = bool(data.get("_battery_discharge_cleanup_pending"))
+        self._battery_recovery = (self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+                                  or self._battery_discharge_cleanup_pending)
+        self._battery_discharge_owner = None
+        self._battery_discharge_template = None
+        self._battery_discharge_last_action = None
+        self._battery_numeric_hold_requested = False
+        self._battery_numeric_hold_deadline = None
         self._battery_hold_engaged = False
         self._battery_hold_ctl = None
         self._battery_watchdog = None
@@ -87,20 +94,31 @@ class BatteryControlMixin:
         self._battery_observed_limits = ()
         self._battery_load_commitments = ()
         self._battery_load_assumptions = ()
-        if data.get("battery_hold_verified") and data.get("battery_hold_entity"):
+        shared_numeric = (data.get("battery_hold_entity") == data.get("battery_max_discharge_entity")
+                          and str(data.get("battery_hold_entity", "")).split(".", 1)[0] in {"number", "input_number"})
+        if (data.get("battery_hold_verified") or shared_numeric) and data.get("battery_hold_entity"):
             try:
-                self._battery_hold_ctl = InverterGridChargeController(self.hass, InverterGridChargeConfig(
+                controller = InverterGridChargeController(self.hass, InverterGridChargeConfig(
                     enable_entity_id=data["battery_hold_entity"],
                     enable_engage_value=data.get("battery_hold_engage_value", ""),
                     enable_disengage_value=data.get("battery_hold_release_value", ""),
                     enable_feedback_entity_id=data.get("battery_hold_feedback_entity"),
                     enable_feedback_engage_value=data.get("battery_hold_feedback_engage_value"),
                     enable_feedback_disengage_value=data.get("battery_hold_feedback_release_value"),
+                    enable_reassert_entity_id=data.get("battery_hold_reassert_entity"),
                 ))
+                if data.get("battery_hold_verified"):
+                    self._battery_hold_ctl = controller
+                if shared_numeric:
+                    self._battery_discharge_template = controller
             except ValueError:
                 _LOGGER.exception("Invalid battery hold mapping")
         if self._battery_hold_cleanup_pending:
             self._battery_hold_owner = self._battery_hold_ctl
+        if self._battery_discharge_cleanup_pending:
+            mapping = self._shared_discharge_mapping()
+            if mapping is not None:
+                self._battery_discharge_owner = InverterGridChargeController(self.hass, mapping)
 
     async def _restore_battery_ownership(self):
         try:
@@ -112,13 +130,24 @@ class BatteryControlMixin:
                 self._battery_hold_cleanup_pending = hold is not None
                 self._battery_charge_owner = None
                 self._battery_hold_owner = None
+                self._battery_discharge_owner = None
+                self._battery_discharge_cleanup_pending = False
             if charge is not None:
                 self._battery_charge_owner = InverterGridChargeController(self.hass, charge)
                 self._grid_charge_cleanup_pending = True
             if hold is not None:
                 self._battery_hold_owner = InverterGridChargeController(self.hass, hold)
                 self._battery_hold_cleanup_pending = True
-            self._battery_recovery = self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+            discharge = getattr(self._battery_journal, "discharge_config", None)
+            if isinstance(discharge, InverterGridChargeConfig):
+                self._battery_discharge_owner = InverterGridChargeController(self.hass, discharge)
+                self._battery_discharge_cleanup_pending = True
+            mapping = getattr(self._battery_journal, "discharge_mapping", None)
+            if (isinstance(mapping, InverterGridChargeConfig) and self._battery_discharge_template is None
+                    and mapping.enable_entity_id == self.config_entry.data.get("battery_max_discharge_entity")):
+                self._battery_discharge_template = InverterGridChargeController(self.hass, mapping)
+            self._battery_recovery = (self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+                                      or self._battery_discharge_cleanup_pending)
             self._battery_storage_ready = True
         except (HomeAssistantError, OSError, ValueError, TypeError):
             self._battery_storage_ready = False
@@ -129,10 +158,14 @@ class BatteryControlMixin:
     async def _save_battery_ownership(self):
         if not self._battery_storage_ready:
             raise RuntimeError("Battery ownership storage unavailable")
-        await self._battery_journal.async_save(
-            self._battery_charge_owner.config if self._grid_charge_cleanup_pending and self._battery_charge_owner else None,
-            self._battery_hold_owner.config if self._battery_hold_cleanup_pending and self._battery_hold_owner else None,
-        )
+        charge = self._battery_charge_owner.config if self._grid_charge_cleanup_pending and self._battery_charge_owner else None
+        hold = self._battery_hold_owner.config if self._battery_hold_cleanup_pending and self._battery_hold_owner else None
+        extra = {}
+        if self._battery_discharge_cleanup_pending and self._battery_discharge_owner:
+            extra["discharge_config"] = self._battery_discharge_owner.config
+        if mapping := self._shared_discharge_mapping():
+            extra["discharge_mapping"] = mapping
+        await self._battery_journal.async_save(charge, hold, **extra)
 
     def _persist_battery_controls(self):
         data = dict(self.config_entry.data)
@@ -140,8 +173,10 @@ class BatteryControlMixin:
             "_grid_charge_engaged": self._grid_charge_engaged,
             "_grid_charge_cleanup_pending": self._grid_charge_cleanup_pending,
             "_battery_hold_cleanup_pending": self._battery_hold_cleanup_pending,
+            "_battery_discharge_cleanup_pending": self._battery_discharge_cleanup_pending,
         })
-        keys = ("_grid_charge_engaged", "_grid_charge_cleanup_pending", "_battery_hold_cleanup_pending")
+        keys = ("_grid_charge_engaged", "_grid_charge_cleanup_pending", "_battery_hold_cleanup_pending",
+                "_battery_discharge_cleanup_pending")
         if any(bool(data[k]) != bool(self.config_entry.data.get(k, False)) for k in keys):
             self.hass.config_entries.async_update_entry(self.config_entry, data=data)
 
@@ -195,7 +230,8 @@ class BatteryControlMixin:
     def _defer_battery_startup_recovery(self):
         """Keep ownership pending without consuming a helper state transition."""
         if not (self._battery_recovery or self._grid_charge_engaged
-                or self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending):
+                or self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+                or self._battery_discharge_cleanup_pending):
             return
         self._battery_recovery = True
         self._battery_control_state = "idle"
@@ -208,17 +244,18 @@ class BatteryControlMixin:
             # Even a failed unload during startup still owns its cleanup. The
             # unloading flag remains set, so this callback can only release.
             if (self._battery_recovery or self._grid_charge_engaged
-                    or self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending):
+                    or self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+                    or self._battery_discharge_cleanup_pending):
                 await self.async_stop_battery_controls("startup_recovery")
 
         self._battery_startup_unsub = async_at_started(self.hass, recover)
 
-    def _arm_battery_watchdog(self, end=None):
+    def _arm_battery_watchdog(self, end=None, *, require_fresh_soc=True):
         """A stalled update loop must not leave an owned charge/hold running."""
         self._cancel_battery_watchdog()
         seconds = float(self.config_entry.data.get("battery_input_max_age_seconds", 300))
         soc_state = self.hass.states.get(self.config_entry.data.get("battery_soc"))
-        if isinstance(soc_state, State):
+        if require_fresh_soc and isinstance(soc_state, State):
             stamp = getattr(soc_state, "last_reported", None) or soc_state.last_updated
             seconds -= max(0., (dt_util.utcnow() - stamp).total_seconds())
         if end is not None:
@@ -228,26 +265,30 @@ class BatteryControlMixin:
             self.hass.async_create_task(self.async_stop_battery_controls("watchdog_expired"))
         self._battery_watchdog = self.hass.loop.call_later(max(.1, seconds), expired)
 
-    async def _release_battery_locked(self, reason):
+    async def _release_battery_locked(self, reason, *, release_discharge=True):
         """Cancellation also leaves an independently retryable cleanup."""
         if self._battery_waiting_for_startup():
             self._cancel_battery_watchdog()
             self._defer_battery_startup_recovery()
             return not self._battery_recovery
         try:
-            return await self._release_battery_locked_impl(reason)
+            return await self._release_battery_locked_impl(reason, release_discharge=release_discharge)
         except asyncio.CancelledError:
             self._battery_recovery = True
             self._arm_battery_watchdog(dt_util.utcnow() + timedelta(seconds=30))
             raise
 
-    async def _release_battery_locked_impl(self, reason):
+    async def _release_battery_locked_impl(self, reason, *, release_discharge=True):
         """Try every owned release; retain ownership until confirmed."""
         self._cancel_battery_watchdog()
         ok = True
         self._battery_grid_notice_since = None
         had_charge = self._grid_charge_cleanup_pending or self._grid_charge_engaged
         had_hold = self._battery_hold_cleanup_pending
+        had_discharge = release_discharge and self._battery_discharge_cleanup_pending
+        if release_discharge:
+            self._battery_numeric_hold_requested = False
+            self._battery_numeric_hold_deadline = None
         if had_charge:
             self._grid_charge_cleanup_pending = True
             try:
@@ -273,16 +314,29 @@ class BatteryControlMixin:
             except Exception as err:
                 ok = False
                 _LOGGER.warning("Battery hold release unconfirmed: %s", err)
-        if (had_charge or had_hold) and self._battery_storage_ready:
+        if had_discharge:
+            try:
+                if self._battery_discharge_owner is None:
+                    raise ValueError("Missing shared discharge cleanup mapping")
+                await self._battery_discharge_owner.disengage()
+                self._battery_discharge_cleanup_pending = False
+                self._battery_hold_engaged = bool(self._battery_hold_cleanup_pending)
+                self._last_discharge_limit = None
+            except Exception as err:
+                ok = False
+                _LOGGER.warning("Shared battery discharge release unconfirmed: %s", err)
+        if (had_charge or had_hold or had_discharge) and self._battery_storage_ready:
             try:
                 await self._save_battery_ownership()
             except asyncio.CancelledError:
                 self._grid_charge_cleanup_pending |= had_charge
                 self._battery_hold_cleanup_pending |= had_hold
+                self._battery_discharge_cleanup_pending |= had_discharge
                 raise
             except Exception as err:
                 self._grid_charge_cleanup_pending |= had_charge
                 self._battery_hold_cleanup_pending |= had_hold
+                self._battery_discharge_cleanup_pending |= had_discharge
                 ok = False
                 _LOGGER.warning("Could not persist battery release: %s", err)
         try:
@@ -298,7 +352,11 @@ class BatteryControlMixin:
                 30, lambda: self.hass.async_create_task(self.async_stop_battery_controls(reason)),
             )
         if ok:
+            if release_discharge and not self._battery_discharge_cleanup_pending:
+                self._battery_discharge_owner = None
             await self._finish_grid_charge_notification(reason)
+            if not release_discharge and self._battery_discharge_cleanup_pending:
+                self._arm_shared_discharge_watchdog()
         return ok
 
     async def _notify_grid_charge(self, event, value):
@@ -438,7 +496,17 @@ class BatteryControlMixin:
         if self._battery_recovery or not self.enabled or self._battery_unloading:
             await self.async_stop_battery_controls("startup_recovery" if self._battery_recovery else "disabled")
         elif (self._grid_charge_engaged or self._battery_hold_engaged) and self._battery_soc_now() is None:
-            await self.async_stop_battery_controls("soc_missing_or_stale")
+            if self._shared_discharge_mapping() is None:
+                await self.async_stop_battery_controls("soc_missing_or_stale")
+            else:
+                async with self._battery_lock:
+                    self._battery_numeric_hold_requested = False
+                    if not self._battery_hold_cleanup_pending:
+                        self._battery_hold_engaged = False
+                    self._battery_numeric_hold_deadline = None
+                    await self._release_battery_locked("soc_missing_or_stale", release_discharge=False)
+                if self._battery_discharge_last_action is not None:
+                    await self._apply_shared_discharge_limit(self._battery_discharge_last_action)
 
     def auto_should_engage_now(self):
         self._init_battery_control()
@@ -462,26 +530,38 @@ class BatteryControlMixin:
             self._defer_battery_startup_recovery()
             return
         async with self._battery_lock:
+            self._battery_numeric_hold_requested = False
             if self._battery_recovery:
                 await self._release_battery_locked("startup_recovery")
                 return
             if not self.enabled or self._battery_unloading:
                 await self._release_battery_locked("disabled")
                 return
+            async def release_control(reason, *, release_discharge=None):
+                # Ordinary consumer protection has a separate owner. Plan
+                # failures must not pulse its shared actuator to the default.
+                if release_discharge is None:
+                    release_discharge = self._shared_discharge_mapping() is None
+                if not release_discharge:
+                    self._battery_numeric_hold_requested = False
+                    self._battery_numeric_hold_deadline = None
+                    if not self._battery_hold_cleanup_pending:
+                        self._battery_hold_engaged = False
+                return await self._release_battery_locked(reason, release_discharge=release_discharge)
             if not self._battery_storage_ready:
-                await self._release_battery_locked("ownership_storage_unavailable")
+                await release_control("ownership_storage_unavailable")
                 return
             soc = self._battery_soc_now()
             if soc is None:
-                await self._release_battery_locked("soc_missing_or_stale")
+                await release_control("soc_missing_or_stale")
                 return
             d = self.config_entry.data
             requested_power = _finite(d.get("battery_grid_charge_power_w"))
             if self._inverter_ctl is None or requested_power is None or requested_power <= 0:
-                await self._release_battery_locked("charge_control_unavailable")
+                await release_control("charge_control_unavailable")
                 return
             if self._inverter_ctl.confirmation_level != "physical":
-                await self._release_battery_locked("physical_feedback_required")
+                await release_control("physical_feedback_required")
                 return
             manual = self.force_charge
             slot = None
@@ -490,11 +570,11 @@ class BatteryControlMixin:
                 action = "charge" if soc < target else "self_consumption"
             elif d.get("auto_battery_grid_charge") and d.get("allow_grid_charging"):
                 if not d.get("inverter_force_charge_power_entity"):
-                    await self._release_battery_locked("adjustable_power_control_required")
+                    await release_control("adjustable_power_control_required")
                     return
                 native_charge_limit = _finite(d.get("battery_max_charge_power_w"))
                 if native_charge_limit is None or native_charge_limit <= 0:
-                    await self._release_battery_locked("native_charge_limit_required")
+                    await release_control("native_charge_limit_required")
                     return
                 try:
                     reason = self._refresh_battery_grid_plan(tariff_info, power_state)
@@ -504,7 +584,7 @@ class BatteryControlMixin:
                 if reason:
                     self._battery_grid_plan = None
                     self._battery_plan_key = None
-                    await self._release_battery_locked(reason)
+                    await release_control(reason)
                     return
                 slot = self._current_battery_slot()
                 action = slot.action if slot else "self_consumption"
@@ -543,9 +623,9 @@ class BatteryControlMixin:
             if action == "charge":
                 requested_power = self._feasible_battery_power(requested_power)
                 if requested_power is None or requested_power <= 0:
-                    await self._release_battery_locked("invalid_planned_power")
+                    await release_control("invalid_planned_power")
                     return
-                if self._battery_hold_cleanup_pending and not await self._release_battery_locked("leave_hold"):
+                if self._battery_hold_cleanup_pending and not await release_control("leave_hold"):
                     return
                 try:
                     if self._grid_charge_engaged and self._battery_charge_power == requested_power:
@@ -557,13 +637,13 @@ class BatteryControlMixin:
                         self._persist_battery_controls()
                         if (not self.enabled or self._battery_unloading or self.force_charge != manual
                                 or self._battery_soc_now() is None):
-                            await self._release_battery_locked("request_changed")
+                            await release_control("request_changed")
                             return
                         await self._release_solar_charge_cap()
                         if not manual:
                             refreshed = self._battery_action_after_wait("charge", tariff_info, power_state)
                             if refreshed is None:
-                                await self._release_battery_locked("planning_input_changed")
+                                await release_control("planning_input_changed")
                                 return
                             slot = refreshed
                             target = min(float(d.get("battery_grid_target_soc", 80)), slot.soc_end)
@@ -574,12 +654,12 @@ class BatteryControlMixin:
                                 float(d["battery_grid_charge_power_w"]) + max(0., pv - load),
                             ))
                             if requested_power is None or requested_power <= 0:
-                                await self._release_battery_locked("invalid_planned_power")
+                                await release_control("invalid_planned_power")
                                 return
                         if (not self.enabled or self._battery_unloading or self.force_charge != manual
                                 or self._battery_soc_now() is None or self._battery_soc_now() >= target
                                 or (slot is not None and dt_util.utcnow() >= slot.end)):
-                            await self._release_battery_locked("request_changed")
+                            await release_control("request_changed")
                             return
                         await self._inverter_ctl.engage(requested_power)
                         self._grid_charge_engaged = True
@@ -588,7 +668,7 @@ class BatteryControlMixin:
                     if (not self.enabled or self._battery_unloading or self.force_charge != manual
                             or self._battery_soc_now() is None
                             or (slot is not None and dt_util.utcnow() >= slot.end)):
-                        await self._release_battery_locked("request_changed")
+                        await release_control("request_changed")
                         return
                     self._battery_control_state = "charging"
                     self._battery_control_reason = "manual" if manual else "economic_plan"
@@ -601,13 +681,21 @@ class BatteryControlMixin:
                 except Exception as err:
                     _LOGGER.warning("Battery start/confirmation failed: %s", err)
                     self._battery_retry_after = now + timedelta(minutes=5)
-                    await self._release_battery_locked("charge_unconfirmed")
+                    await release_control("charge_unconfirmed")
                 return
             if action == "hold" and self._battery_hold_ctl is not None:
                 if self._battery_hold_retry_after is not None and now < self._battery_hold_retry_after:
-                    await self._release_battery_locked("retry_backoff")
+                    await release_control("retry_backoff")
                     return
-                if self._grid_charge_cleanup_pending and not await self._release_battery_locked("enter_hold"):
+                if self._uses_shared_numeric_hold():
+                    if self._grid_charge_cleanup_pending and not await release_control(
+                        "enter_hold", release_discharge=False,
+                    ):
+                        return
+                    self._battery_numeric_hold_requested = True
+                    self._battery_numeric_hold_deadline = slot.end
+                    return
+                if self._grid_charge_cleanup_pending and not await release_control("enter_hold"):
                     return
                 try:
                     if self._battery_hold_engaged:
@@ -619,23 +707,23 @@ class BatteryControlMixin:
                         self._persist_battery_controls()
                         if (not self.enabled or self._battery_unloading or self.force_charge
                                 or self._battery_soc_now() is None or dt_util.utcnow() >= slot.end):
-                            await self._release_battery_locked("request_changed")
+                            await release_control("request_changed")
                             return
                         await self._release_solar_charge_cap()
                         refreshed = self._battery_action_after_wait("hold", tariff_info, power_state)
                         if refreshed is None:
-                            await self._release_battery_locked("planning_input_changed")
+                            await release_control("planning_input_changed")
                             return
                         slot = refreshed
                         if (not self.enabled or self._battery_unloading or self.force_charge
                                 or self._battery_soc_now() is None or dt_util.utcnow() >= slot.end):
-                            await self._release_battery_locked("request_changed")
+                            await release_control("request_changed")
                             return
                         await self._battery_hold_ctl.engage(0)
                         self._battery_hold_engaged = True
                     if (not self.enabled or self._battery_unloading or self.force_charge
                             or self._battery_soc_now() is None or dt_util.utcnow() >= slot.end):
-                        await self._release_battery_locked("request_changed")
+                        await release_control("request_changed")
                         return
                     self._battery_control_state = "holding"
                     self._battery_control_reason = "later_expensive_window"
@@ -648,9 +736,12 @@ class BatteryControlMixin:
                     _LOGGER.warning("Battery hold unconfirmed: %s", err)
                     self._battery_plan_key = None
                     self._battery_hold_retry_after = now + timedelta(minutes=5)
-                    await self._release_battery_locked("hold_unconfirmed")
+                    await release_control("hold_unconfirmed")
                 return
-            released = await self._release_battery_locked("target_reached" if soc >= target else "self_consumption")
+            released = await self._release_battery_locked(
+                "target_reached" if soc >= target else "self_consumption",
+                release_discharge=self._shared_discharge_mapping() is None,
+            )
             if released and d.get("auto_battery_grid_charge"):
                 self._battery_control_state = "self_consumption"
 
@@ -725,6 +816,212 @@ class BatteryControlMixin:
         value = min(watts, maximum) if maximum is not None else watts
         value = minimum + math.floor((value - minimum + 1e-9) / step) * step
         return value if value >= minimum else None
+
+    def _shared_discharge_mapping(self):
+        """Return the confirmed numeric mapping for the shared discharge limit."""
+        entity = self.config_entry.data.get("battery_max_discharge_entity")
+        for controller in (getattr(self, "_battery_hold_ctl", None), getattr(self, "_battery_discharge_template", None)):
+            if (controller is not None and controller.confirmation_level == "physical"
+                    and isinstance(controller.config, InverterGridChargeConfig)
+                    and controller.config.enable_entity_id == entity
+                    and entity.split(".", 1)[0] in {"number", "input_number"}):
+                return controller.config
+        return None
+
+    def _uses_shared_numeric_hold(self):
+        """A remembered consumer capability never enables economic holding."""
+        mapping = self._shared_discharge_mapping()
+        data = self.config_entry.data
+        return bool(mapping and self._battery_hold_ctl is not None
+                    and data.get("battery_hold_verified")
+                    and data.get("battery_hold_entity") == mapping.enable_entity_id
+                    and self._battery_hold_ctl.config == mapping)
+
+    @staticmethod
+    def _discharge_unit_multiplier(state):
+        if not isinstance(state, State) or state.state in {"unknown", "unavailable"}:
+            raise ValueError("Discharge control or feedback is unavailable")
+        unit = state.attributes.get("unit_of_measurement")
+        if unit not in {None, "", "W", "kW"}:
+            raise ValueError("Unsupported discharge power unit")
+        return 1000. if unit == "kW" else 1.
+
+    def _numeric_hold_still_requested(self):
+        if (not self._uses_shared_numeric_hold() or not self._battery_numeric_hold_requested
+                or not self.enabled or self._battery_unloading
+                or self.force_charge or self._battery_numeric_hold_deadline is None
+                or dt_util.utcnow() >= self._battery_numeric_hold_deadline or self._battery_soc_now() is None):
+            return False
+        data = self.config_entry.data
+        for key in ("pv_power", "load_power"):
+            watts = self._battery_read_number(data.get(key), power=True,
+                                             max_age=data.get("battery_input_max_age_seconds", 300))
+            if watts is None or watts < 0:
+                return False
+        slot = self._battery_action_after_wait("hold", self._latest_tariff, self._latest_power_state)
+        if slot is None:
+            return False
+        self._battery_numeric_hold_deadline = min(self._battery_numeric_hold_deadline, slot.end)
+        return dt_util.utcnow() < self._battery_numeric_hold_deadline
+
+    async def _apply_shared_discharge_limit(self, action):
+        """Serialize economic hold, consumer caps and their confirmed cleanup."""
+        self._init_battery_control()
+        async with self._battery_lock:
+            if self._battery_waiting_for_startup():
+                self._defer_battery_startup_recovery()
+                return
+            if self._battery_recovery:
+                return
+            if not self.enabled or self._battery_unloading:
+                await self._release_battery_locked("disabled")
+                return
+            if not self._battery_storage_ready:
+                self._battery_control_state = "fault"
+                self._battery_control_reason = "ownership_storage_unavailable"
+                return
+            self._battery_discharge_last_action = action
+            try:
+                mapping = self._shared_discharge_mapping()
+                if mapping is None:
+                    raise ValueError("Shared discharge control needs physical feedback")
+                state = self.hass.states.get(mapping.enable_entity_id)
+                multiplier = self._discharge_unit_multiplier(state)
+                feedback = self.hass.states.get(mapping.enable_feedback_entity_id or mapping.enable_entity_id)
+                feedback_multiplier = self._discharge_unit_multiplier(feedback)
+                fallback = _finite(mapping.enable_disengage_value)
+                hold = _finite(mapping.enable_engage_value)
+                if fallback is None or hold is None or not 0 <= hold < fallback:
+                    raise ValueError("Invalid shared discharge hold/release values")
+                fallback, hold = fallback * multiplier, hold * multiplier
+                attrs = state.attributes
+                raw_limits = (attrs.get("min", 0), attrs.get("max", fallback / multiplier),
+                              attrs.get("step", 1 / multiplier))
+                if any(isinstance(value, bool) or _finite(value) is None for value in raw_limits):
+                    raise ValueError("Invalid shared discharge actuator limits")
+                minimum, maximum, step = (float(value) * multiplier for value in raw_limits)
+                if not (0 <= minimum <= maximum and step > 0 and minimum <= fallback <= maximum):
+                    raise ValueError("Invalid shared discharge actuator range")
+                requested = (action.max_discharge_watts if action.should_limit and action.max_discharge_watts is not None
+                             else self.config_entry.data.get("battery_max_discharge_default"))
+                if requested is None:
+                    requested = fallback
+                if isinstance(requested, bool) or _finite(requested) is None or float(requested) < 0:
+                    raise ValueError("Invalid ordinary discharge limit")
+                ordinary = min(fallback, maximum, max(minimum, float(requested)))
+                ordinary = minimum + math.floor((ordinary - minimum + 1e-9) / step) * step
+                # An invalidated economic hold hands directly to the ordinary
+                # consumer cap on the second pass, without a default-power pulse.
+                for _ in range(2):
+                    requested_hold = self._numeric_hold_still_requested()
+                    if not requested_hold:
+                        self._battery_numeric_hold_requested = False
+                    if requested_hold and (not minimum <= hold <= maximum
+                                           or abs((hold - minimum) / step - round((hold - minimum) / step)) > 1e-6):
+                        raise ValueError("Configured hold value is not an executable setpoint")
+                    target = min(ordinary, hold) if requested_hold else ordinary
+                    if target < fallback:
+                        current = self._battery_discharge_owner
+                        # Preserve the original fallback mapping while changing a cap.
+                        original = current.config if self._battery_discharge_cleanup_pending and current else mapping
+                        effective = replace(original, enable_engage_value=str(target / multiplier),
+                                            enable_feedback_engage_value=str(target / feedback_multiplier))
+                        controller = InverterGridChargeController(self.hass, effective)
+                        if (current is not None and self._battery_discharge_cleanup_pending
+                                and current.config == effective and self._last_discharge_limit == target):
+                            await current.verify_engaged(0)
+                        else:
+                            self._battery_discharge_owner = controller
+                            self._battery_discharge_cleanup_pending = True
+                            await self._save_battery_ownership()
+                            self._persist_battery_controls()
+                            if not self.enabled or self._battery_unloading:
+                                await self._release_battery_locked("request_changed")
+                                return
+                            if requested_hold:
+                                if not self._battery_hold_engaged:
+                                    await self._release_solar_charge_cap()
+                                if not self._numeric_hold_still_requested():
+                                    self._battery_numeric_hold_requested = False
+                                    continue
+                            await controller.engage(0)
+                        self._last_discharge_limit = target
+                    else:
+                        controller = (self._battery_discharge_owner if self._battery_discharge_cleanup_pending
+                                      else None) or InverterGridChargeController(self.hass, mapping)
+                        if self._battery_discharge_cleanup_pending or self._last_discharge_limit != fallback:
+                            await controller.disengage()
+                        else:
+                            await controller.verify_disengaged()
+                        had_discharge = self._battery_discharge_cleanup_pending
+                        self._battery_discharge_cleanup_pending = False
+                        try:
+                            await self._save_battery_ownership()
+                            self._persist_battery_controls()
+                        except BaseException:
+                            self._battery_discharge_cleanup_pending = had_discharge
+                            raise
+                        self._last_discharge_limit = fallback
+                        self._battery_discharge_owner = None
+                    if not self.enabled or self._battery_unloading:
+                        await self._release_battery_locked("request_changed")
+                        return
+                    if requested_hold and not self._numeric_hold_still_requested():
+                        self._battery_numeric_hold_requested = False
+                        continue
+                    break
+                self._battery_hold_engaged = requested_hold or self._battery_hold_cleanup_pending
+                if requested_hold:
+                    self._battery_control_state = "holding"
+                    self._battery_control_reason = "later_expensive_window"
+                elif self._battery_control_state == "holding" and not self._battery_hold_cleanup_pending:
+                    self._battery_control_state = "self_consumption"
+                    self._battery_control_reason = "self_consumption"
+                if self._battery_discharge_cleanup_pending:
+                    self._arm_shared_discharge_watchdog()
+            except asyncio.CancelledError:
+                self._battery_recovery = True
+                self._arm_battery_watchdog(dt_util.utcnow() + timedelta(seconds=30))
+                raise
+            except Exception as err:
+                _LOGGER.warning("Shared discharge command failed: %s", err)
+                self._battery_hold_retry_after = dt_util.utcnow() + timedelta(minutes=5)
+                self._last_discharge_limit = None
+                await self._release_battery_locked("discharge_limit_unconfirmed")
+
+    def _arm_shared_discharge_watchdog(self):
+        """At a hold boundary hand back to the last consumer limit directly."""
+        if self._grid_charge_engaged:
+            slot = self._current_battery_slot()
+            self._arm_battery_watchdog(slot.end if slot else None)
+        elif self._battery_hold_cleanup_pending:
+            slot = self._current_battery_slot()
+            self._arm_battery_watchdog(slot.end if slot else None)
+        elif self._battery_hold_engaged and self._battery_numeric_hold_deadline is not None:
+            end = self._battery_numeric_hold_deadline
+            seconds = (end - dt_util.utcnow()).total_seconds()
+            freshness = self.config_entry.data.get("battery_input_max_age_seconds", 300)
+            soc = self.hass.states.get(self.config_entry.data.get("battery_soc"))
+            if isinstance(soc, State):
+                stamp = getattr(soc, "last_reported", None) or soc.last_updated
+                freshness -= max(0., (dt_util.utcnow() - stamp).total_seconds())
+            if 0 < seconds < freshness:
+                self._cancel_battery_watchdog()
+                async def handoff():
+                    async with self._battery_lock:
+                        if self._battery_numeric_hold_deadline != end or dt_util.utcnow() < end:
+                            return
+                        self._battery_numeric_hold_requested = False
+                        self._battery_numeric_hold_deadline = None
+                        action = self._battery_discharge_last_action
+                    if action is not None:
+                        await self._apply_shared_discharge_limit(action)
+                self._battery_watchdog = self.hass.loop.call_later(
+                    seconds, lambda: self.hass.async_create_task(handoff()))
+            else:
+                self._arm_battery_watchdog(require_fresh_soc=True)
+        else:
+            self._arm_battery_watchdog(require_fresh_soc=False)
 
     def _battery_load_policy_allows_run(self, appliance_id, data, now):
         """Mirror immediate gates relevant to an already observed active run."""
@@ -880,14 +1177,25 @@ class BatteryControlMixin:
         cap_maximum = None
         cap_entity = self.config_entry.data.get("battery_max_discharge_entity")
         cap_state = self.hass.states.get(cap_entity) if cap_entity else None
+        shared_mapping = self._shared_discharge_mapping()
+        cap_step = None
         if isinstance(cap_state, State) and _finite(cap_state.state) is not None:
             unit = str(cap_state.attributes.get("unit_of_measurement", "W")).lower()
+            if shared_mapping and unit in ("none", ""):
+                unit = "w"
             minimum = _finite(cap_state.attributes.get("min"))
             if minimum is not None and minimum >= 0 and unit in ("w", "kw"):
                 multiplier = 1000 if unit == "kw" else 1
                 cap = minimum * multiplier
                 maximum = _finite(cap_state.attributes.get("max"))
                 cap_maximum = maximum * multiplier if maximum is not None else None
+                if shared_mapping:
+                    fallback = _finite(shared_mapping.enable_disengage_value)
+                    step = _finite(cap_state.attributes.get("step", 1 / multiplier))
+                    if fallback is None or step is None or step <= 0:
+                        return (), (), "load_discharge_limit_unavailable"
+                    cap_maximum = min(cap_maximum, fallback * multiplier) if cap_maximum is not None else fallback * multiplier
+                    cap_step = step * multiplier
 
         for appliance_id, subentry in getattr(self.config_entry, "subentries", {}).items():
             data = subentry.data
@@ -927,19 +1235,23 @@ class BatteryControlMixin:
             if requested is not None and cap_entity:
                 if cap is None:
                     return (), (), "load_discharge_limit_unavailable"
-                if requested != 0 and unit == "kw":
+                if requested != 0 and unit == "kw" and not shared_mapping:
                     # The existing writer sends watts without converting a
                     # nonzero request to kW. Do not predict an unsupported cap.
                     return (), (), "load_discharge_limit_units_unsupported"
                 limit = max(requested, cap)
                 if cap_maximum is not None:
                     limit = min(limit, cap_maximum)
+                if cap_step:
+                    limit = cap + math.floor((limit - cap + 1e-9) / cap_step) * cap_step
                 if after_requested is not None:
-                    if after_requested != 0 and unit == "kw":
+                    if after_requested != 0 and unit == "kw" and not shared_mapping:
                         return (), (), "load_discharge_limit_units_unsupported"
                     after_limit = max(after_requested, cap)
                     if cap_maximum is not None:
                         after_limit = min(after_limit, cap_maximum)
+                    if cap_step:
+                        after_limit = cap + math.floor((after_limit - cap + 1e-9) / cap_step) * cap_step
             # Ignore normal meter jitter, while a real start/stop or material
             # power/policy change immediately invalidates a cached battery plan.
             projected_w = max(100., round(watts / 100) * 100.)
@@ -1199,6 +1511,7 @@ class BatteryControlMixin:
             "battery_grid_charge_observed_power_w": round(measured_flow[0], 1) if measured_flow else None,
             "battery_charge_cleanup_pending": self._grid_charge_cleanup_pending,
             "battery_hold_cleanup_pending": self._battery_hold_cleanup_pending,
+            "battery_discharge_cleanup_pending": self._battery_discharge_cleanup_pending,
             "battery_hold_supported": bool(self._battery_hold_ctl and self._battery_hold_ctl.confirmation_level == "physical"),
             "battery_confirmation": self._inverter_ctl.confirmation_level if self._inverter_ctl else "unconfigured",
             "battery_grid_energy_kwh": round(plan.grid_energy_kwh, 3) if plan and plan.valid else None,

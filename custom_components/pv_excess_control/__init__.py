@@ -38,6 +38,7 @@ _RUNTIME_STATE_KEYS = frozenset({
     "disabled_appliances", "overridden_appliances", "paused_appliances",
     "_pending_stop_appliances",
     "_grid_charge_engaged", "_grid_charge_cleanup_pending", "_battery_hold_cleanup_pending",
+    "_battery_discharge_cleanup_pending",
 })
 
 

@@ -1986,6 +1986,11 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
         discharge_entity = data.get(CONF_BATTERY_MAX_DISCHARGE_ENTITY)
         if not discharge_entity:
             return
+        if ((discharge_entity == data.get("battery_hold_entity")
+                and discharge_entity.split(".", 1)[0] in {"number", "input_number"})
+                or self._shared_discharge_mapping() is not None):
+            await self._apply_shared_discharge_limit(action)
+            return
 
         domain = discharge_entity.split(".")[0] if "." in discharge_entity else "number"
 

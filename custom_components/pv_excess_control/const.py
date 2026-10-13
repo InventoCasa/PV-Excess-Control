@@ -172,6 +172,7 @@ CONF_BATTERY_HOLD_RELEASE_VALUE = "battery_hold_release_value"
 CONF_BATTERY_HOLD_FEEDBACK_ENTITY = "battery_hold_feedback_entity"
 CONF_BATTERY_HOLD_FEEDBACK_ENGAGE_VALUE = "battery_hold_feedback_engage_value"
 CONF_BATTERY_HOLD_FEEDBACK_RELEASE_VALUE = "battery_hold_feedback_release_value"
+CONF_BATTERY_HOLD_REASSERT_ENTITY = "battery_hold_reassert_entity"
 CONF_BATTERY_HOLD_VERIFIED = "battery_hold_verified"
 
 DEFAULT_BATTERY_GRID_TARGET_SOC = 80.0
