@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from itertools import chain
 import math
 
 from .models import HourlyForecast, TariffWindow
@@ -16,6 +17,9 @@ from .models import HourlyForecast, TariffWindow
 
 _EPS = 1e-8
 _ECONOMIC_TIE_EPS = 1e-9
+# Additional search work is deterministic and cannot displace a completed plan
+# with a partially explored trajectory when this budget is exhausted.
+_REFINEMENT_TRANSITION_BUDGET = 100_000
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,9 @@ class BatteryPlanningConfig:
     horizon_hours: float = 24.0
     energy_step_kwh: float = 0.1
     max_pv_charge_power_w: float | None = None
+    forced_charge_min_power_w: float | None = None
+    forced_charge_max_power_w: float | None = None
+    forced_charge_power_step_w: float | None = None
 
     @property
     def native_charge_power_w(self) -> float:
@@ -194,6 +201,15 @@ def _validate_config(config: BatteryPlanningConfig, soc: float | None) -> None:
         and config.energy_step_kwh > 0
     ):
         raise ValueError("invalid_configuration")
+    minimum = config.forced_charge_min_power_w
+    maximum = config.forced_charge_max_power_w
+    step = config.forced_charge_power_step_w
+    if (any(value is not None and not _finite(value) for value in (minimum, maximum, step))
+            or (minimum is not None and minimum < 0)
+            or (maximum is not None and maximum <= 0)
+            or (step is not None and step <= 0)
+            or (minimum is not None and maximum is not None and minimum > maximum)):
+        raise ValueError("invalid_charge_power_constraints")
 
 
 def _timeline(
@@ -324,6 +340,104 @@ def _slots(node: _Node) -> tuple[BatteryGridSlot, ...]:
     return tuple(reversed(slots))
 
 
+def _executable_grid_energy(
+    interval: _Interval, config: BatteryPlanningConfig, solar_ac: float, grid: float,
+) -> float:
+    """Quantize the combined PV/grid command without purchasing extra energy.
+
+    The native PV model is unchanged. An actuator limit that would curtail that
+    solar input excludes this forced-charge candidate instead of hiding PV loss.
+    """
+    minimum = config.forced_charge_min_power_w or 0.
+    maximum = config.forced_charge_max_power_w
+    step = config.forced_charge_power_step_w
+    if config.forced_charge_min_power_w is None and maximum is None and step is None:
+        return grid
+    requested = (solar_ac + grid) * 1000 / interval.hours
+    watts = min(requested, maximum) if maximum is not None else requested
+    if step is not None:
+        watts = minimum + math.floor((watts - minimum + 1e-9) / step) * step
+    if watts <= 0 or watts < minimum:
+        return 0.
+    return max(0., min(grid, watts * interval.hours / 1000 - solar_ac))
+
+
+def _search_schedule(
+    timeline: list[_Interval], config: BatteryPlanningConfig, efficiency: float,
+    initial: _Node, baseline_solar: list[float], bounds: list[float],
+    step: float, bucket_step: float, *, transition_budget: int | None = None,
+) -> _Node | None:
+    """Search one bounded grouping of exact energy states, or abandon it."""
+    attempts = 0
+    states = {(round(initial.energy / bucket_step), 0): initial}
+    grid_ceiling = config.capacity_kwh * config.grid_target_soc / 100
+    for i, interval in enumerate(timeline):
+        following: dict[tuple[int, int], _Node] = {}
+
+        def retain(candidate: _Node, solar: float) -> None:
+            if candidate.energy > bounds[i + 1] + _EPS or solar + _EPS < baseline_solar[i]:
+                return
+            bucket = round(candidate.energy / bucket_step)
+            key = (bucket, 0)
+            previous = following.get(key)
+            if previous is None or _prefer_economic_node(candidate, previous):
+                following[key] = candidate
+            # Preserve exact upper endpoints as well as the cheapest state in a
+            # bucket. Otherwise a partial current slot or a precise demand gap
+            # can lose its physically available last few Wh through pruning.
+            key = (bucket, 1)
+            previous = following.get(key)
+            if (previous is None or candidate.energy > previous.energy
+                    or (candidate.energy == previous.energy and _prefer_economic_node(candidate, previous))):
+                following[key] = candidate
+
+        for node in states.values():
+            # Count conservatively before each node's native/hold transitions.
+            attempts += 3
+            if transition_budget is not None and attempts > transition_budget:
+                return None
+            native, solar = _transition(interval, node, config, efficiency, "self_consumption")
+            retain(native, solar)
+            if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
+                retained, solar = _transition(interval, node, config, efficiency, "hold")
+                retain(retained, solar)
+            if interval.price > config.charge_price_limit:
+                continue
+            held, solar = _transition(interval, node, config, efficiency, "hold")
+            maximum_grid = min(
+                config.max_charge_power_w * interval.hours / 1000,
+                config.native_charge_power_w * interval.hours / 1000 - solar / efficiency,
+                (min(grid_ceiling, bounds[i + 1]) - held.energy) / efficiency,
+            )
+            if maximum_grid <= _EPS:
+                continue
+            # Include the exact endpoint: small residual demand is useful too.
+            options = chain(
+                (j * step for j in range(1, int(maximum_grid / step) + 1)),
+                (maximum_grid,),
+            )
+            seen = set()
+            for grid in options:
+                attempts += 1
+                if transition_budget is not None and attempts > transition_budget:
+                    return None
+                grid = _executable_grid_energy(interval, config, solar / efficiency, grid)
+                if grid <= _EPS or grid in seen:
+                    continue
+                seen.add(grid)
+                charged, solar = _transition(interval, node, config, efficiency, "charge", grid)
+                retain(charged, solar)
+        states = following
+        if not states:
+            return None
+
+    best = next(iter(states.values()))
+    for candidate in states.values():
+        if _prefer_economic_node(candidate, best):
+            best = candidate
+    return best
+
+
 def build_battery_grid_plan(
     now: datetime,
     soc: float | None,
@@ -376,61 +490,16 @@ def build_battery_grid_plan(
         discharge = min(interval.deficit_kwh, interval.discharge_limit(config) * interval.hours / 1000) / efficiency
         bounds[i] = min(config.capacity_kwh, max(0.0, bounds[i + 1] + discharge - baseline_solar[i]))
 
-    # Bound CPU/memory for large batteries without rounding physical balances.
+    # Refine storage-state grouping, not the charging quantities. This avoids
+    # introducing tiny purchases solely to imitate an unverified discharge hold.
     step = max(config.energy_step_kwh, config.capacity_kwh / 200)
-    states = {(round(initial.energy / step), 0): initial}
-    grid_ceiling = config.capacity_kwh * config.grid_target_soc / 100
-    for i, interval in enumerate(timeline):
-        following: dict[tuple[int, int], _Node] = {}
-
-        def retain(candidate: _Node, solar: float) -> None:
-            if candidate.energy > bounds[i + 1] + _EPS or solar + _EPS < baseline_solar[i]:
-                return
-            bucket = round(candidate.energy / step)
-            key = (bucket, 0)
-            previous = following.get(key)
-            if previous is None or _prefer_economic_node(candidate, previous):
-                following[key] = candidate
-            # Preserve exact upper endpoints as well as the cheapest state in a
-            # bucket. Otherwise a partial current slot or a precise demand gap
-            # can lose its physically available last few Wh through pruning.
-            key = (bucket, 1)
-            previous = following.get(key)
-            if (previous is None or candidate.energy > previous.energy
-                    or (candidate.energy == previous.energy and _prefer_economic_node(candidate, previous))):
-                following[key] = candidate
-
-        for node in states.values():
-            native, solar = _transition(interval, node, config, efficiency, "self_consumption")
-            retain(native, solar)
-            if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
-                retained, solar = _transition(interval, node, config, efficiency, "hold")
-                retain(retained, solar)
-            if interval.price > config.charge_price_limit:
-                continue
-            held, solar = _transition(interval, node, config, efficiency, "hold")
-            maximum_grid = min(
-                config.max_charge_power_w * interval.hours / 1000,
-                config.native_charge_power_w * interval.hours / 1000 - solar / efficiency,
-                (min(grid_ceiling, bounds[i + 1]) - held.energy) / efficiency,
-            )
-            if maximum_grid <= _EPS:
-                continue
-            # Include the exact endpoint: small residual demand is useful too.
-            options = [j * step for j in range(1, int(maximum_grid / step) + 1)]
-            options.append(maximum_grid)
-            for grid in options:
-                charged, solar = _transition(interval, node, config, efficiency, "charge", grid)
-                retain(charged, solar)
-        states = following
-        if not states:
-            # Approximate state pruning must never turn native operation into a
-            # fabricated profitable schedule or make valid input unsafe.
-            return BatteryGridPlan(_slots(baseline), 0.0, 0.0, "no_economic_benefit", soc)
-
-    best = next(iter(states.values()))
-    for candidate in states.values():
-        if _prefer_economic_node(candidate, best):
+    best = baseline
+    for bucket_step, budget in ((step, None), (step / 2, _REFINEMENT_TRANSITION_BUDGET)):
+        candidate = _search_schedule(
+            timeline, config, efficiency, initial, baseline_solar, bounds,
+            step, bucket_step, transition_budget=budget,
+        )
+        if candidate is not None and _prefer_economic_node(candidate, best):
             best = candidate
     savings = baseline.cost - best.cost
     if savings <= 1e-6:

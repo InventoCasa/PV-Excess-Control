@@ -687,23 +687,44 @@ class BatteryControlMixin:
         self._dyn_charge_release_pending = False
         self._dyn_charge_pause_released = True
 
-    def _feasible_battery_power(self, watts):
-        """Round down to actuator steps so a plan cannot request extra energy."""
+    def _battery_charge_power_constraints(self):
+        """Read actuator limits in watts for both planning and dispatch."""
         entity_id = self.config_entry.data.get("inverter_force_charge_power_entity")
         if not entity_id:
-            return watts
+            return None, None, None
         state = self.hass.states.get(entity_id)
         if not isinstance(state, State) or state.state in ("unknown", "unavailable"):
             return None
-        multiplier = 1000 if str(state.attributes.get("unit_of_measurement", "W")).lower() == "kw" else 1
-        minimum = _finite(state.attributes.get("min", 0))
-        maximum = _finite(state.attributes.get("max", watts / multiplier))
-        step = _finite(state.attributes.get("step", 1 / multiplier))
-        if minimum is None or maximum is None or step is None or step <= 0:
+        unit = state.attributes.get("unit_of_measurement")
+        if unit not in (None, "", "W", "kW"):
             return None
-        value = min(watts / multiplier, maximum)
+        multiplier = 1000 if unit == "kW" else 1
+        raw_minimum = state.attributes.get("min", 0)
+        raw_maximum = state.attributes.get("max")
+        raw_step = state.attributes.get("step", 1 / multiplier)
+        if any(isinstance(value, bool) for value in (raw_minimum, raw_maximum, raw_step)):
+            return None
+        minimum, maximum, step = _finite(raw_minimum), _finite(raw_maximum), _finite(raw_step)
+        if (minimum is None or minimum < 0 or step is None or step <= 0
+                or (raw_maximum is not None and (maximum is None or maximum <= 0 or minimum > maximum))):
+            return None
+        minimum, step = minimum * multiplier, step * multiplier
+        maximum = maximum * multiplier if maximum is not None else None
+        if not all(math.isfinite(value) for value in (minimum, step, maximum) if value is not None):
+            return None
+        return minimum, maximum, step
+
+    def _feasible_battery_power(self, watts):
+        """Round down to actuator steps so a plan cannot request extra energy."""
+        if not self.config_entry.data.get("inverter_force_charge_power_entity"):
+            return watts
+        constraints = self._battery_charge_power_constraints()
+        if constraints is None:
+            return None
+        minimum, maximum, step = constraints
+        value = min(watts, maximum) if maximum is not None else watts
         value = minimum + math.floor((value - minimum + 1e-9) / step) * step
-        return value * multiplier if value >= minimum else None
+        return value if value >= minimum else None
 
     def _battery_load_policy_allows_run(self, appliance_id, data, now):
         """Mirror immediate gates relevant to an already observed active run."""
@@ -1045,13 +1066,17 @@ class BatteryControlMixin:
         if load_error:
             self._battery_grid_plan = None
             return load_error
+        charge_constraints = self._battery_charge_power_constraints()
+        if charge_constraints is None:
+            self._battery_grid_plan = None
+            return "invalid_charge_power_constraints"
         soc = self._battery_soc_now()
         hold = bool(self._battery_hold_ctl and self._battery_hold_ctl.confirmation_level == "physical")
         # Keep the chosen slot target stable between planner runs; re-evaluate
         # immediately when any tariff/forecast/configuration input changes.
         key = (tuple((w.start, w.end, w.price) for w in tariff_info.windows),
                tuple((f.start, f.end, f.expected_kwh) for f in forecast.hourly_breakdown),
-               hold, load_key,
+               hold, load_key, charge_constraints,
                tuple((k, repr(v)) for k, v in sorted(d.items()) if k.startswith("battery_") or k == "min_battery_soc"),
                tariff_info.battery_charge_price_threshold)
         slot = self._current_battery_slot()
@@ -1066,6 +1091,9 @@ class BatteryControlMixin:
                 roundtrip_efficiency=d.get("battery_roundtrip_efficiency", .85),
                 wear_cost_per_kwh=d.get("battery_wear_cost_per_kwh", 0),
                 charge_price_limit=tariff_info.battery_charge_price_threshold, hold_supported=hold,
+                forced_charge_min_power_w=charge_constraints[0],
+                forced_charge_max_power_w=charge_constraints[1],
+                forced_charge_power_step_w=charge_constraints[2],
             )
             # Calibration belongs to grid-purchase planning only. The shared
             # provider forecast still drives independent solar/appliance plans.

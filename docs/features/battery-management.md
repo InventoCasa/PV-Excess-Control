@@ -59,7 +59,21 @@ A sunny forecast may therefore result in little or no overnight charging. The
 solar target time is not a requirement to buy enough grid energy to fill the
 battery; grid purchases follow expected demand and economical time windows.
 
-A bounded numerical search produces an approximate schedule. When cost and
+A bounded numerical search produces an approximate schedule. It also tries finer
+storage-state grouping without introducing smaller charging quantities. Only a
+completed candidate with better modeled economics can replace the original;
+if the additional search reaches its fixed computation budget, the completed
+original plan remains available. This improves selection without promising a
+global optimum or realized savings.
+
+Configured actuator minimum, maximum and power steps apply to the combined
+PV-plus-grid forced-charge setpoint before its energy and cost are scored.
+Unusable residual purchases are excluded rather than counted as free holding.
+Native solar charging keeps its separate physical limit. These numeric limits
+do not measure efficiency at low charging power. A reached SoC target or a
+safety condition can still stop charging before the forecast interval ends.
+
+ When cost and
 total purchased energy are otherwise equal, it prefers earlier useful charging
 to avoid arbitrary shifts between equally priced windows. Lower prices and
 solar headroom retain their priority. Forecasts and household demand remain
