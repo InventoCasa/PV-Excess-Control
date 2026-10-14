@@ -114,13 +114,23 @@ do not establish a switch-off time. A cheap window provides a stopping estimate
 only when the configured policy and available solar do not permit continuation. Starting, stopping or changing a consumer's policy causes the
 battery schedule to be reconsidered.
 
-Unmapped or otherwise unbounded non-EV household consumption is a near-term
-estimate: measured load persists for a bounded 30-minute observation window and
-is updated as new measurements arrive. It is not assumed to run unchanged for
-24 hours. An active EV excluded from the household history needs valid power and
-a credible duration bound; if these are unavailable, automatic purchases are
-blocked with a diagnostic reason instead of assuming that its solar demand is
-zero.
+Unmapped non-EV household background is a near-term estimate. Its trailing
+two-minute, time-weighted mean contributes to a bounded 30-minute projection;
+the current excess contributes for at most one minute from its actual sensor
+report. A brief spike therefore does not become half an hour of sustained demand.
+Regularly cycling loads retain their average energy, and a sustained increase is
+fully reflected after two minutes. During warm-up, the household profile fills
+unobserved time. Duplicate reports do not add weight; missing readings, changed
+meter mappings or observation gaps longer than two minutes reset the estimate.
+The mean can remain above the current load briefly after a spike ends.
+
+Known metered household runs and bounded EV demand remain immediate. The same
+background estimate accompanies known household runs without counting their
+metered power twice. Actual consumption learning and safety limits use current
+measurements, not the mean. No unknown load is extrapolated unchanged for 24
+hours. An active EV excluded from household history needs valid power and a
+credible duration bound; if these are unavailable, automatic purchases are
+blocked with a diagnostic reason instead of assuming its solar demand is zero.
 
 The calculation also respects the discharge limit expected while those loads
 run. A device whose minimum setting is 100 W is modeled with that remaining
@@ -212,6 +222,11 @@ discharge hold** is explicitly selected and a complete control mapping exists.
 Configure hold/release command values and feedback, with separate expected
 feedback values when the inverter reports different text from the command.
 Helper controls require a distinct physical feedback entity.
+
+Exactly adjacent hold intervals in a valid plan share one hold deadline, avoiding
+a release at their common boundary. A gap, a different planned action, invalid
+inputs or an explicit stop still ends holding; sensor freshness continues to
+limit the watchdog deadline. A changed plan is revalidated after hardware waits.
 
 Numeric `number` and `input_number` controls are also supported. Enter command
 values in the control entity's native units and, when needed, separate numeric

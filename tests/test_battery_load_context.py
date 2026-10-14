@@ -87,15 +87,15 @@ def test_runtime_sensor_shortens_ev_run_without_extrapolating_full_day(economic_
     assert any(s.pv_charge_kwh > 0 for s in slots[1:])
 
 
-def test_unmapped_house_load_reserves_observed_solar_for_only_thirty_minutes(economic_case):
+def test_unmapped_house_load_initially_reserves_solar_for_only_sixty_seconds(economic_case):
     case = economic_case([.17, .35], [2.5, 0], [0, 2000])
     case.reading("sensor.load_power", 4000, unit_of_measurement="W")
     assert refresh(case) is None
     slots = case.coord._battery_grid_plan.slots
-    assert slots[0].end == case.clock["now"] + timedelta(minutes=30)
+    assert slots[0].end == case.clock["now"] + timedelta(seconds=60)
     assert slots[0].pv_charge_kwh == 0
-    assert sum(s.load_kwh for s in slots) == pytest.approx(4)
-    assert "observed_30_minute_persistence" in case.coord.battery_control_diagnostics()["battery_load_assumptions"]
+    assert sum(s.load_kwh for s in slots) == pytest.approx(2 + 4 / 60)
+    assert "observed_household_60_second_persistence" in case.coord.battery_control_diagnostics()["battery_load_assumptions"]
 
 
 def test_known_non_ev_load_is_a_household_floor_not_an_added_profile_load(economic_case):
@@ -189,12 +189,18 @@ def test_end_before_splits_the_actual_cheap_window(economic_case):
     assert case.coord._battery_grid_plan.slots[0].end == case.clock["now"] + timedelta(minutes=20)
 
 
-def test_observed_load_uses_thirty_elapsed_minutes_across_autumn_clock_change(economic_case):
+def test_observed_load_horizons_use_elapsed_time_across_autumn_clock_change(economic_case):
     case = economic_case([.17, .35], [2.5, 0], [0, 2000])
-    case.clock["now"] = datetime(2026, 10, 25, 2, 45, tzinfo=ZoneInfo("Europe/Berlin"), fold=0)
+    case.clock["now"] = datetime(2026, 10, 25, 2, 59, 30, tzinfo=ZoneInfo("Europe/Berlin"), fold=0)
     case.reading("sensor.load_power", 4000, unit_of_measurement="W")
     rows, _, error = case.coord._battery_load_context(case.clock["now"], case.tariff, [0.] * 24)
     assert error is None
+    assert rows[0].end.astimezone(timezone.utc) - rows[0].start.astimezone(timezone.utc) == timedelta(seconds=60)
+    for _ in range(2):
+        case.clock["now"] = (case.clock["now"].astimezone(timezone.utc) + timedelta(seconds=60)).astimezone(ZoneInfo("Europe/Berlin"))
+        case.reading("sensor.load_power", 4000, unit_of_measurement="W")
+        rows, _, error = case.coord._battery_load_context(case.clock["now"], case.tariff, [0.] * 24)
+        assert error is None
     assert rows[0].end.astimezone(timezone.utc) - rows[0].start.astimezone(timezone.utc) == timedelta(minutes=30)
 
 
@@ -304,6 +310,10 @@ def test_observed_house_horizon_starts_when_excess_begins_not_at_baseline(econom
     assert context(case, 500) == ()
     case.clock["now"] += timedelta(minutes=29)
     rows = context(case, 4000)
+    assert rows[0].end == case.clock["now"] + timedelta(seconds=60)
+    for _ in range(4):
+        case.clock["now"] += timedelta(seconds=30)
+        rows = context(case, 4000)
     assert rows[0].end == case.clock["now"] + timedelta(minutes=30)
     previous_end = rows[0].end
     case.clock["now"] += timedelta(seconds=10)
@@ -319,7 +329,7 @@ def test_observed_house_horizon_reanchors_after_new_demand(economic_case, event)
         assert context(case, 500) == ()
         case.clock["now"] += timedelta(minutes=10)
     rows = context(case, 6000 if event == "increase" else 4000)
-    assert rows[0].end == case.clock["now"] + timedelta(minutes=30)
+    assert rows[0].end == case.clock["now"] + timedelta(seconds=60)
 
 
 def test_unknown_run_discharge_horizon_reanchors_when_cap_changes(economic_case):
@@ -350,7 +360,7 @@ def test_known_house_run_recomputes_base_floor_at_hour_boundaries(economic_case)
     assert slots[1].load_kwh == pytest.approx(1.5)
 
 
-def test_unmetered_base_change_invalidates_plan_even_below_current_house_profile(economic_case):
+def test_unmetered_base_change_waits_for_observations_before_extending_known_runs(economic_case):
     case = economic_case([.17, .17, .35], [0, 0, 0], [5000, 500, 0])
     appliance(case, ev=False, watts=1000)
     case.reading("sensor.load_power", 1100, unit_of_measurement="W")
@@ -358,8 +368,14 @@ def test_unmetered_base_change_invalidates_plan_even_below_current_house_profile
     previous = case.coord._battery_grid_plan
     case.reading("sensor.load_power", 1600, unit_of_measurement="W")
     assert refresh(case) is None
+    assert case.coord._battery_grid_plan is previous
+    assert sum(s.load_kwh for s in previous.slots if s.start.hour == 1) == pytest.approx(1.1)
+    for _ in range(5):
+        case.clock["now"] += timedelta(seconds=30)
+        case.reading("sensor.load_power", 1600, unit_of_measurement="W")
+        assert refresh(case) is None
     assert case.coord._battery_grid_plan is not previous
-    assert case.coord._battery_grid_plan.slots[1].load_kwh == pytest.approx(1.5)
+    assert sum(s.load_kwh for s in case.coord._battery_grid_plan.slots if s.start.hour == 1) == pytest.approx(1.5)
 
 
 @pytest.mark.parametrize("dynamic,solar", [(False, 20), (True, 3)])
