@@ -813,6 +813,7 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
                 ev_soc=state.ev_soc,
                 activations_today=0,
                 current_power_available=state.current_power_available,
+                runtime_observed_at=dt_util.utcnow(),
             )
         self.appliance_states = new_states  # Atomic replacement
         # Only clear switch interval for OFF appliances; ON appliances keep protection
@@ -1501,6 +1502,7 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
     ) -> dict[str, ApplianceState]:
         """Read current state of each controlled appliance entity."""
         self._ensure_daily_date()
+        runtime_observed_at = dt_util.utcnow()
         states: dict[str, ApplianceState] = {}
         # Track all physical appliances even while their automatic control is
         # disabled. This also gives restored disabled appliances a live state.
@@ -1612,6 +1614,8 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
                 activations_today=self._activations_today.get(config.id, 0),
                 current_power_available=current_power_available,
                 remaining_runtime_minutes=_parse_sensor_float(self.hass, config.remaining_runtime_entity) if config.remaining_runtime_entity else None,
+                runtime_observed_at=(runtime_observed_at if update_runtime or previous is None
+                                     else getattr(previous, "runtime_observed_at", None)),
                 enable_condition=(_parse_sensor_bool(self.hass, config.enable_condition_entity) if config.enable_condition_entity else True),
                 solar_start_elapsed=max(0, _time.monotonic() - getattr(self, "_solar_start_since", {}).get(config.id, _time.monotonic())),
                 seconds_since_current_change=(

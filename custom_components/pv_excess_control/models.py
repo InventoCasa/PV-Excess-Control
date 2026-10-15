@@ -142,6 +142,8 @@ class ApplianceState:
     enable_condition: bool | None = True
     solar_start_elapsed: float = 0.0
     remaining_runtime_minutes: float | None = None
+    # The counter observation's clock is stable during asynchronous planning.
+    runtime_observed_at: datetime | None = None
 
 
 def runtime_demand_seconds(config: ApplianceConfig, state: ApplianceState) -> float | None:

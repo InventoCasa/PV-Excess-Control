@@ -130,6 +130,7 @@ class BatteryControlMixin:
         self._battery_observed_limits_until = None
         self._battery_load_commitments = ()
         self._battery_load_assumptions = ()
+        self._battery_runtime_observations = {}
         shared_numeric = (data.get("battery_hold_entity") == data.get("battery_max_discharge_entity")
                           and str(data.get("battery_hold_entity", "")).split(".", 1)[0] in {"number", "input_number"})
         if (data.get("battery_hold_verified") or shared_numeric) and data.get("battery_hold_entity"):
@@ -1258,6 +1259,36 @@ class BatteryControlMixin:
         available = solar * factor * 3_600_000 / duration - profile[when.astimezone(dt_util.now().tzinfo).hour]
         return available + 1e-6 < minimum
 
+    def _battery_runtime_observation(self, appliance_id, data, state, now):
+        """Anchor a runtime counter to its observation, including legacy states."""
+        observed = getattr(state, "runtime_observed_at", None)
+        if observed is not None:
+            self._battery_runtime_observations.pop(appliance_id, None)
+            if (not isinstance(observed, datetime) or observed.tzinfo is None
+                    or observed.utcoffset() is None):
+                return None
+            observed = observed.astimezone(timezone.utc)
+            if (observed > now.astimezone(timezone.utc)
+                    or observed.astimezone(now.tzinfo).date() != now.date()):
+                return None
+            return observed
+        # Restored/legacy states have no observation timestamp. The first read
+        # anchors that snapshot; validation alone must not make it newer.
+        entity_id = data.get("appliance_entity")
+        physical = self.hass.states.get(entity_id) if entity_id else None
+        token = (state.runtime_today, entity_id,
+                 getattr(state, "is_on", None), getattr(state, "last_state_change", None),
+                 physical.last_changed if isinstance(physical, State) else None)
+        previous = self._battery_runtime_observations.get(appliance_id)
+        if previous is None or previous[0] is not state or previous[1] != token:
+            previous = state, token, now.astimezone(timezone.utc)
+            self._battery_runtime_observations[appliance_id] = previous
+        observed = previous[2]
+        if (observed > now.astimezone(timezone.utc)
+                or observed.astimezone(now.tzinfo).date() != now.date()):
+            return None
+        return observed
+
     def _battery_load_run_end(self, appliance_id, data, now, tariff):
         """Bound an observed run by actual stopping rules, never minimum demand.
 
@@ -1282,12 +1313,13 @@ class BatteryControlMixin:
             state = self.appliance_states.get(appliance_id)
             if maximum is None or state is None:
                 return None, False
-            end = now.astimezone(timezone.utc) + timedelta(minutes=maximum) - state.runtime_today
-            midnight = datetime.combine(now.date() + timedelta(days=1), time(), tzinfo=now.tzinfo)
-            # The daily counter resets at local midnight; today's remaining
-            # allowance cannot promise a stop on the following day.
-            if end < midnight:
-                bounds.append(end)
+            observed = self._battery_runtime_observation(appliance_id, data, state, now)
+            if observed is not None:
+                end = observed + timedelta(minutes=maximum) - state.runtime_today
+                midnight = datetime.combine(now.date() + timedelta(days=1), time(), tzinfo=now.tzinfo)
+                # Today's allowance cannot promise a stop after its reset.
+                if end < midnight:
+                    bounds.append(end)
         if not override and not helper_only and not (on_only and not data.get("dynamic_current")) and data.get("end_before"):
             try:
                 end_time = time.fromisoformat(data["end_before"])
@@ -1332,6 +1364,10 @@ class BatteryControlMixin:
 
         self._battery_load_commitments = ()
         self._battery_load_assumptions = ()
+        self._battery_runtime_observations = {
+            key: value for key, value in self._battery_runtime_observations.items()
+            if key in getattr(self.config_entry, "subentries", {})
+        }
 
         def invalid(reason):
             self._reset_battery_load_forecast()

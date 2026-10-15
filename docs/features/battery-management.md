@@ -53,6 +53,12 @@ demand within that horizon, while preserving the solar uptake expected without
 grid charging. Export arbitrage and filling unused storage at the horizon are
 not objectives.
 
+The first solar charging interval is not a requirement to reach an empty
+battery. A small solar surplus may leave useful storage capacity available while
+retained energy avoids more expensive purchases later. The objective is lower
+total modeled cost with preserved solar uptake; the integration does not force
+discharge or export simply to reach zero before each charging interval.
+
 **Maximum grid-charge SoC** (`battery_grid_target_soc`, default 80%) is a ceiling,
 not an instruction to fill to that value. The computed slot target can be lower.
 A sunny forecast may therefore result in little or no overnight charging. The
@@ -124,6 +130,11 @@ Minimum daily runtime, an advisory plan or an advisory planning deadline alone
 do not establish a switch-off time. A cheap window provides a stopping estimate
 only when the configured policy and available solar do not permit continuation. Starting, stopping or changing a consumer's policy causes the
 battery schedule to be reconsidered.
+
+Daily-runtime limits are anchored to the observation of the consumed runtime.
+Rechecking the same observation after a calculation must not move its expected
+end time. New runtime observations, operating changes and the local daily reset
+are revalidated before the plan can drive a command.
 
 Unmapped non-EV household background is a near-term estimate. Its trailing
 two-minute, time-weighted mean initially contributes for at most two minutes;
@@ -321,6 +332,9 @@ non-essential appliances and limit discharge when storage is low. These policies
 retain their existing safety precedence. The inverter's native reserve is an
 independent hardware setting; configuring a planning reserve does not change it.
 Set the planning reserve consistently with the native reserve.
+If the configured SoC sensor already reports only usable storage above the
+native reserve, its 0% means that protected reserve has been reached. Use capacity
+and planning-reserve values that match that sensor's scale.
 
 ## Grid-charge notifications
 
