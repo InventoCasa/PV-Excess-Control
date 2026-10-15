@@ -201,7 +201,7 @@ def test_observed_load_horizons_use_elapsed_time_across_autumn_clock_change(econ
         case.reading("sensor.load_power", 4000, unit_of_measurement="W")
         rows, _, error = case.coord._battery_load_context(case.clock["now"], case.tariff, [0.] * 24)
         assert error is None
-    assert rows[0].end.astimezone(timezone.utc) - rows[0].start.astimezone(timezone.utc) == timedelta(minutes=30)
+    assert rows[0].end.astimezone(timezone.utc) - rows[0].start.astimezone(timezone.utc) == timedelta(minutes=2)
 
 
 def test_daily_runtime_reset_is_not_a_fictitious_stop_after_midnight(economic_case):
@@ -314,7 +314,7 @@ def test_observed_house_horizon_starts_when_excess_begins_not_at_baseline(econom
     for _ in range(4):
         case.clock["now"] += timedelta(seconds=30)
         rows = context(case, 4000)
-    assert rows[0].end == case.clock["now"] + timedelta(minutes=30)
+    assert rows[0].end == case.clock["now"] + timedelta(minutes=2)
     previous_end = rows[0].end
     case.clock["now"] += timedelta(seconds=10)
     assert context(case, 4003)[0].end == previous_end
@@ -375,7 +375,7 @@ def test_unmetered_base_change_waits_for_observations_before_extending_known_run
         case.reading("sensor.load_power", 1600, unit_of_measurement="W")
         assert refresh(case) is None
     assert case.coord._battery_grid_plan is not previous
-    assert sum(s.load_kwh for s in case.coord._battery_grid_plan.slots if s.start.hour == 1) == pytest.approx(1.5)
+    assert sum(s.load_kwh for s in case.coord._battery_grid_plan.slots if s.start.hour == 1) == pytest.approx(1.1)
 
 
 @pytest.mark.parametrize("dynamic,solar", [(False, 20), (True, 3)])

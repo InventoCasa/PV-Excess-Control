@@ -59,12 +59,23 @@ A sunny forecast may therefore result in little or no overnight charging. The
 solar target time is not a requirement to buy enough grid energy to fill the
 battery; grid purchases follow expected demand and economical time windows.
 
-A bounded numerical search produces an approximate schedule. It also tries finer
-storage-state grouping without introducing smaller charging quantities. Only a
-completed candidate with better modeled economics can replace the original;
-if the additional search reaches its fixed computation budget, the completed
-original plan remains available. This improves selection without promising a
-global optimum or realized savings.
+A bounded numerical search produces an approximate schedule. It retains the
+original and finer storage-state searches, then additionally tries smaller
+charging quantities when physically verified discharge hold is available. Each
+extra search has its own fixed computation budget. Only a completed candidate
+with better modeled economics can replace an already completed plan. Without
+verified hold, the additional smaller-quantity search is omitted. All candidates
+must still honor actuator power steps, solar uptake and useful future demand.
+This improves selection without promising a global optimum or realized savings.
+
+The pure search runs outside Home Assistant's event loop. Its detached input
+snapshot is revalidated before a result can drive a command, including current
+SoC, tariff and configured power/price limits. Stop, unload and watchdog requests
+interrupt waiting for a search; an abandoned computation cannot publish a plan.
+
+Load metadata that leaves the actual demand, solar availability and discharge
+limit unchanged does not create extra planning boundaries. Tariff, forecast,
+local-hour, genuine load/cap and restart-eligibility boundaries remain intact.
 
 Configured actuator minimum, maximum and power steps apply to the combined
 PV-plus-grid forced-charge setpoint before its energy and cost are scored.
@@ -115,14 +126,21 @@ only when the configured policy and available solar do not permit continuation. 
 battery schedule to be reconsidered.
 
 Unmapped non-EV household background is a near-term estimate. Its trailing
-two-minute, time-weighted mean contributes to a bounded 30-minute projection;
+two-minute, time-weighted mean initially contributes for at most two minutes;
 the current excess contributes for at most one minute from its actual sensor
-report. A brief spike therefore does not become half an hour of sustained demand.
-Regularly cycling loads retain their average energy, and a sustained increase is
-fully reflected after two minutes. During warm-up, the household profile fills
-unobserved time. Duplicate reports do not add weight; missing readings, changed
-meter mappings or observation gaps longer than two minutes reset the estimate.
-The mean can remain above the current load briefly after a spike ends.
+report. Sustained observations can extend the mean's projection to five, ten
+or thirty minutes only after the corresponding duration has been observed.
+A short kitchen load therefore does not immediately become a thirty-minute
+increase in expected demand. Regularly cycling loads retain their average energy.
+
+During warm-up, the household profile fills unobserved time. Duplicate reports
+do not add weight or renew an expired horizon; missing readings, changed meter
+mappings or observation gaps longer than two minutes reset the estimate. The
+mean can remain above the current load for up to two minutes after a spike ends.
+The background added to known household runs also loses transient increases when
+this short horizon ends. Its established reference may rise only after thirty
+minutes of sustained observations and remains capped by the future hourly
+profile. Known metered runs retain their separate duration bounds.
 
 Known metered household runs and bounded EV demand remain immediate. The same
 background estimate accompanies known household runs without counting their
@@ -186,6 +204,22 @@ least **30 minutes of valid samples for every one of the 24 local hours**,
 usually at least one day; missing readings delay readiness. Each hour must have
 recent observations within seven days. The learned profile is persisted across
 reloads and midnight. Clearing the explicit profile returns to learning.
+
+## Restart eligibility
+
+**Grid-charge restart delay** (`grid_charge_engage_min_duration_minutes`, default
+five minutes) is an off-time after a confirmed owned grid-charge stop. Every
+release path, including watchdog expiry and changed inputs, starts the same
+pause after successful confirmation. The deadline survives reload/restart and
+is visible as `battery_restart_available_at`; `restart_delay` explains waiting.
+Repeated inactive cleanup and hold-only releases do not renew this charge pause.
+
+The plan includes the current restart deadline and applies the same delay after
+future planned stops. A running charge may continue without being treated as a
+new start. If a future deadline falls inside an otherwise indivisible planning
+interval, the next available interval is used; the schedule remains an
+approximation. Disabling control, unloading or losing required data still stops
+an owned charge immediately. A restart delay does not impose a minimum on-time.
 
 ## Inverter acknowledgement and shutdown
 

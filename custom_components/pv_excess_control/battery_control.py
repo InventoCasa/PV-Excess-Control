@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 
 from homeassistant.core import CoreState, State
@@ -34,6 +34,31 @@ _GRID_NOTICE_START_SECONDS = 30
 _GRID_NOTICE_STOP_SECONDS = 60
 _GRID_NOTICE_MAX_AGE_SECONDS = 60
 _GRID_NOTICE_DELIVERY_TIMEOUT_SECONDS = 2
+
+
+@dataclass(frozen=True)
+class _BatteryPlanningRequest:
+    """Detached planner inputs; building a plan never accesses Home Assistant."""
+
+    key: tuple
+    now: datetime
+    soc: float
+    tariffs: tuple
+    forecast: tuple
+    profile: tuple
+    config: object
+    commitments: tuple
+
+    @property
+    def inputs(self):
+        return self.key, self.soc, self.profile, self.config
+
+    def build(self):
+        from .battery_planner import build_battery_grid_plan
+        return build_battery_grid_plan(
+            self.now, self.soc, self.tariffs, self.forecast, self.profile, self.config,
+            load_commitments=self.commitments,
+        )
 
 
 def _finite(value):
@@ -69,12 +94,14 @@ class BatteryControlMixin:
         self._battery_watchdog_generation = 0
         self._battery_startup_unsub = None
         self._battery_retry_after = None
+        self._battery_charge_stop_confirmed = False
         self._battery_hold_retry_after = None
         self._battery_target_latched = None
         self._battery_target_slot = None
         self._battery_grid_plan = None
         self._battery_plan_key = None
         self._battery_plan_created = None
+        self._battery_planning_abort = None
         self._battery_charge_power = None
         self._battery_grid_notice_active = False
         self._battery_grid_notice_since = None
@@ -95,6 +122,10 @@ class BatteryControlMixin:
         self._battery_load_sources = None
         self._battery_observed_load_until = None
         self._battery_observed_load_floor = 0.
+        self._battery_observed_load_horizon = None
+        self._battery_observed_load_reported_at = None
+        self._battery_observed_house_runs = ()
+        self._battery_observed_house_until = None
         self._battery_observed_limits = ()
         self._battery_observed_limits_until = None
         self._battery_load_commitments = ()
@@ -126,8 +157,12 @@ class BatteryControlMixin:
                 self._battery_discharge_owner = InverterGridChargeController(self.hass, mapping)
 
     async def _restore_battery_ownership(self):
+        self._battery_storage_ready = False
         try:
             charge, hold = await self._battery_journal.async_load()
+            retry_after = getattr(self._battery_journal, "charge_retry_after", None)
+            if isinstance(retry_after, datetime) and retry_after > dt_util.utcnow():
+                self._delay_battery_restart(retry_after)
             if self._battery_journal.loaded_record_exists is True:
                 # The awaited journal outranks delayed configuration flags.
                 self._grid_charge_engaged = False
@@ -153,6 +188,22 @@ class BatteryControlMixin:
                 self._battery_discharge_template = InverterGridChargeController(self.hass, mapping)
             self._battery_recovery = (self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
                                       or self._battery_discharge_cleanup_pending)
+            if getattr(self._battery_journal, "charge_retry_after_invalid", False) is True:
+                raw_minutes = self.config_entry.data.get("grid_charge_engage_min_duration_minutes", 5)
+                minutes = _finite(raw_minutes)
+                if isinstance(raw_minutes, bool) or minutes is None or not 0 <= minutes <= 60:
+                    minutes = 5.
+                self._delay_battery_restart(dt_util.utcnow() + timedelta(minutes=minutes))
+                # Preserve every validated original cleanup mapping. Keep the
+                # start gate closed throughout the awaited repair; failed
+                # persistence leaves those owners available for safe release.
+                await self._battery_journal.async_save(
+                    charge, hold,
+                    discharge_config=discharge if isinstance(discharge, InverterGridChargeConfig) else None,
+                    discharge_mapping=mapping if isinstance(mapping, InverterGridChargeConfig) else None,
+                    charge_retry_after=self._battery_retry_after,
+                )
+                _LOGGER.warning("Repaired invalid battery restart deadline; configured restart delay applied")
             self._battery_storage_ready = True
         except (HomeAssistantError, OSError, ValueError, TypeError):
             self._battery_storage_ready = False
@@ -166,6 +217,8 @@ class BatteryControlMixin:
         charge = self._battery_charge_owner.config if self._grid_charge_cleanup_pending and self._battery_charge_owner else None
         hold = self._battery_hold_owner.config if self._battery_hold_cleanup_pending and self._battery_hold_owner else None
         extra = {}
+        if self._battery_retry_after is not None:
+            extra["charge_retry_after"] = self._battery_retry_after
         if self._battery_discharge_cleanup_pending and self._battery_discharge_owner:
             extra["discharge_config"] = self._battery_discharge_owner.config
         if mapping := self._shared_discharge_mapping():
@@ -272,6 +325,7 @@ class BatteryControlMixin:
             if generation != self._battery_watchdog_generation:
                 return
             self._battery_watchdog = None
+            self._interrupt_battery_planning()
             self.hass.async_create_task(release_if_current())
 
         self._battery_watchdog = self.hass.loop.call_later(max(.1, seconds), expired)
@@ -318,6 +372,17 @@ class BatteryControlMixin:
                 if controller is None:
                     raise ValueError("Missing controller for pending battery release")
                 await controller.disengage()
+                if not self._battery_charge_stop_confirmed:
+                    raw_minutes = self.config_entry.data.get("grid_charge_engage_min_duration_minutes", 5)
+                    minutes = _finite(raw_minutes)
+                    # Match the configured upper bound, retaining legacy zero.
+                    # Invalid options must never interrupt confirmed cleanup.
+                    if isinstance(raw_minutes, bool) or minutes is None or not 0 <= minutes <= 60:
+                        minutes = 5.
+                    self._delay_battery_restart(dt_util.utcnow() + timedelta(minutes=minutes))
+                    self._battery_charge_stop_confirmed = True
+                    self._battery_plan_key = None
+                    self._battery_grid_plan = None
                 self._grid_charge_engaged = False
                 self._grid_charge_cleanup_pending = False
                 self._grid_charge_engage_ts = None
@@ -378,6 +443,12 @@ class BatteryControlMixin:
             if not release_discharge and self._battery_discharge_cleanup_pending:
                 self._arm_shared_discharge_watchdog()
         return ok
+
+    def _delay_battery_restart(self, until):
+        """Keep the latest confirmed-stop or command-failure deadline."""
+        if self._battery_retry_after is None or until > self._battery_retry_after:
+            self._battery_retry_after = until
+            self._battery_plan_key = None
 
     async def _notify_grid_charge(self, event, value):
         method = getattr(getattr(self, "notifications", None), f"notify_battery_grid_charge_{event}", None)
@@ -495,6 +566,7 @@ class BatteryControlMixin:
 
     async def async_stop_battery_controls(self, reason="disabled"):
         self._init_battery_control()
+        self._interrupt_battery_planning()
         async with self._battery_lock:
             return await self._release_battery_locked(reason)
 
@@ -519,6 +591,7 @@ class BatteryControlMixin:
             if self._shared_discharge_mapping() is None:
                 await self.async_stop_battery_controls("soc_missing_or_stale")
             else:
+                self._interrupt_battery_planning()
                 async with self._battery_lock:
                     self._battery_numeric_hold_requested = False
                     if not self._battery_hold_cleanup_pending:
@@ -532,7 +605,8 @@ class BatteryControlMixin:
         self._init_battery_control()
         if (self._battery_waiting_for_startup() or not self.enabled or self._battery_unloading or not self._battery_storage_ready
                 or not self.config_entry.data.get("auto_battery_grid_charge")
-                or not self.config_entry.data.get("allow_grid_charging")):
+                or not self.config_entry.data.get("allow_grid_charging")
+                or (self._battery_retry_after is not None and dt_util.utcnow() < self._battery_retry_after)):
             return False
         slot = self._current_battery_slot()
         return bool(slot and slot.action == "charge" and self._battery_soc_now() is not None)
@@ -615,7 +689,7 @@ class BatteryControlMixin:
                     await release_control("native_charge_limit_required")
                     return
                 try:
-                    reason = self._refresh_battery_grid_plan(tariff_info, power_state)
+                    reason = await self._async_refresh_battery_grid_plan(tariff_info, power_state)
                 except (ValueError, TypeError, AttributeError, ArithmeticError) as err:
                     _LOGGER.warning("Battery planning input rejected: %s", err)
                     reason = "invalid_planning_input"
@@ -623,6 +697,23 @@ class BatteryControlMixin:
                     self._battery_grid_plan = None
                     self._battery_plan_key = None
                     await release_control(reason)
+                    return
+                # Options and measurements can change while the pure search
+                # runs. Use the same fresh limits that validated its result.
+                d = self.config_entry.data
+                tariff_info = self._latest_tariff or tariff_info
+                soc = self._battery_soc_now()
+                requested_power = _finite(d.get("battery_grid_charge_power_w"))
+                native_charge_limit = _finite(d.get("battery_max_charge_power_w"))
+                if soc is None:
+                    await release_control("soc_missing_or_stale")
+                    return
+                if (requested_power is None or requested_power <= 0
+                        or native_charge_limit is None or native_charge_limit <= 0):
+                    await release_control("charge_control_unavailable")
+                    return
+                if self._inverter_ctl is None or self._inverter_ctl.confirmation_level != "physical":
+                    await release_control("physical_feedback_required")
                     return
                 slot = self._current_battery_slot()
                 action = slot.action if slot else "self_consumption"
@@ -632,11 +723,13 @@ class BatteryControlMixin:
                     current_surplus = max(0., current_pv - current_load)
                     requested_power = min(native_charge_limit, requested_power + current_surplus, slot.battery_charge_power_w)
                     target = min(float(d.get("battery_grid_target_soc", 80)), slot.soc_end)
-                    if action == "charge" and tariff_info.current_price > tariff_info.battery_charge_price_threshold:
+                    price_limit = _finite(d.get("battery_charge_price_threshold", tariff_info.battery_charge_price_threshold))
+                    if action == "charge" and (price_limit is None or tariff_info.current_price > price_limit):
                         action = "self_consumption"
             else:
                 action = "self_consumption"
             now = dt_util.utcnow()
+            restart_waiting = self._battery_retry_after is not None and now < self._battery_retry_after
             if action == "charge":
                 target_slot = slot.end if slot else None
                 if target_slot != self._battery_target_slot or (
@@ -654,10 +747,8 @@ class BatteryControlMixin:
                         action = "self_consumption"
                     else:
                         self._battery_target_latched = None
-                if self._battery_retry_after is not None and now < self._battery_retry_after:
+                if restart_waiting:
                     action = "self_consumption"
-            if action != "charge" and self._grid_charge_engaged:
-                self._battery_retry_after = now + timedelta(minutes=d.get("grid_charge_engage_min_duration_minutes", 5))
             if action == "charge":
                 requested_power = self._feasible_battery_power(requested_power)
                 if requested_power is None or requested_power <= 0:
@@ -669,6 +760,7 @@ class BatteryControlMixin:
                     if self._grid_charge_engaged and self._battery_charge_power == requested_power:
                         await self._inverter_ctl.verify_engaged(requested_power)
                     else:
+                        self._battery_charge_stop_confirmed = False
                         self._grid_charge_cleanup_pending = True
                         self._battery_charge_owner = self._inverter_ctl
                         await self._save_battery_ownership()
@@ -678,17 +770,27 @@ class BatteryControlMixin:
                             await release_control("request_changed")
                             return
                         await self._release_solar_charge_cap()
+                        if manual:
+                            current_power = _finite(self.config_entry.data.get("battery_grid_charge_power_w"))
+                            requested_power = (self._feasible_battery_power(min(requested_power, current_power))
+                                               if current_power is not None and current_power > 0 else None)
+                            if requested_power is None or requested_power <= 0:
+                                await release_control("invalid_planned_power")
+                                return
                         if not manual:
-                            refreshed = self._battery_action_after_wait("charge", tariff_info, power_state)
+                            refreshed = await self._battery_action_after_wait("charge", tariff_info, power_state)
                             if refreshed is None:
                                 await release_control("planning_input_changed")
                                 return
                             slot = refreshed
+                            d = self.config_entry.data
+                            tariff_info = self._latest_tariff or tariff_info
                             target = min(float(d.get("battery_grid_target_soc", 80)), slot.soc_end)
                             pv = self._battery_read_number(d.get("pv_power"), power=True)
                             load = self._battery_read_number(d.get("load_power"), power=True)
                             requested_power = self._feasible_battery_power(min(
                                 requested_power, slot.battery_charge_power_w,
+                                float(d["battery_max_charge_power_w"]),
                                 float(d["battery_grid_charge_power_w"]) + max(0., pv - load),
                             ))
                             if requested_power is None or requested_power <= 0:
@@ -718,7 +820,7 @@ class BatteryControlMixin:
                     raise
                 except Exception as err:
                     _LOGGER.warning("Battery start/confirmation failed: %s", err)
-                    self._battery_retry_after = now + timedelta(minutes=5)
+                    self._delay_battery_restart(dt_util.utcnow() + timedelta(minutes=5))
                     await release_control("charge_unconfirmed")
                 return
             if action == "hold" and self._battery_hold_ctl is not None:
@@ -749,7 +851,7 @@ class BatteryControlMixin:
                             await release_control("request_changed")
                             return
                         await self._release_solar_charge_cap()
-                        refreshed = self._battery_action_after_wait("hold", tariff_info, power_state)
+                        refreshed = await self._battery_action_after_wait("hold", tariff_info, power_state)
                         if refreshed is None:
                             await release_control("planning_input_changed")
                             return
@@ -761,7 +863,7 @@ class BatteryControlMixin:
                             return
                         await self._battery_hold_ctl.engage(0)
                         self._battery_hold_engaged = True
-                    refreshed = self._battery_action_after_wait("hold", tariff_info, power_state)
+                    refreshed = await self._battery_action_after_wait("hold", tariff_info, power_state)
                     if refreshed is None:
                         await release_control("planning_input_changed")
                         return
@@ -784,16 +886,16 @@ class BatteryControlMixin:
                     await release_control("hold_unconfirmed")
                 return
             released = await self._release_battery_locked(
-                "target_reached" if soc >= target else "self_consumption",
+                "restart_delay" if restart_waiting else "target_reached" if soc >= target else "self_consumption",
                 release_discharge=self._shared_discharge_mapping() is None,
             )
             if released and d.get("auto_battery_grid_charge"):
                 self._battery_control_state = "self_consumption"
 
-    def _battery_action_after_wait(self, action, tariff_info, power_state):
+    async def _battery_action_after_wait(self, action, tariff_info, power_state):
         """Revalidate inputs after asynchronous preparation before a new write."""
         try:
-            reason = self._refresh_battery_grid_plan(tariff_info, power_state)
+            reason = await self._async_refresh_battery_grid_plan(tariff_info, power_state)
             slot = self._current_battery_slot()
             if not reason and slot is not None and slot.action == action:
                 return slot
@@ -891,7 +993,7 @@ class BatteryControlMixin:
             raise ValueError("Unsupported discharge power unit")
         return 1000. if unit == "kW" else 1.
 
-    def _numeric_hold_still_requested(self):
+    async def _numeric_hold_still_requested(self):
         if (not self._uses_shared_numeric_hold() or not self._battery_numeric_hold_requested
                 or not self.enabled or self._battery_unloading
                 or self.force_charge or self._battery_numeric_hold_deadline is None
@@ -903,7 +1005,7 @@ class BatteryControlMixin:
                                              max_age=data.get("battery_input_max_age_seconds", 300))
             if watts is None or watts < 0:
                 return False
-        slot = self._battery_action_after_wait("hold", self._latest_tariff, self._latest_power_state)
+        slot = await self._battery_action_after_wait("hold", self._latest_tariff, self._latest_power_state)
         if slot is None:
             return False
         self._battery_numeric_hold_deadline = min(
@@ -968,7 +1070,7 @@ class BatteryControlMixin:
                 # An invalidated economic hold hands directly to the ordinary
                 # consumer cap on the second pass, without a default-power pulse.
                 for _ in range(2):
-                    requested_hold = self._numeric_hold_still_requested()
+                    requested_hold = await self._numeric_hold_still_requested()
                     if not requested_hold:
                         self._battery_numeric_hold_requested = False
                     if requested_hold and (not minimum <= hold <= maximum
@@ -996,7 +1098,7 @@ class BatteryControlMixin:
                             if requested_hold:
                                 if not self._battery_hold_engaged:
                                     await self._release_solar_charge_cap()
-                                if not self._numeric_hold_still_requested():
+                                if not await self._numeric_hold_still_requested():
                                     self._battery_numeric_hold_requested = False
                                     continue
                             await controller.engage(0)
@@ -1021,7 +1123,7 @@ class BatteryControlMixin:
                     if not self.enabled or self._battery_unloading:
                         await self._release_battery_locked("request_changed")
                         return
-                    if requested_hold and not self._numeric_hold_still_requested():
+                    if requested_hold and not await self._numeric_hold_still_requested():
                         self._battery_numeric_hold_requested = False
                         continue
                     break
@@ -1064,6 +1166,8 @@ class BatteryControlMixin:
                 self._cancel_battery_watchdog()
                 generation = self._battery_watchdog_generation
                 async def handoff():
+                    if generation == self._battery_watchdog_generation:
+                        self._interrupt_battery_planning()
                     async with self._battery_lock:
                         if (generation != self._battery_watchdog_generation
                                 or self._battery_numeric_hold_deadline != end or dt_util.utcnow() < end):
@@ -1211,11 +1315,15 @@ class BatteryControlMixin:
         self._battery_load_sources = None
         self._battery_observed_load_until = None
         self._battery_observed_load_floor = 0.
+        self._battery_observed_load_horizon = None
+        self._battery_observed_load_reported_at = None
+        self._battery_observed_house_runs = ()
+        self._battery_observed_house_until = None
 
     def _battery_load_context(self, now, tariff, profile):
         """Project observed major loads without adding household history twice.
 
-        Unmapped house demand uses a recent mean for the thirty-minute outlook.
+        Unmapped demand earns a two-to-thirty-minute outlook from its duration.
         A higher raw reading has a separate sixty-second observation window.
         Managed metered runs can extend to a known policy boundary. EV demand is
         separate because it was excluded when learning the household profile.
@@ -1240,6 +1348,7 @@ class BatteryControlMixin:
         metered_house = 0.0
         ev_runs = []
         house_runs = []
+        unbounded_house = []
         limited_runs = []
         signature = []
         sources = []
@@ -1341,6 +1450,8 @@ class BatteryControlMixin:
                     ev_runs.append(BatteryLoadCommitment(now, end, projected_w, limit))
             elif end is not None:
                 house_runs.append((end, projected_w))
+            else:
+                unbounded_house.append((appliance_id, watts))
             if not is_ev and limit is not None:
                 limited_runs.append((appliance_id, end, limit, funding_end))
                 if funding_end is not None and end is not None and funding_end < end and after_limit is not None:
@@ -1360,27 +1471,61 @@ class BatteryControlMixin:
         try:
             background = self._battery_recent_house_load.observe(
                 reported_at, unmetered_base, min(unmetered_base, profile[now.hour]),
+                reference_watts=max(0., profile[now.hour] - metered_house),
             )
         except ValueError:
             return invalid("load_power_missing_or_stale")
         observed_floor = max(0., round((metered_house + background) / 100) * 100.)
         raw_floor = max(0., round(observed_house / 100) * 100.)
-        short_end = reported_at.astimezone(timezone.utc) + timedelta(seconds=60)
+        reported_at = reported_at.astimezone(timezone.utc)
+        # A separately metered run keeps its existing immediate outlook even
+        # when policy supplies no exact stop. Unknown background has its own
+        # shorter horizon and cannot extend through this measured-load path.
+        known_power = max(0., round(sum(watts for _, watts in unbounded_house) / 100) * 100.)
+        known_signature = (tuple(app_id for app_id, _ in unbounded_house), known_power) if known_power else ()
+        known_until = self._battery_observed_house_until
+        if known_signature:
+            if (known_until is None or known_until <= now
+                    or known_signature != self._battery_observed_house_runs):
+                known_until = reported_at + timedelta(minutes=30)
+            if known_until > now:
+                house_runs.append((known_until, known_power))
+                assumptions.add("observed_metered_household_30_minute_persistence")
+        else:
+            known_until = None
+        self._battery_observed_house_until = known_until
+        self._battery_observed_house_runs = known_signature
+        short_end = reported_at + timedelta(seconds=60)
         # Avoid replan-only boundaries hidden below the household profile, but
         # retain a raw observation that crosses into a lower local-hour profile.
         short_profile = min(profile[now.hour], profile[(short_end - timedelta(microseconds=1)).astimezone(now.tzinfo).hour])
         short_active = raw_floor > max(observed_floor, short_profile) and short_end > now
-        floor_active = observed_floor > profile[now.hour]
+        # Metered runs get their total floor below, respecting each real end.
+        floor_active = not house_runs and observed_floor > profile[now.hour]
         floor_level = observed_floor if floor_active else 0.
+        reference = self._battery_recent_house_load.background_reference_watts
+        horizon_seconds = self._battery_recent_house_load.persistence_seconds
+        background_active = bool(house_runs) and round(background / 100) > round(reference / 100)
+        projection_active = floor_active or background_active
         unknown_limits = tuple((app_id, limit, funding_end) for app_id, end, limit, funding_end in limited_runs if end is None)
         until = self._battery_observed_load_until
-        if floor_active:
-            if until is None or until <= now or floor_level > self._battery_observed_load_floor:
-                until = now.astimezone(timezone.utc) + timedelta(minutes=30)
+        previous_report = self._battery_observed_load_reported_at
+        fresh_report = previous_report is None or reported_at != previous_report
+        if previous_report is not None and reported_at < previous_report:
+            until = None
+        projection_level = max(floor_level, round(background / 100) * 100. if background_active else 0.)
+        if projection_active:
+            if fresh_report and (until is None or until <= now
+                                 or projection_level > self._battery_observed_load_floor
+                                 or horizon_seconds != self._battery_observed_load_horizon):
+                until = reported_at + timedelta(seconds=horizon_seconds)
         else:
             until = None
         self._battery_observed_load_until = until
-        self._battery_observed_load_floor = floor_level
+        self._battery_observed_load_floor = projection_level
+        self._battery_observed_load_horizon = horizon_seconds
+        self._battery_observed_load_reported_at = reported_at
+        projection_current = until is not None and until > now
         limit_until = self._battery_observed_limits_until
         if unknown_limits:
             if limit_until is None or limit_until <= now or unknown_limits != self._battery_observed_limits:
@@ -1395,9 +1540,10 @@ class BatteryControlMixin:
             if funding_end is not None:
                 limit_end = min(limit_end, funding_end)
             commitments.append(BatteryLoadCommitment(now, limit_end, 0., limit))
-        if floor_active:
+        if floor_active and projection_current:
             commitments.append(BatteryLoadCommitment(now, until, 0., household_power_floor_w=observed_floor))
-            assumptions.add("recent_household_mean_30_minute_persistence")
+        if projection_current:
+            assumptions.add("recent_household_mean_adaptive_persistence")
         if short_active:
             commitments.append(BatteryLoadCommitment(now, short_end, 0., household_power_floor_w=raw_floor))
             assumptions.add("observed_household_60_second_persistence")
@@ -1407,33 +1553,39 @@ class BatteryControlMixin:
         # floor. Taking max(profile, floor) keeps their historical contribution
         # from being charged twice. Unmapped excess is not projected all day.
         boundaries = {now, *(end for end, _ in house_runs)}
+        if background_active and projection_current:
+            boundaries.add(until)
         hour = now.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc) + timedelta(hours=1)
         last = max(boundaries)
+        if projection_current and until < last:
+            boundaries.add(until)
         while hour < last:
             boundaries.add(hour)
             hour += timedelta(hours=1)
         boundaries = sorted(boundaries)
         for left, right in zip(boundaries, boundaries[1:]):
             active_w = sum(watts for end, watts in house_runs if end > left)
-            floor = active_w + min(background, profile[left.astimezone(now.tzinfo).hour])
+            projected_background = (background if projection_current and left < until
+                                    else min(reference, profile[left.astimezone(now.tzinfo).hour]))
+            floor = active_w + projected_background
             commitments.append(BatteryLoadCommitment(left, right, 0., household_power_floor_w=floor))
         self._battery_load_commitments = tuple(commitments)
         self._battery_load_assumptions = tuple(sorted(assumptions))
-        base_key = round(background / 100) * 100. if house_runs else None
+        base_key = (round(background / 100) * 100., round(reference / 100) * 100.) if house_runs else None
         short_key = (raw_floor, short_end) if short_active else None
-        key = (tuple(signature), observed_floor if until is not None else None, until,
-               cap, base_key, short_key, limit_until)
+        key = (tuple(signature), observed_floor if projection_current else None, until if projection_current else None,
+               cap, base_key, short_key, limit_until, known_until)
         return self._battery_load_commitments, key, None
 
-    def _refresh_battery_grid_plan(self, tariff_info, power_state):
+    def _battery_planning_request(self, tariff_info, power_state):
         """Validate observations before passing immutable inputs to pure planning."""
-        from .battery_planner import BatteryPlanningConfig, build_battery_grid_plan
+        from .battery_planner import BatteryPlanningConfig
         d = self.config_entry.data
         factor = d.get(CONF_BATTERY_PV_FORECAST_FACTOR, DEFAULT_BATTERY_PV_FORECAST_FACTOR)
         if (isinstance(factor, bool) or not isinstance(factor, (int, float))
                 or not math.isfinite(factor) or not .1 <= factor <= 1.):
             self._battery_grid_plan = None
-            return "invalid_pv_forecast_factor"
+            return "invalid_pv_forecast_factor", None
         age = d.get("battery_input_max_age_seconds", 300)
         # Use the live State object: REST serialization can cache old report
         # timestamps for unchanged zero readings even while polls keep arriving.
@@ -1443,87 +1595,196 @@ class BatteryControlMixin:
                 self._battery_grid_plan = None
                 if key == "load_power":
                     self._reset_battery_load_forecast()
-                return f"{key}_missing_or_stale"
+                return f"{key}_missing_or_stale", None
         if tariff_info is None or _finite(tariff_info.current_price) is None:
             self._battery_grid_plan = None
-            return "price_unavailable"
+            return "price_unavailable", None
+        raw_price_limit = d.get("battery_charge_price_threshold", tariff_info.battery_charge_price_threshold)
+        price_limit = _finite(raw_price_limit)
+        if isinstance(raw_price_limit, bool) or price_limit is None:
+            self._battery_grid_plan = None
+            return "invalid_charge_price_limit", None
         source = self.hass.states.get(d.get("price_sensor"))
         if not isinstance(source, State) or self._battery_read_number(
             d.get("price_sensor"), max_age=max(3900, d.get("battery_forecast_max_age_seconds", 21600)),
         ) is None:
             self._battery_grid_plan = None
-            return "price_missing_or_stale"
+            return "price_missing_or_stale", None
         if abs(float(source.state) - tariff_info.current_price) > .00001:
-            return "price_snapshot_changed"
+            return "price_snapshot_changed", None
         now = dt_util.now()
         price_now = [w for w in tariff_info.windows if w.start <= now < w.end]
         if (len(price_now) != 1
                 or abs(price_now[0].price - tariff_info.current_price) > _FOUR_DECIMAL_PRICE_TOLERANCE):
             self._battery_grid_plan = None
-            return "price_window_mismatch"
+            return "price_window_mismatch", None
         forecast = getattr(self, "_forecast_data", None)
         if forecast is None or not forecast.hourly_breakdown:
             self._battery_grid_plan = None
-            return "forecast_unavailable"
+            return "forecast_unavailable", None
         sources = [*getattr(self, "_forecast_entities", []), *getattr(self, "_forecast_tomorrow_entities", [])]
         if not sources:
-            return "forecast_unavailable"
+            return "forecast_unavailable", None
         for entity_id in sources:
             state = self.hass.states.get(entity_id)
             if not isinstance(state, State) or state.state in ("unknown", "unavailable"):
-                return "forecast_unavailable"
+                return "forecast_unavailable", None
             stamp = getattr(state, "last_reported", None) or state.last_updated
             if not -5 <= (dt_util.utcnow() - stamp).total_seconds() <= d.get("battery_forecast_max_age_seconds", 21600):
-                return "forecast_stale"
+                return "forecast_stale", None
         profile = self._battery_load_profile()
         if profile is None:
             self._battery_grid_plan = None
-            return "household_profile_incomplete"
+            return "household_profile_incomplete", None
         commitments, load_key, load_error = self._battery_load_context(now, tariff_info, profile)
         if load_error:
             self._battery_grid_plan = None
-            return load_error
+            return load_error, None
         charge_constraints = self._battery_charge_power_constraints()
         if charge_constraints is None:
             self._battery_grid_plan = None
-            return "invalid_charge_power_constraints"
+            return "invalid_charge_power_constraints", None
         soc = self._battery_soc_now()
+        if soc is None:
+            return "soc_missing_or_stale", None
         hold = bool(self._battery_hold_ctl and self._battery_hold_ctl.confirmation_level == "physical")
+        restart_delay = d.get("grid_charge_engage_min_duration_minutes", 5)
+        restart_at = self._battery_retry_after
+        if restart_at is not None and restart_at <= dt_util.utcnow():
+            restart_at = None
         # Keep the chosen slot target stable between planner runs; re-evaluate
         # immediately when any tariff/forecast/configuration input changes.
         key = (tuple((w.start, w.end, w.price) for w in tariff_info.windows),
                tuple((f.start, f.end, f.expected_kwh) for f in forecast.hourly_breakdown),
-               hold, load_key, charge_constraints,
+               hold, load_key, charge_constraints, restart_delay, restart_at,
                tuple((k, repr(v)) for k, v in sorted(d.items()) if k.startswith("battery_") or k == "min_battery_soc"),
-               tariff_info.battery_charge_price_threshold)
-        slot = self._current_battery_slot()
-        stale = self._battery_plan_created is None or (now - self._battery_plan_created).total_seconds() >= 300
-        if key != self._battery_plan_key or slot is None or stale:
-            config = BatteryPlanningConfig(
-                capacity_kwh=d.get("battery_capacity", 0), reserve_soc=d.get("min_battery_soc", 10),
-                grid_target_soc=d.get("battery_grid_target_soc", 80),
-                max_charge_power_w=d.get("battery_grid_charge_power_w", 0),
-                max_pv_charge_power_w=d.get("battery_max_charge_power_w"),
-                max_discharge_power_w=d.get("battery_max_discharge_default", d.get("battery_grid_charge_power_w", 0)),
-                roundtrip_efficiency=d.get("battery_roundtrip_efficiency", .85),
-                wear_cost_per_kwh=d.get("battery_wear_cost_per_kwh", 0),
-                charge_price_limit=tariff_info.battery_charge_price_threshold, hold_supported=hold,
-                forced_charge_min_power_w=charge_constraints[0],
-                forced_charge_max_power_w=charge_constraints[1],
-                forced_charge_power_step_w=charge_constraints[2],
-            )
-            # Calibration belongs to grid-purchase planning only. The shared
-            # provider forecast still drives independent solar/appliance plans.
-            grid_forecast = [replace(row, expected_kwh=row.expected_kwh * factor,
-                                     expected_watts=row.expected_watts * factor)
-                             for row in forecast.hourly_breakdown]
-            self._battery_grid_plan = build_battery_grid_plan(
-                now, soc, tariff_info.windows, grid_forecast, profile, config,
-                load_commitments=commitments,
-            )
-            self._battery_plan_key = key
-            self._battery_plan_created = now
+               price_limit)
+        config = BatteryPlanningConfig(
+            capacity_kwh=d.get("battery_capacity", 0), reserve_soc=d.get("min_battery_soc", 10),
+            grid_target_soc=d.get("battery_grid_target_soc", 80),
+            max_charge_power_w=d.get("battery_grid_charge_power_w", 0),
+            max_pv_charge_power_w=d.get("battery_max_charge_power_w"),
+            max_discharge_power_w=d.get("battery_max_discharge_default", d.get("battery_grid_charge_power_w", 0)),
+            roundtrip_efficiency=d.get("battery_roundtrip_efficiency", .85),
+            wear_cost_per_kwh=d.get("battery_wear_cost_per_kwh", 0),
+            charge_price_limit=price_limit, hold_supported=hold,
+            forced_charge_min_power_w=charge_constraints[0],
+            forced_charge_max_power_w=charge_constraints[1],
+            forced_charge_power_step_w=charge_constraints[2],
+            grid_restart_delay_minutes=restart_delay,
+            grid_charge_not_before=restart_at,
+            grid_charge_active=bool(self._grid_charge_engaged),
+        )
+        # Calibration belongs to grid-purchase planning only. The shared
+        # provider forecast still drives independent solar/appliance plans.
+        grid_forecast = [replace(row, expected_kwh=row.expected_kwh * factor,
+                                 expected_watts=row.expected_watts * factor)
+                         for row in forecast.hourly_breakdown]
+        return None, _BatteryPlanningRequest(
+            key, now, soc, tuple(tariff_info.windows), tuple(grid_forecast),
+            tuple(profile), config, tuple(commitments),
+        )
+
+    def _battery_plan_needs_refresh(self, request):
+        stale = (self._battery_plan_created is None
+                 or (request.now - self._battery_plan_created).total_seconds() >= 300)
+        return request.key != self._battery_plan_key or self._current_battery_slot() is None or stale
+
+    def _commit_battery_grid_plan(self, request, plan):
+        self._battery_grid_plan = plan
+        self._battery_plan_key = request.key
+        self._battery_plan_created = request.now
+        return None if plan.valid else plan.reason
+
+    def _interrupt_battery_planning(self):
+        """Release the safety lock without waiting for a detached CPU search."""
+        if self._battery_planning_abort is not None:
+            self._battery_planning_abort.set()
+
+    async def _build_battery_plan_async(self, request):
+        """An owned stop interrupts waiting; an abandoned worker has no HA state."""
+        aborted = asyncio.Event()
+        self._battery_planning_abort = aborted
+        pending = []
+        try:
+            worker = asyncio.ensure_future(self.hass.async_add_executor_job(request.build))
+            stop = asyncio.create_task(aborted.wait())
+            pending = [worker, stop]
+            await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if aborted.is_set():
+                return None
+            return await worker
+        finally:
+            if self._battery_planning_abort is aborted:
+                self._battery_planning_abort = None
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    def _refresh_battery_grid_plan(self, tariff_info, power_state):
+        """Synchronous helper for offline analysis; runtime uses the executor."""
+        reason, request = self._battery_planning_request(tariff_info, power_state)
+        if reason:
+            return reason
+        if self._battery_plan_needs_refresh(request):
+            return self._commit_battery_grid_plan(request, request.build())
         return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason
+
+    def _automatic_battery_planning_requested(self):
+        return (self.enabled and not self._battery_unloading and not self.force_charge
+                and self._battery_storage_ready and not self._battery_recovery
+                and self.config_entry.data.get("auto_battery_grid_charge")
+                and self.config_entry.data.get("allow_grid_charging"))
+
+    async def _async_refresh_battery_grid_plan(self, tariff_info, power_state):
+        """Yield expensive searches, committing only still-current input data."""
+        def reject(reason):
+            self._battery_grid_plan = None
+            self._battery_plan_key = None
+            return reason
+
+        try:
+            for _ in range(2):
+                if not self._automatic_battery_planning_requested():
+                    return reject("request_changed")
+                # The coordinator may publish a newer provider snapshot while
+                # this request waits. Follow-up validation must not revert it.
+                if self._latest_tariff is not None:
+                    tariff_info = self._latest_tariff
+                reason, request = self._battery_planning_request(tariff_info, power_state)
+                if reason:
+                    return reject(reason)
+                if not self._battery_plan_needs_refresh(request):
+                    return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason
+                latest_tariff = self._latest_tariff
+                plan = await self._build_battery_plan_async(request)
+                if plan is None:
+                    return reject("planning_interrupted")
+                if not self._automatic_battery_planning_requested():
+                    return reject("request_changed")
+                if self._latest_tariff is not latest_tariff and self._latest_tariff is not None:
+                    tariff_info = self._latest_tariff
+                reason, current = self._battery_planning_request(tariff_info, power_state)
+                if reason:
+                    return reject(reason)
+                covers_now = (not plan.valid or (plan.slots and
+                              plan.slots[0].start <= dt_util.utcnow() < plan.slots[0].end))
+                if current.inputs == request.inputs and covers_now:
+                    return self._commit_battery_grid_plan(request, plan)
+                reject("planning_input_changed")
+            return reject("planning_input_changed")
+        except asyncio.CancelledError:
+            reject("planning_cancelled")
+            if (self._grid_charge_cleanup_pending or self._battery_hold_cleanup_pending
+                    or self._battery_discharge_cleanup_pending):
+                self._battery_recovery = True
+                self._arm_battery_watchdog(dt_util.utcnow())
+            raise
+        except Exception:
+            _LOGGER.exception("Battery planning failed; owned controls must release")
+            return reject("planning_failed")
 
     def _observe_battery_load(self):
         """Learn non-EV household watts by local hour; never learn missing as zero."""
@@ -1613,6 +1874,9 @@ class BatteryControlMixin:
         return {
             "battery_control_state": self._battery_control_state,
             "battery_control_reason": self._battery_control_reason,
+            "battery_restart_available_at": (self._battery_retry_after.isoformat()
+                                             if self._battery_retry_after is not None
+                                             and self._battery_retry_after > dt_util.utcnow() else None),
             "battery_grid_charge_observed_power_w": round(measured_flow[0], 1) if measured_flow else None,
             "battery_charge_cleanup_pending": self._grid_charge_cleanup_pending,
             "battery_hold_cleanup_pending": self._battery_hold_cleanup_pending,

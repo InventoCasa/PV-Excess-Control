@@ -283,6 +283,9 @@ async def test_failed_stop_delivery_does_not_block_future_episodes(charging_case
         coord.hass.services.async_call.side_effect = None
         coord.notifications._rate_limit_seconds = 0
         await cycle(30, charge=2000, export=0)
+        assert not coord._grid_charge_engaged
+        # A failed notification does not bypass the confirmed stop's delay.
+        await cycle(300, charge=2000, export=0)
         await cycle(30, charge=2000, export=0)
         assert len(messages()) == 3
         assert "started" in messages()[-1]

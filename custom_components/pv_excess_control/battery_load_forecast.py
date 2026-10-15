@@ -11,6 +11,12 @@ class RecentHouseholdLoad:
     fills the unobserved portion during warm-up; duplicate timestamps add no
     information. Callers must reset on missing inputs or changed meter mappings.
     This estimate is for forecasting, never for real-time safety or accounting.
+
+    Excess demand earns a two, five, ten or thirty minute forecast after the
+    corresponding observed duration (two minutes is the initial bound). A
+    background increase needs thirty minutes before it can support the longer
+    outlook of a separately metered run. That reference falls with the recent
+    mean, and the caller still caps it by each future hour's learned profile.
     """
 
     WINDOW_SECONDS = 120.0
@@ -21,19 +27,40 @@ class RecentHouseholdLoad:
         self._last_watts = 0.0
         self._prior_watts = 0.0
         self._estimate = 0.0
+        self._background_reference = 0.0
+        self._background_since: datetime | None = None
+        self._excess_since: datetime | None = None
+        self._persistence_seconds = self.WINDOW_SECONDS
+
+    @property
+    def persistence_seconds(self) -> float:
+        """Forecast duration earned by distinct observations, bounded to 30 min."""
+        return self._persistence_seconds
+
+    @property
+    def background_reference_watts(self) -> float:
+        """Established background for bounded known runs after the excess ends."""
+        return self._background_reference
 
     def reset(self) -> None:
         """Discard history that no longer describes the current input source."""
         self._segments.clear()
         self._last_at = None
         self._last_watts = self._prior_watts = self._estimate = 0.0
+        self._background_reference = 0.0
+        self._background_since = self._excess_since = None
+        self._persistence_seconds = self.WINDOW_SECONDS
 
-    def observe(self, observed_at: datetime, watts: float, prior_watts: float) -> float:
+    def observe(self, observed_at: datetime, watts: float, prior_watts: float,
+                *, reference_watts: float | None = None) -> float:
         """Return the estimate at a real report's timestamp, normalized to UTC.
 
         Gaps exceeding the window or backwards timestamps start a fresh warm-up.
         Invalid data clears history and raises instead of inventing a zero load.
+        ``reference_watts`` is the hourly profile allowance for this unknown
+        component; it stays separate from the established background reference.
         """
+        reference_watts = prior_watts if reference_watts is None else reference_watts
         if (
             not isinstance(observed_at, datetime)
             or observed_at.tzinfo is None
@@ -43,7 +70,7 @@ class RecentHouseholdLoad:
                 or not isinstance(value, (int, float))
                 or not isfinite(value)
                 or value < 0
-                for value in (watts, prior_watts)
+                for value in (watts, prior_watts, reference_watts)
             )
         ):
             self.reset()
@@ -59,8 +86,10 @@ class RecentHouseholdLoad:
             self._last_at = observed_at
             self._last_watts = float(watts)
             self._prior_watts = self._estimate = float(prior_watts)
+            self._background_reference = self._estimate
             return self._estimate
 
+        previous_at = self._last_at
         start = self._last_at
         if self._segments and self._segments[-1][2] == self._last_watts:
             start, _, _ = self._segments.pop()
@@ -76,5 +105,28 @@ class RecentHouseholdLoad:
             watt_seconds += load * duration
         watt_seconds += max(0.0, self.WINDOW_SECONDS - known_seconds) * self._prior_watts
         self._estimate = watt_seconds / self.WINDOW_SECONDS
+        # A lower recent mean reduces the reference without discarding energy
+        # from duty-cycle loads. Only sustained observations can raise it.
+        self._background_reference = min(self._background_reference, self._estimate)
+        for attribute, reference in (
+            ("_background_since", self._background_reference),
+            ("_excess_since", reference_watts),
+        ):
+            if round(self._estimate / 100) > round(reference / 100):
+                if getattr(self, attribute) is None:
+                    setattr(self, attribute, previous_at)
+            else:
+                setattr(self, attribute, None)
+        starts = [stamp for stamp in (self._background_since, self._excess_since)
+                  if stamp is not None]
+        duration = (observed_at - min(starts)).total_seconds() if starts else 0.
+        self._persistence_seconds = next(
+            (seconds for seconds in (1800., 600., 300.) if duration >= seconds),
+            self.WINDOW_SECONDS,
+        )
+        if (self._background_since is not None
+                and (observed_at - self._background_since).total_seconds() >= 1800):
+            self._background_reference = self._estimate
+            self._background_since = None
         self._last_at, self._last_watts = observed_at, float(watts)
         return self._estimate

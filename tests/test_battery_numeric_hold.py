@@ -28,7 +28,7 @@ def numeric_case(economic_case, monkeypatch):
     )
     case.coord._battery_hold_ctl = MagicMock(config=config, confirmation_level="physical")
     case.coord.config_entry.data["battery_hold_verified"] = True
-    case.coord._battery_action_after_wait = MagicMock(side_effect=lambda *_:
+    case.coord._battery_action_after_wait = AsyncMock(side_effect=lambda *_:
         SimpleNamespace(action="hold", end=case.coord._battery_numeric_hold_deadline))
     case.reading("input_number.discharge", 5000, min=10, max=5000, step=10, unit_of_measurement="W")
     case.reading("sensor.discharge_limit", 5000, unit_of_measurement="W")

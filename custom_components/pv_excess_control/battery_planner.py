@@ -7,7 +7,8 @@ The result is an approximate economic schedule, not a guarantee about forecasts.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from bisect import bisect_left
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from itertools import chain
 import math
@@ -20,6 +21,7 @@ _ECONOMIC_TIE_EPS = 1e-9
 # Additional search work is deterministic and cannot displace a completed plan
 # with a partially explored trajectory when this budget is exhausted.
 _REFINEMENT_TRANSITION_BUDGET = 100_000
+_QUANTITY_REFINEMENT_TRANSITION_BUDGET = 100_000
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,10 @@ class BatteryPlanningConfig:
     ``max_charge_power_w`` limits additional grid purchases. The optional
     ``max_pv_charge_power_w`` is the native/shared battery charge limit for all
     sources; when omitted, the same limit applies to both for compatibility.
+    The restart delay is an off-time after a grid-charge stop, never a minimum
+    on-time. An aware ``grid_charge_not_before`` carries existing restart
+    eligibility; ``grid_charge_active`` allows an already running charge to
+    continue. Defaults preserve callers that do not provide runtime state.
     """
 
     capacity_kwh: float
@@ -67,6 +73,9 @@ class BatteryPlanningConfig:
     forced_charge_min_power_w: float | None = None
     forced_charge_max_power_w: float | None = None
     forced_charge_power_step_w: float | None = None
+    grid_restart_delay_minutes: float = 0.0
+    grid_charge_not_before: datetime | None = None
+    grid_charge_active: bool = False
 
     @property
     def native_charge_power_w(self) -> float:
@@ -152,6 +161,8 @@ class _Node:
     previous: _Node | None
     slot: BatteryGridSlot | None
     charge_moment: float = 0.0
+    charge_active: bool = False
+    charge_not_before: datetime | None = None
 
 
 def _prefer_economic_node(candidate: _Node, previous: _Node) -> bool:
@@ -186,6 +197,7 @@ def _validate_config(config: BatteryPlanningConfig, soc: float | None) -> None:
         config.roundtrip_efficiency, config.wear_cost_per_kwh,
         config.charge_price_limit, config.horizon_hours, config.energy_step_kwh,
         config.native_charge_power_w,
+        config.grid_restart_delay_minutes,
     )
     if not all(_finite(value) for value in values):
         raise ValueError("invalid_configuration")
@@ -199,8 +211,12 @@ def _validate_config(config: BatteryPlanningConfig, soc: float | None) -> None:
         and config.wear_cost_per_kwh >= 0
         and 0 < config.horizon_hours <= 48
         and config.energy_step_kwh > 0
+        and 0 <= config.grid_restart_delay_minutes <= 60
+        and isinstance(config.grid_charge_active, bool)
     ):
         raise ValueError("invalid_configuration")
+    if config.grid_charge_not_before is not None:
+        _utc(config.grid_charge_not_before)
     minimum = config.forced_charge_min_power_w
     maximum = config.forced_charge_max_power_w
     step = config.forced_charge_power_step_w
@@ -219,6 +235,7 @@ def _timeline(
     load_w: list[float],
     horizon_hours: float,
     load_commitments: tuple[BatteryLoadCommitment, ...] = (),
+    *, grid_charge_not_before: datetime | None = None,
 ) -> list[_Interval]:
     start = _utc(now)
     if len(load_w) != 24 or not all(_finite(value) and value >= 0 for value in load_w):
@@ -231,6 +248,12 @@ def _timeline(
     if end <= start:
         raise ValueError("missing_future_data")
     boundaries = {start, end}
+    protected_boundaries = {start, end}
+    if grid_charge_not_before is not None:
+        eligible = _utc(grid_charge_not_before)
+        if start < eligible < end:
+            boundaries.add(eligible)
+            protected_boundaries.add(eligible)
     commitments = []
     for row in load_commitments:
         row_start, row_end = _utc(row.start), _utc(row.end)
@@ -260,6 +283,7 @@ def _timeline(
                 raise ValueError(f"{kind}_gap_or_overlap")
             cursor = clipped_end
             boundaries.update((clipped_start, clipped_end))
+            protected_boundaries.update((clipped_start, clipped_end))
         if cursor != end:
             raise ValueError(f"missing_{kind}_coverage")
         normalized.append(relevant)
@@ -270,6 +294,7 @@ def _timeline(
     while hour < end:
         if hour > start:
             boundaries.add(hour)
+            protected_boundaries.add(hour)
         hour += timedelta(hours=1)
     points = sorted(boundaries)
     if len(points) > 289:
@@ -291,13 +316,39 @@ def _timeline(
         caps = [row[3] for row in active if row[3] is not None]
         floors = [row[4] for row in active if row[4] is not None]
         household_power = max(load_w[left.astimezone(now.tzinfo).hour], max(floors, default=0))
-        result.append(_Interval(
+        interval = _Interval(
             left, right, prices[pi][2], pv - reserved_pv,
             household_power * duration / 3_600_000,
             reserved_pv, min(caps) if caps else None, external_load,
             (left - start).total_seconds() / 3600,
-        ))
+        )
+        # Only load metadata may introduce removable boundaries. Price, solar,
+        # local-hour and restart-eligibility edges remain authoritative even
+        # when their adjacent numeric values happen to match.
+        if (result and left not in protected_boundaries
+                and _same_physical_rates(result[-1], interval)):
+            previous = result[-1]
+            result[-1] = replace(
+                previous, end=right, pv=previous.pv + interval.pv,
+                load=previous.load + interval.load,
+                reserved_pv=previous.reserved_pv + interval.reserved_pv,
+                external_load=previous.external_load + interval.external_load,
+            )
+        else:
+            result.append(interval)
     return result
+
+
+def _same_physical_rates(left: _Interval, right: _Interval) -> bool:
+    """Ignore only duration arithmetic noise, never a genuine load/cap change."""
+    return (
+        left.price == right.price
+        and left.max_discharge_power_w == right.max_discharge_power_w
+        and all(math.isclose(a / left.hours, b / right.hours, rel_tol=1e-12, abs_tol=1e-12)
+                for a, b in ((left.pv, right.pv), (left.load, right.load),
+                             (left.reserved_pv, right.reserved_pv),
+                             (left.external_load, right.external_load)))
+    )
 
 
 def _transition(
@@ -326,9 +377,16 @@ def _transition(
         grid_charge, solar_stored / efficiency, discharge, energy / capacity * 100, action,
         interval.reserved_pv, interval.external_load,
     )
+    not_before = node.charge_not_before
+    if node.charge_active and action != "charge" and config.grid_restart_delay_minutes:
+        stopped_until = interval.start + timedelta(minutes=config.grid_restart_delay_minutes)
+        not_before = max(not_before, stopped_until) if not_before is not None else stopped_until
+    if not_before is not None and not_before <= interval.end:
+        not_before = None
     return _Node(
         energy, node.cost + cost, node.grid_energy + grid_charge, node, slot,
         node.charge_moment + grid_charge * interval.elapsed_hours,
+        action == "charge", not_before,
     ), solar_stored
 
 
@@ -370,22 +428,36 @@ def _search_schedule(
     """Search one bounded grouping of exact energy states, or abandon it."""
     attempts = 0
     states = {(round(initial.energy / bucket_step), 0): initial}
+    starts = [interval.start for interval in timeline]
+    restart_delay = timedelta(minutes=config.grid_restart_delay_minutes)
+    short_intervals = [interval.end - interval.start < restart_delay for interval in timeline]
     grid_ceiling = config.capacity_kwh * config.grid_target_soc / 100
     for i, interval in enumerate(timeline):
-        following: dict[tuple[int, int], _Node] = {}
+        following: dict[tuple[int, int, bool, int], _Node] = {}
 
         def retain(candidate: _Node, solar: float) -> None:
             if candidate.energy > bounds[i + 1] + _EPS or solar + _EPS < baseline_solar[i]:
                 return
             bucket = round(candidate.energy / bucket_step)
-            key = (bucket, 0)
+            # Two equal-energy states are not interchangeable if one may keep
+            # charging or restart earlier. Deadlines with the same next usable
+            # interval are equivalent; expired deadlines collapse to one class.
+            # When the next entire interval already spans the off-delay, both
+            # states may charge immediately or stop for that interval and then
+            # restart. Keeping their active flags separate adds no capability.
+            active_matters = (candidate.charge_not_before is not None
+                              or (i + 1 < len(timeline) and short_intervals[i + 1]))
+            active = candidate.charge_active if active_matters else False
+            eligible = (bisect_left(starts, candidate.charge_not_before, lo=i + 1)
+                        if candidate.charge_not_before is not None else i + 1)
+            key = (bucket, 0, active, eligible)
             previous = following.get(key)
             if previous is None or _prefer_economic_node(candidate, previous):
                 following[key] = candidate
             # Preserve exact upper endpoints as well as the cheapest state in a
             # bucket. Otherwise a partial current slot or a precise demand gap
             # can lose its physically available last few Wh through pruning.
-            key = (bucket, 1)
+            key = (bucket, 1, active, eligible)
             previous = following.get(key)
             if (previous is None or candidate.energy > previous.energy
                     or (candidate.energy == previous.energy and _prefer_economic_node(candidate, previous))):
@@ -401,7 +473,9 @@ def _search_schedule(
             if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
                 retained, solar = _transition(interval, node, config, efficiency, "hold")
                 retain(retained, solar)
-            if interval.price > config.charge_price_limit:
+            if (interval.price > config.charge_price_limit
+                    or (not node.charge_active and node.charge_not_before is not None
+                        and interval.start < node.charge_not_before)):
                 continue
             held, solar = _transition(interval, node, config, efficiency, "hold")
             maximum_grid = min(
@@ -469,12 +543,19 @@ def build_battery_grid_plan(
     """
     try:
         _validate_config(config, soc)
-        timeline = _timeline(now, tariff_windows, forecast, hourly_load_w, config.horizon_hours, load_commitments)
+        timeline = _timeline(
+            now, tariff_windows, forecast, hourly_load_w, config.horizon_hours,
+            load_commitments, grid_charge_not_before=config.grid_charge_not_before,
+        )
     except (ValueError, TypeError, AttributeError) as exc:
         return BatteryGridPlan((), 0.0, 0.0, str(exc), 0.0, valid=False)
 
     efficiency = math.sqrt(config.roundtrip_efficiency)
-    initial = _Node(soc / 100 * config.capacity_kwh, 0.0, 0.0, None, None)
+    initial = _Node(
+        soc / 100 * config.capacity_kwh, 0.0, 0.0, None, None,
+        charge_active=config.grid_charge_active,
+        charge_not_before=_utc(config.grid_charge_not_before) if config.grid_charge_not_before is not None else None,
+    )
     baseline = initial
     baseline_solar = []
     for interval in timeline:
@@ -490,14 +571,18 @@ def build_battery_grid_plan(
         discharge = min(interval.deficit_kwh, interval.discharge_limit(config) * interval.hours / 1000) / efficiency
         bounds[i] = min(config.capacity_kwh, max(0.0, bounds[i + 1] + discharge - baseline_solar[i]))
 
-    # Refine storage-state grouping, not the charging quantities. This avoids
-    # introducing tiny purchases solely to imitate an unverified discharge hold.
+    # Keep both established searches and every completed incumbent. Smaller
+    # purchases are considered only with verified hold support, so they cannot
+    # introduce an unverified pseudo-hold through tiny forced-charge commands.
     step = max(config.energy_step_kwh, config.capacity_kwh / 200)
     best = baseline
-    for bucket_step, budget in ((step, None), (step / 2, _REFINEMENT_TRANSITION_BUDGET)):
+    searches = [(step, step, None), (step, step / 2, _REFINEMENT_TRANSITION_BUDGET)]
+    if config.hold_supported:
+        searches.append((step / 2, step / 2, _QUANTITY_REFINEMENT_TRANSITION_BUDGET))
+    for quantity_step, bucket_step, budget in searches:
         candidate = _search_schedule(
             timeline, config, efficiency, initial, baseline_solar, bounds,
-            step, bucket_step, transition_budget=budget,
+            quantity_step, bucket_step, transition_budget=budget,
         )
         if candidate is not None and _prefer_economic_node(candidate, best):
             best = candidate

@@ -40,7 +40,7 @@ def test_sustained_load_reaches_its_full_forecast_after_two_minutes(economic_cas
     assert floor_at(rows, later(case)) == 500
     for _ in range(4):
         rows, _, _ = sample(case, 4000, seconds=30)
-    assert floor_at(rows, later(case)) == 4000
+    assert floor_at(rows, later(case, 119)) == 4000
 
 
 def test_alternating_power_preserves_time_weighted_energy_and_real_zero(economic_case):
@@ -49,7 +49,7 @@ def test_alternating_power_preserves_time_weighted_energy_and_real_zero(economic
     for watts in (0, 4000, 0, 4000):
         rows, _, error = sample(case, watts, seconds=30)
         assert error is None
-    assert floor_at(rows, later(case)) == 2000
+    assert floor_at(rows, later(case, 61)) == 2000
 
 
 def test_repeated_report_neither_adds_weight_nor_extends_short_horizon(economic_case):
@@ -123,7 +123,7 @@ def test_unknown_background_of_known_run_is_not_extrapolated_immediately(economi
     assert floor_at(rows, tomorrow_hour) == 1100
     for _ in range(4):
         rows, _, _ = sample(case, 1600, seconds=30, profile=profile)
-    assert floor_at(rows, tomorrow_hour) == 1500
+    assert floor_at(rows, tomorrow_hour) == 1100
 
 
 def test_new_meter_mapping_resets_background_instead_of_counting_it_twice(economic_case):

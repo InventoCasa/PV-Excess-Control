@@ -6,12 +6,14 @@ Reload recovery uses these mappings even if the current options have changed.
 from __future__ import annotations
 
 from dataclasses import asdict, fields
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
 
 from homeassistant.core import HomeAssistant, valid_entity_id
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .inverter_control import SUPPORTED_ENABLE_DOMAINS, SUPPORTED_POWER_DOMAINS, _validate_numeric_mapping
 from .models import InverterGridChargeConfig
@@ -21,6 +23,23 @@ _CONFIG_FIELDS = frozenset(field.name for field in fields(InverterGridChargeConf
 _NUMERIC_FIELDS = frozenset({"timeout_seconds", "power_tolerance_w"})
 _ON_VALUES = frozenset({"on", "true", "1", "yes"})
 _OFF_VALUES = frozenset({"off", "false", "0", "no"})
+
+
+def _decode_retry_after(raw: object) -> datetime | None:
+    """A restart deadline is an absolute instant, never a local clock label."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("Invalid battery charge restart deadline")
+    value = datetime.fromisoformat(raw)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Battery charge restart deadline requires a timezone")
+    value = value.astimezone(timezone.utc)
+    # Configuration permits at most 60 minutes. Allow one minute of clock
+    # skew, but do not let optional metadata block charging for years.
+    if value > dt_util.utcnow() + timedelta(minutes=61):
+        raise ValueError("Battery charge restart deadline exceeds the supported delay")
+    return value
 
 
 def _validate_existing_json(path: str) -> bool:
@@ -104,6 +123,18 @@ class BatteryOwnershipJournal:
         self._loaded_record_exists = False
         self._discharge_config: InverterGridChargeConfig | None = None
         self._discharge_mapping: InverterGridChargeConfig | None = None
+        self._charge_retry_after: datetime | None = None
+        self._charge_retry_after_invalid = False
+
+    @property
+    def charge_retry_after(self) -> datetime | None:
+        """Restore the confirmed stop's restart deadline even without ownership."""
+        return self._charge_retry_after
+
+    @property
+    def charge_retry_after_invalid(self) -> bool:
+        """Require deadline repair without discarding valid cleanup mappings."""
+        return self._charge_retry_after_invalid
 
     @property
     def discharge_config(self) -> InverterGridChargeConfig | None:
@@ -125,6 +156,8 @@ class BatteryOwnershipJournal:
         self._loaded_record_exists = False
         self._discharge_config = None
         self._discharge_mapping = None
+        self._charge_retry_after = None
+        self._charge_retry_after_invalid = False
         existed = await self._hass.async_add_executor_job(_validate_existing_json, self._store.path)
         saved = await self._store.async_load()
         if saved is None:
@@ -132,11 +165,17 @@ class BatteryOwnershipJournal:
                 raise ValueError("Battery ownership journal is unreadable")
             return None, None
         if (not isinstance(saved, dict) or not {"charge", "hold"} <= set(saved)
-                or set(saved) - {"charge", "hold", "discharge", "discharge_mapping"}):
+                or set(saved) - {"charge", "hold", "discharge", "discharge_mapping", "charge_retry_after"}):
             raise ValueError("Invalid battery ownership journal structure")
         restored = _decode_config(saved["charge"]), _decode_config(saved["hold"])
         self._discharge_config = _decode_discharge_config(saved.get("discharge"))
         self._discharge_mapping = _decode_discharge_config(saved.get("discharge_mapping"))
+        try:
+            self._charge_retry_after = _decode_retry_after(saved.get("charge_retry_after"))
+        except (ValueError, TypeError, OverflowError):
+            # Optional restart metadata must not hide the original mappings
+            # needed to release an owned charge or hold after a restart.
+            self._charge_retry_after_invalid = True
         self._loaded_record_exists = True
         return restored
 
@@ -147,6 +186,7 @@ class BatteryOwnershipJournal:
         *,
         discharge_config: InverterGridChargeConfig | None = None,
         discharge_mapping: InverterGridChargeConfig | None = None,
+        charge_retry_after: datetime | None = None,
     ) -> None:
         """Await storage and confirm persistence before allowing hardware writes.
 
@@ -155,6 +195,10 @@ class BatteryOwnershipJournal:
         when checking that the requested ownership is actually recoverable.
         """
         payload = {}
+        if charge_retry_after is not None:
+            if not isinstance(charge_retry_after, datetime):
+                raise ValueError("Invalid battery charge restart deadline")
+            payload["charge_retry_after"] = _decode_retry_after(charge_retry_after.isoformat()).isoformat()
         for name, config in (("charge", charge_config), ("hold", hold_config)):
             if config is not None and not isinstance(config, InverterGridChargeConfig):
                 raise ValueError("Invalid battery ownership controller configuration")

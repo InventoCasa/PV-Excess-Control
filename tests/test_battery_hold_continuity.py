@@ -20,7 +20,7 @@ def install_plan(case, *, actions=("hold", "hold", "self_consumption")):
         .2 + index * .01, 0., .01, 0., 0., 0., 30., action,
     ) for index, action in enumerate(actions))
     case.coord._battery_grid_plan = BatteryGridPlan(slots, 0., .1, "economic_plan", 30.)
-    case.coord._refresh_battery_grid_plan = MagicMock(return_value=None)
+    case.coord._async_refresh_battery_grid_plan = AsyncMock(return_value=None)
     if "_battery_action_after_wait" in case.coord.__dict__:
         del case.coord._battery_action_after_wait
     case.coord._latest_tariff = case.tariff
@@ -119,7 +119,7 @@ async def test_hold_chain_does_not_bypass_current_input_validation(numeric_case,
         await case.coord._run_grid_charge_state_machine(case.tariff, None)
         await case.coord._apply_battery_discharge_limit(BatteryDischargeAction(True, 100))
         if failure == "price":
-            case.coord._refresh_battery_grid_plan.return_value = "price_window_mismatch"
+            case.coord._async_refresh_battery_grid_plan.return_value = "price_window_mismatch"
         else:
             case.reading({"pv": "sensor.pv_power", "load": "sensor.load_power", "soc": "sensor.soc"}[failure], "unavailable")
         await case.coord._apply_battery_discharge_limit(BatteryDischargeAction(True, 100))
@@ -233,7 +233,7 @@ async def test_independent_hold_revalidates_after_hardware_wait(numeric_case, af
             changed = (slots[0], replace(slots[1], action="self_consumption"), slots[2])
             case.coord._battery_grid_plan = replace(case.coord._battery_grid_plan, slots=changed)
         elif after_wait == "invalid_price":
-            case.coord._refresh_battery_grid_plan.return_value = "price_window_mismatch"
+            case.coord._async_refresh_battery_grid_plan.return_value = "price_window_mismatch"
 
     hold.engage.side_effect = engage
     try:

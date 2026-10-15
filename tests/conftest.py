@@ -197,6 +197,7 @@ def coordinator_factory():
             self.bus = MagicMock()
             self.bus.async_listen_once = MagicMock(return_value=MagicMock())
             self.async_add_job = MagicMock()
+            self.async_add_executor_job = AsyncMock(side_effect=asyncio.to_thread)
             self.loop = asyncio.get_event_loop()
             self.async_create_task = MagicMock(
                 side_effect=lambda coro, **kw: asyncio.ensure_future(coro)

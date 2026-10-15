@@ -331,7 +331,7 @@ async def test_new_higher_slot_target_clears_old_hysteresis_latch(coordinator_fa
 async def test_durable_ownership_save_finishes_before_hardware_start(coordinator_factory, mock_inverter_controller):
     coord, _ = prepared(coordinator_factory, mock_inverter_controller)
     completed = False
-    async def save(*_):
+    async def save(*_, **__):
         nonlocal completed
         completed = True
     async def engage(_):
@@ -414,7 +414,9 @@ async def test_journal_restores_original_controls_after_configuration_changes(co
         "switch.original_charge", "switch.original_hold",
     ]
     mock_inverter_controller.disengage.assert_not_awaited()
-    coord._battery_journal.async_save.assert_awaited_with(None, None)
+    coord._battery_journal.async_save.assert_awaited_with(
+        None, None, charge_retry_after=coord._battery_retry_after,
+    )
 
 
 async def test_cleared_journal_overrides_late_config_flags(coordinator_factory, mock_inverter_controller):
@@ -432,7 +434,7 @@ async def test_cancelled_journal_clear_retains_retryable_ownership(coordinator_f
     coord, _ = prepared(coordinator_factory, mock_inverter_controller)
     await entity(ForceChargeSwitch, coord).async_turn_on()
     entered = asyncio.Event()
-    async def blocked(*_):
+    async def blocked(*_, **__):
         entered.set()
         await asyncio.Event().wait()
     coord._battery_journal.async_save.side_effect = blocked
