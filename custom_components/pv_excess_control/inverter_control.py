@@ -8,6 +8,7 @@ are configured; diagnostics distinguish these levels of confirmation.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import logging
 import math
 
@@ -125,9 +126,38 @@ class InverterGridChargeController:
 
     async def engage(self, power_w: float) -> None:
         """Confirm each engage step; attempt release after any partial failure."""
+        self._validate_start(power_w)
+        try:
+            await self.prepare(power_w, require_stopped=False)
+            await self.enable_prepared(power_w, require_stopped=False)
+        except Exception:
+            try:
+                await self.disengage()
+            except Exception:
+                _LOGGER.exception("Inverter release after failed grid-charge command was not confirmed")
+            raise
+        # Cancellation leaves cleanup with the caller's durable ownership.
+
+    async def prepare(self, power_w: float, *, require_stopped: bool = True) -> None:
+        """Confirm mode and power while leaving the charge command stopped.
+
+        The caller must retain cleanup ownership throughout preparation. Direct
+        engage remains available for manual commands and existing integrations.
+        """
+        config = self._config
+        self._validate_start(power_w)
+        if require_stopped:
+            await self.verify_disengaged()
+        if config.mode_entity_id is not None:
+            await self._write_and_confirm(config.mode_entity_id, config.mode_engage_value,
+                lambda: self._confirm([(config.mode_entity_id, config.mode_feedback_entity_id,
+                                       config.mode_engage_value, False)]))
+        await self.set_power(power_w)
+
+    def _validate_start(self, power_w: float) -> None:
         config = self._config
         # Validate the complete power request before changing inverter mode.
-        power_value = self._power_value(power_w)
+        self._power_value(power_w)
         for entity, engage, release in (
             (config.enable_entity_id, config.enable_engage_value, config.enable_disengage_value),
             (config.mode_entity_id, config.mode_engage_value, config.mode_disengage_value),
@@ -135,24 +165,50 @@ class InverterGridChargeController:
             if entity and self._domain(entity) in SUPPORTED_POWER_DOMAINS:
                 self._validate_numeric_setpoint(entity, engage)
                 self._validate_numeric_setpoint(entity, release)
+
+    async def set_power(self, power_w: float) -> None:
+        """Adjust only the charge power, preserving an ongoing charge episode."""
+        config = self._config
+        power_value = self._power_value(power_w)
+        if config.power_entity_id is not None:
+            await self._write_and_confirm(config.power_entity_id, power_value,
+                lambda: self._confirm([(config.power_entity_id, config.power_feedback_entity_id, power_w, True)]))
+
+    async def enable_prepared(
+        self, power_w: float, *, require_stopped: bool = True,
+        before_enable: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Enable only after the prepared mode and latest power are confirmed."""
+        config = self._config
+        if before_enable is not None:
+            await before_enable()
+        self._power_value(power_w)
+        expected = []
+        if config.mode_entity_id is not None:
+            expected.append((config.mode_entity_id, config.mode_feedback_entity_id, config.mode_engage_value, False))
+        if config.power_entity_id is not None:
+            expected.append((config.power_entity_id, config.power_feedback_entity_id, power_w, True))
+        if require_stopped:
+            expected.append((config.enable_entity_id, config.enable_feedback_entity_id, config.enable_disengage_value, False))
+        mismatches = self._mismatches(expected, enable_feedback_value=config.enable_feedback_disengage_value)
+        if mismatches:
+            raise InverterConfirmationError(f"Could not confirm prepared inverter state: {', '.join(mismatches)}")
+        # No further wait separates authorization/readback from the enable
+        # write. The write and final readback share the advertised phase budget.
+        await self._write_and_confirm(config.enable_entity_id, config.enable_engage_value,
+                                      lambda: self.verify_engaged(power_w))
+
+    async def _write_and_confirm(self, entity_id, value, confirm):
+        written = False
         try:
-            if config.mode_entity_id is not None:
-                await self._write(config.mode_entity_id, config.mode_engage_value)
-                await self._confirm([(config.mode_entity_id, config.mode_feedback_entity_id,
-                                      config.mode_engage_value, False)])
-            if config.power_entity_id is not None:
-                await self._write(config.power_entity_id, power_value)
-                await self._confirm([(config.power_entity_id, config.power_feedback_entity_id, power_w, True)])
-            await self._write(config.enable_entity_id, config.enable_engage_value)
-            await self.verify_engaged(power_w)
-        except Exception:
-            try:
-                await self.disengage()
-            except Exception:
-                _LOGGER.exception("Inverter release after failed grid-charge command was not confirmed")
-            raise
-        # CancelledError intentionally propagates. The caller retains ownership
-        # and must retry cleanup; cancellation must not look like a confirmed stop.
+            async with asyncio.timeout(self._config.timeout_seconds):
+                await self._write(entity_id, value)
+                written = True
+                await confirm()
+        except TimeoutError as error:
+            if not written:
+                raise
+            raise InverterConfirmationError(f"Could not confirm inverter command: {entity_id}") from error
 
     async def disengage(self) -> None:
         """Attempt both release writes independently and confirm the final state."""
@@ -208,21 +264,7 @@ class InverterGridChargeController:
         try:
             async with asyncio.timeout(self._config.timeout_seconds):
                 while True:
-                    mismatches = []
-                    for command, feedback, value, is_power in expected:
-                        for entity_id in dict.fromkeys((command, feedback or command)):
-                            feedback_override = (
-                                command == self._config.enable_entity_id
-                                and entity_id == feedback
-                                and entity_id != command
-                                and enable_feedback_value is not None
-                            )
-                            expected_value = enable_feedback_value if feedback_override else value
-                            if not self._matches(
-                                entity_id, command, expected_value, is_power,
-                                normalize_switch=not feedback_override,
-                            ):
-                                mismatches.append(entity_id)
+                    mismatches = self._mismatches(expected, enable_feedback_value=enable_feedback_value)
                     if not mismatches:
                         return
                     await asyncio.sleep(min(0.1, self._config.timeout_seconds / 5))
@@ -230,6 +272,19 @@ class InverterGridChargeController:
             raise InverterConfirmationError(
                 f"Could not confirm inverter state: {', '.join(mismatches)}"
             ) from error
+
+    def _mismatches(self, expected, *, enable_feedback_value=None):
+        mismatches = []
+        for command, feedback, value, is_power in expected:
+            for entity_id in dict.fromkeys((command, feedback or command)):
+                feedback_override = (command == self._config.enable_entity_id
+                                     and entity_id == feedback and entity_id != command
+                                     and enable_feedback_value is not None)
+                expected_value = enable_feedback_value if feedback_override else value
+                if not self._matches(entity_id, command, expected_value, is_power,
+                                     normalize_switch=not feedback_override):
+                    mismatches.append(entity_id)
+        return mismatches
 
     def _matches(
         self, entity_id: str, command: str, value: object, is_power: bool,

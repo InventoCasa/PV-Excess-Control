@@ -147,7 +147,8 @@
           "battery_hold_feedback_engage_value": "Rückmeldewert bei Sperre (optional)",
           "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)",
           "battery_pv_forecast_factor": "PV-Prognosefaktor für Netzladen",
-          "battery_hold_reassert_entity": "Automation zur erneuten Befehlsübertragung (optional)"
+          "battery_hold_reassert_entity": "Automation zur erneuten Befehlsübertragung (optional)",
+          "battery_grid_charge_minimum_minutes": "Mindestdauer geplanter Netzladephasen (min)"
         },
         "data_description": {
           "battery_strategy": "Priorität zwischen Batterieladung und Verbrauchersteuerung.",
@@ -189,7 +190,8 @@
           "battery_hold_feedback_engage_value": "Erwartete physische Rückmeldung bei aktiver Sperre. Zahlenwerte verwenden die Einheit der Rückmeldeentität. Bei abweichender Einheit eigene Werte angeben. Leer verwendet den Befehlswert.",
           "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Zahlenwerte verwenden die Einheit der Rückmeldeentität. Bei abweichender Einheit eigene Werte angeben. Leer verwendet den Befehlswert.",
           "battery_pv_forecast_factor": "Skaliert die PV-Prognose nur für die Batterie-Netzladeplanung: 0,9 bedeutet 90 % der Prognose. Bereich 0,1–1,0; Standard 1,0 lässt die Prognose unverändert. Anhand früherer, zum Planungszeitpunkt verfügbarer Prognosen und der später gemessenen Erzeugung kalibrieren. Solar- und Geräteplanung bleiben unverändert.",
-          "battery_hold_reassert_entity": "Optional: Die vorhandene Automation, die den Zahlenwert an das Gerät überträgt. Sie wird nur erneut ausgelöst, wenn der unveränderte Sollwert keine bestätigte physische Rückmeldung hat. Separate Rückmeldung erforderlich; Befehls- und Rückmeldewerte behalten die jeweilige Einheit."
+          "battery_hold_reassert_entity": "Optional: Die vorhandene Automation, die den Zahlenwert an das Gerät überträgt. Sie wird nur erneut ausgelöst, wenn der unveränderte Sollwert keine bestätigte physische Rückmeldung hat. Separate Rückmeldung erforderlich; Befehls- und Rückmeldewerte behalten die jeweilige Einheit.",
+          "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich."
         }
       }
     },
@@ -267,7 +269,8 @@
           "battery_hold_feedback_engage_value": "Rückmeldewert bei Sperre (optional)",
           "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)",
           "battery_pv_forecast_factor": "PV-Prognosefaktor für Netzladen",
-          "battery_hold_reassert_entity": "Automation zur erneuten Befehlsübertragung (optional)"
+          "battery_hold_reassert_entity": "Automation zur erneuten Befehlsübertragung (optional)",
+          "battery_grid_charge_minimum_minutes": "Mindestdauer geplanter Netzladephasen (min)"
         },
         "data_description": {
           "battery_strategy": "Priorität zwischen Batterieladung und Verbrauchersteuerung.",
@@ -309,7 +312,8 @@
           "battery_hold_feedback_engage_value": "Erwartete physische Rückmeldung bei aktiver Sperre. Zahlenwerte verwenden die Einheit der Rückmeldeentität. Bei abweichender Einheit eigene Werte angeben. Leer verwendet den Befehlswert.",
           "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Zahlenwerte verwenden die Einheit der Rückmeldeentität. Bei abweichender Einheit eigene Werte angeben. Leer verwendet den Befehlswert.",
           "battery_pv_forecast_factor": "Skaliert die PV-Prognose nur für die Batterie-Netzladeplanung: 0,9 bedeutet 90 % der Prognose. Bereich 0,1–1,0; Standard 1,0 lässt die Prognose unverändert. Anhand früherer, zum Planungszeitpunkt verfügbarer Prognosen und der später gemessenen Erzeugung kalibrieren. Solar- und Geräteplanung bleiben unverändert.",
-          "battery_hold_reassert_entity": "Optional: Die vorhandene Automation, die den Zahlenwert an das Gerät überträgt. Sie wird nur erneut ausgelöst, wenn der unveränderte Sollwert keine bestätigte physische Rückmeldung hat. Separate Rückmeldung erforderlich; Befehls- und Rückmeldewerte behalten die jeweilige Einheit."
+          "battery_hold_reassert_entity": "Optional: Die vorhandene Automation, die den Zahlenwert an das Gerät überträgt. Sie wird nur erneut ausgelöst, wenn der unveränderte Sollwert keine bestätigte physische Rückmeldung hat. Separate Rückmeldung erforderlich; Befehls- und Rückmeldewerte behalten die jeweilige Einheit.",
+          "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich."
         }
       }
     },

@@ -248,7 +248,8 @@ async def test_price_rise_overrides_minimum_run_time(coordinator_factory, mock_i
 async def test_fresh_target_stops_charge_without_hysteresis_delay(coordinator_factory, mock_inverter_controller):
     coord, states, tariff = planned(coordinator_factory, mock_inverter_controller)
     await coord._run_grid_charge_state_machine(tariff, None)
-    target = coord._current_battery_slot().soc_end
+    # Contiguous charge slots form one goal, even across accounting boundaries.
+    target = coord._battery_charge_episode_now().target_soc
     states["sensor.soc"] = State("sensor.soc", str(target))
     await coord._run_grid_charge_state_machine(tariff, None)
     assert not coord._grid_charge_engaged

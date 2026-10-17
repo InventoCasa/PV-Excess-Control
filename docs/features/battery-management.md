@@ -49,9 +49,10 @@ shared, continuously covered forecast and price horizon, up to 24 hours. It
 accounts for household demand, PV production, current storage, reserve, charging
 and discharging power, later prices and conversion losses. It can wait for a
 later cheaper slot. It only buys energy that is expected to supply household
-demand within that horizon, while preserving the solar uptake expected without
-grid charging. Export arbitrage and filling unused storage at the horizon are
-not objectives.
+demand within that horizon, while protecting forecast solar from displacement
+by grid-filled capacity. Preparation of a new charge can briefly interrupt solar
+charging; that physical overhead is modeled separately. Export arbitrage and
+filling unused storage at the horizon are not objectives.
 
 The first solar charging interval is not a requirement to reach an empty
 battery. A small solar surplus may leave useful storage capacity available while
@@ -215,6 +216,47 @@ least **30 minutes of valid samples for every one of the 24 local hours**,
 usually at least one day; missing readings delay readiness. Each hour must have
 recent observations within seven days. The learned profile is persisted across
 reloads and midnight. Clearing the explicit profile returns to learning.
+
+## Executable charging episodes
+
+**Minimum planned grid-charge duration** (`battery_grid_charge_minimum_minutes`)
+defaults to **five minutes**, configurable from one to sixty minutes. This is an
+operating choice to avoid short starts, not a measured hardware minimum. A new
+automatic charge must have enough contiguous planned charging time after
+preparation and a separate allowance for the final enable confirmation.
+
+The timing budget comes from the configured inverter confirmation timeouts.
+For a mode, power and enable mapping with a 15-second timeout per step, the plan
+reserves 30 seconds before enabling and another 15 seconds for acknowledgement.
+A five-minute charge therefore needs at least a five-minute, 45-second
+opportunity. The model's energy after the enable command remains a forecast:
+physical response and measurement delays are not exact energy measurements.
+
+Real price, PV and household-load boundaries stay in the energy calculation.
+The search can continue charging across these boundaries, updating power and
+using the episode's final SoC target. A short first accounting interval is not
+itself a reason to stop a valid longer charge. A running episode keeps its
+original minimum deadline through replanning; the countdown does not restart
+every update. New data may still justify an immediate stop.
+
+During preparation the model credits no grid energy or battery discharge and
+accounts for a possible interruption of solar charging. Only this explicit
+preparation loss is exempted from the solar-uptake comparison; later capacity
+crowding is still excluded. The useful-energy bounds also account for lost
+solar that would otherwise remain unused at the end of the horizon. Loss is
+already included through the energy balance, so it is not charged twice as an
+extra monetary fee.
+
+The controller checks remaining time before writing hardware commands and again
+before enabling charge. Preparation is interruptible. A section handover must
+retain a safety deadline while commands are confirmed; an unrelated discharge
+limit acknowledgement cannot extend an expired charging authorization. Only a
+freshly validated charging decision can authorize a later end.
+
+The minimum is a planning and admission requirement. It does not force continued
+charging when control is disabled, required data is missing, the target is
+reached, the price is no longer permitted, or another necessary stop applies.
+Manual forced charging retains its separate behavior.
 
 ## Restart eligibility
 

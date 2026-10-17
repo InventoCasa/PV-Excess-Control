@@ -120,7 +120,8 @@
           "battery_hold_feedback_engage_value": "Hold readback value (optional)",
           "battery_hold_feedback_release_value": "Release readback value (optional)",
           "battery_pv_forecast_factor": "PV forecast factor for grid charging",
-          "battery_hold_reassert_entity": "Command retry automation (optional)"
+          "battery_hold_reassert_entity": "Command retry automation (optional)",
+          "battery_grid_charge_minimum_minutes": "Minimum planned grid-charge duration (min)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -162,7 +163,8 @@
           "battery_hold_feedback_engage_value": "Expected physical readback while holding. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
           "battery_hold_feedback_release_value": "Expected physical readback after release. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
           "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged.",
-          "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units."
+          "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units.",
+          "battery_grid_charge_minimum_minutes": "New automatic charging requires at least this much continuous charging time after preparation. Safety stops remain immediate."
         }
       },
       "settings": {
@@ -583,7 +585,8 @@
           "battery_hold_feedback_engage_value": "Hold readback value (optional)",
           "battery_hold_feedback_release_value": "Release readback value (optional)",
           "battery_pv_forecast_factor": "PV forecast factor for grid charging",
-          "battery_hold_reassert_entity": "Command retry automation (optional)"
+          "battery_hold_reassert_entity": "Command retry automation (optional)",
+          "battery_grid_charge_minimum_minutes": "Minimum planned grid-charge duration (min)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -625,7 +628,8 @@
           "battery_hold_feedback_engage_value": "Expected physical readback while holding. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
           "battery_hold_feedback_release_value": "Expected physical readback after release. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
           "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged.",
-          "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units."
+          "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units.",
+          "battery_grid_charge_minimum_minutes": "New automatic charging requires at least this much continuous charging time after preparation. Safety stops remain immediate."
         }
       },
       "settings": {

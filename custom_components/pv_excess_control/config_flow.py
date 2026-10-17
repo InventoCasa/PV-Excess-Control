@@ -50,6 +50,7 @@ except ImportError:
 
 from .const import (
     CONF_BATTERY_GRID_TARGET_SOC,
+    CONF_BATTERY_GRID_CHARGE_MINIMUM_MINUTES,
     CONF_BATTERY_ROUNDTRIP_EFFICIENCY,
     CONF_BATTERY_PV_FORECAST_FACTOR,
     CONF_BATTERY_WEAR_COST_PER_KWH,
@@ -707,6 +708,7 @@ def _forecast_schema(
 # Defaults, bounds and selector units for independent grid-charge planning.
 _BATTERY_PLANNING_NUMBERS = {
     CONF_BATTERY_GRID_TARGET_SOC: (80, 0, 100, 1, "%"),
+    CONF_BATTERY_GRID_CHARGE_MINIMUM_MINUTES: (5, 1, 60, 1, "min"),
     CONF_BATTERY_ROUNDTRIP_EFFICIENCY: (0.85, 0.5, 1, 0.01, None),
     CONF_BATTERY_PV_FORECAST_FACTOR: (1.0, 0.1, 1, 0.01, None),
     CONF_BATTERY_WEAR_COST_PER_KWH: (0, 0, 1, 0.001, "€/kWh"),

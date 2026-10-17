@@ -122,13 +122,27 @@ async def test_grid_charge_stops_at_the_planned_soc_before_the_pv_target(
     coordinator_factory, mock_inverter_controller,
 ):
     coordinator, states, tariff = _grid_inputs(coordinator_factory, mock_inverter_controller)
-    await coordinator._run_grid_charge_state_machine(tariff, None)
-    target = coordinator._current_battery_slot().soc_end
-    assert target < coordinator.config_entry.data["battery_target_soc"]
-    states["sensor.soc"] = State("sensor.soc", str(target))
-    await coordinator._run_grid_charge_state_machine(tariff, None)
-    mock_inverter_controller.disengage.assert_awaited_once()
-    assert not coordinator._grid_charge_engaged
+    cheap = tariff.windows[0]
+    boundary = cheap.start + timedelta(minutes=30)
+    tariff.windows[:1] = [
+        TariffWindow(cheap.start, boundary, cheap.price, True),
+        TariffWindow(boundary, cheap.end, cheap.price, True),
+    ]
+    try:
+        await coordinator._run_grid_charge_state_machine(tariff, None)
+        subslot_target = coordinator._current_battery_slot().soc_end
+        episode_target = coordinator._battery_charge_episode_now().target_soc
+        assert subslot_target < episode_target < coordinator.config_entry.data["battery_target_soc"]
+        states["sensor.soc"] = State("sensor.soc", str(subslot_target))
+        await coordinator._run_grid_charge_state_machine(tariff, None)
+        assert coordinator._grid_charge_engaged
+        mock_inverter_controller.disengage.assert_not_awaited()
+        states["sensor.soc"] = State("sensor.soc", str(episode_target))
+        await coordinator._run_grid_charge_state_machine(tariff, None)
+        mock_inverter_controller.disengage.assert_awaited_once()
+        assert not coordinator._grid_charge_engaged
+    finally:
+        await coordinator.async_stop_battery_controls()
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,8 @@ _ECONOMIC_TIE_EPS = 1e-9
 # with a partially explored trajectory when this budget is exhausted.
 _REFINEMENT_TRANSITION_BUDGET = 100_000
 _QUANTITY_REFINEMENT_TRANSITION_BUDGET = 100_000
+_EPISODE_PRIMARY_TRANSITION_BUDGET = 300_000
+_EPISODE_COARSE_TRANSITION_BUDGET = 100_000
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,12 @@ class BatteryPlanningConfig:
     The restart delay is an off-time after a grid-charge stop, never a minimum
     on-time. An aware ``grid_charge_not_before`` carries existing restart
     eligibility; ``grid_charge_active`` allows an already running charge to
-    continue. Defaults preserve callers that do not provide runtime state.
+    continue. A new episode reserves preparation, enable confirmation and the
+    requested minimum charging time. ``grid_charge_prepared`` skips only the
+    initial preparation. ``grid_charge_minimum_until`` carries the unchanged
+    deadline of an already confirmed episode: it may stop immediately or plan
+    continuation through that deadline. These are planning constraints, never
+    a physical lock against safety stops. Zero defaults preserve pure callers.
     """
 
     capacity_kwh: float
@@ -76,6 +83,11 @@ class BatteryPlanningConfig:
     grid_restart_delay_minutes: float = 0.0
     grid_charge_not_before: datetime | None = None
     grid_charge_active: bool = False
+    grid_charge_minimum_minutes: float = 0.0
+    grid_charge_startup_seconds: float = 0.0
+    grid_charge_enable_seconds: float = 0.0
+    grid_charge_prepared: bool = False
+    grid_charge_minimum_until: datetime | None = None
 
     @property
     def native_charge_power_w(self) -> float:
@@ -99,16 +111,25 @@ class BatteryGridSlot:
     action: str
     reserved_pv_kwh: float = 0.0
     external_load_kwh: float = 0.0
+    grid_charge_available_at: datetime | None = None
+    startup_pv_loss_kwh: float = 0.0
+
+    @property
+    def charging_hours(self) -> float:
+        """Actual planned input time, excluding preparation before enable."""
+        start = max(self.start, self.grid_charge_available_at or self.start)
+        return max(0., (self.end - start).total_seconds() / 3600)
 
     @property
     def charge_power_w(self) -> float:
         """Mean requested grid charging power for this interval."""
-        return self.grid_charge_kwh * 3_600_000 / (self.end - self.start).total_seconds()
+        return self.grid_charge_kwh * 1000 / self.charging_hours if self.charging_hours else 0.
 
     @property
     def battery_charge_power_w(self) -> float:
         """Total battery input power, including PV, for a forced-charge command."""
-        return (self.grid_charge_kwh + self.pv_charge_kwh) * 3_600_000 / (self.end - self.start).total_seconds()
+        return ((self.grid_charge_kwh + self.pv_charge_kwh) * 1000 / self.charging_hours
+                if self.charging_hours else 0.)
 
 
 @dataclass(frozen=True)
@@ -122,6 +143,44 @@ class BatteryGridPlan:
 
 
 @dataclass(frozen=True)
+class BatteryChargeEpisode:
+    """One contiguous command episode across genuine accounting boundaries."""
+
+    start: datetime
+    available_at: datetime
+    end: datetime
+    target_soc: float
+    power_w: float
+    slot: BatteryGridSlot
+    power_slot: BatteryGridSlot
+
+
+def charge_episode_at(plan: BatteryGridPlan | None, now: datetime) -> BatteryChargeEpisode | None:
+    """Describe the current episode, including an input-free setup interval."""
+    if plan is None or not plan.valid:
+        return None
+    now = _utc(now)
+    slots = plan.slots
+    index = next((i for i, row in enumerate(slots) if row.start <= now < row.end), None)
+    if index is None or slots[index].action != "charge":
+        return None
+    first = last = index
+    while first and slots[first - 1].action == "charge" and slots[first - 1].end == slots[first].start:
+        first -= 1
+    while last + 1 < len(slots) and slots[last + 1].action == "charge" and slots[last].end == slots[last + 1].start:
+        last += 1
+    available = slots[first].grid_charge_available_at or slots[first].start
+    power_slot = next((row for row in slots[index:last + 1]
+                       if row.grid_charge_kwh > _EPS and row.charging_hours > 0), None)
+    if power_slot is None:
+        return None
+    return BatteryChargeEpisode(
+        slots[first].start, available, slots[last].end, slots[last].soc_end,
+        power_slot.battery_charge_power_w, slots[index], power_slot,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _Interval:
     start: datetime
     end: datetime
@@ -153,7 +212,7 @@ class _Interval:
         return min(config.max_discharge_power_w, self.max_discharge_power_w)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Node:
     energy: float
     cost: float
@@ -163,6 +222,10 @@ class _Node:
     charge_moment: float = 0.0
     charge_active: bool = False
     charge_not_before: datetime | None = None
+    charge_available_at: datetime | None = None
+    charge_minimum_until: datetime | None = None
+    startup_pv_loss: float = 0.0
+    charge_grid_delivered: bool = False
 
 
 def _prefer_economic_node(candidate: _Node, previous: _Node) -> bool:
@@ -198,6 +261,8 @@ def _validate_config(config: BatteryPlanningConfig, soc: float | None) -> None:
         config.charge_price_limit, config.horizon_hours, config.energy_step_kwh,
         config.native_charge_power_w,
         config.grid_restart_delay_minutes,
+        config.grid_charge_minimum_minutes, config.grid_charge_startup_seconds,
+        config.grid_charge_enable_seconds,
     )
     if not all(_finite(value) for value in values):
         raise ValueError("invalid_configuration")
@@ -213,10 +278,16 @@ def _validate_config(config: BatteryPlanningConfig, soc: float | None) -> None:
         and config.energy_step_kwh > 0
         and 0 <= config.grid_restart_delay_minutes <= 60
         and isinstance(config.grid_charge_active, bool)
+        and 0 <= config.grid_charge_minimum_minutes <= 60
+        and 0 <= config.grid_charge_startup_seconds <= 300
+        and 0 <= config.grid_charge_enable_seconds <= 300
+        and isinstance(config.grid_charge_prepared, bool)
     ):
         raise ValueError("invalid_configuration")
     if config.grid_charge_not_before is not None:
         _utc(config.grid_charge_not_before)
+    if config.grid_charge_minimum_until is not None:
+        _utc(config.grid_charge_minimum_until)
     minimum = config.forced_charge_min_power_w
     maximum = config.forced_charge_max_power_w
     step = config.forced_charge_power_step_w
@@ -236,6 +307,7 @@ def _timeline(
     horizon_hours: float,
     load_commitments: tuple[BatteryLoadCommitment, ...] = (),
     *, grid_charge_not_before: datetime | None = None,
+    protected_instants: tuple[datetime, ...] = (),
 ) -> list[_Interval]:
     start = _utc(now)
     if len(load_w) != 24 or not all(_finite(value) and value >= 0 for value in load_w):
@@ -249,6 +321,11 @@ def _timeline(
         raise ValueError("missing_future_data")
     boundaries = {start, end}
     protected_boundaries = {start, end}
+    for instant in protected_instants:
+        instant = _utc(instant)
+        if start < instant < end:
+            boundaries.add(instant)
+            protected_boundaries.add(instant)
     if grid_charge_not_before is not None:
         eligible = _utc(grid_charge_not_before)
         if start < eligible < end:
@@ -351,6 +428,22 @@ def _same_physical_rates(left: _Interval, right: _Interval) -> bool:
     )
 
 
+def _charge_timing(
+    interval: _Interval, node: _Node, config: BatteryPlanningConfig,
+) -> tuple[datetime | None, datetime | None]:
+    """Return the enable instant and minimum end of this planned episode."""
+    if node.charge_active:
+        return node.charge_available_at, node.charge_minimum_until
+    prepared = config.grid_charge_prepared and node.slot is None
+    seconds = 0. if prepared else config.grid_charge_startup_seconds
+    if not seconds and not config.grid_charge_minimum_minutes and not config.grid_charge_enable_seconds:
+        return None, None
+    available = interval.start + timedelta(seconds=seconds)
+    minimum = available + timedelta(minutes=config.grid_charge_minimum_minutes,
+                                    seconds=config.grid_charge_enable_seconds)
+    return available, minimum
+
+
 def _transition(
     interval: _Interval,
     node: _Node,
@@ -364,7 +457,22 @@ def _transition(
     reserve = capacity * config.reserve_soc / 100
     surplus = max(0.0, interval.pv - interval.load)
     deficit = interval.deficit_kwh
-    solar_stored = min(surplus, config.native_charge_power_w * interval.hours / 1000, max(0.0, capacity - node.energy) / efficiency) * efficiency
+    natural_solar = min(surplus, config.native_charge_power_w * interval.hours / 1000, max(0.0, capacity - node.energy) / efficiency) * efficiency
+    available = minimum = None
+    solar_stored = natural_solar
+    startup_loss = 0.
+    if action == "charge":
+        available, minimum = _charge_timing(interval, node, config)
+        active_hours = max(0., (interval.end - max(interval.start, available or interval.start)).total_seconds() / 3600)
+        if active_hours < interval.hours:
+            # Forced-mode preparation can suspend native PV charging. Account
+            # for that interval explicitly instead of inventing solar uptake.
+            solar_stored = min(
+                surplus * active_hours / interval.hours,
+                config.native_charge_power_w * active_hours / 1000,
+                max(0., capacity - node.energy) / efficiency,
+            ) * efficiency
+            startup_loss = (natural_solar - solar_stored) / efficiency
     energy = node.energy + solar_stored + grid_charge * efficiency
     discharge = 0.0
     if action == "self_consumption":
@@ -376,6 +484,7 @@ def _transition(
         interval.start, interval.end, interval.price, interval.pv, interval.load,
         grid_charge, solar_stored / efficiency, discharge, energy / capacity * 100, action,
         interval.reserved_pv, interval.external_load,
+        available, startup_loss,
     )
     not_before = node.charge_not_before
     if node.charge_active and action != "charge" and config.grid_restart_delay_minutes:
@@ -387,6 +496,10 @@ def _transition(
         energy, node.cost + cost, node.grid_energy + grid_charge, node, slot,
         node.charge_moment + grid_charge * interval.elapsed_hours,
         action == "charge", not_before,
+        available if available is not None and available > interval.end else None,
+        minimum if minimum is not None and minimum > interval.end else None,
+        node.startup_pv_loss + startup_loss * efficiency,
+        action == "charge" and (node.charge_grid_delivered or grid_charge > _EPS),
     ), solar_stored
 
 
@@ -398,8 +511,30 @@ def _slots(node: _Node) -> tuple[BatteryGridSlot, ...]:
     return tuple(reversed(slots))
 
 
+def _add_grid_charge(
+    previous: _Node, prepared: _Node, config: BatteryPlanningConfig,
+    efficiency: float, grid: float, elapsed_hours: float,
+) -> _Node:
+    """Reuse one interval's physical preparation balance for its quantities."""
+    base = prepared.slot
+    energy = prepared.energy + grid * efficiency
+    slot = BatteryGridSlot(
+        base.start, base.end, base.price, base.pv_kwh, base.load_kwh,
+        grid, base.pv_charge_kwh, 0., energy / config.capacity_kwh * 100,
+        "charge", base.reserved_pv_kwh, base.external_load_kwh,
+        base.grid_charge_available_at, base.startup_pv_loss_kwh,
+    )
+    return _Node(
+        energy, prepared.cost + grid * base.price, prepared.grid_energy + grid,
+        previous, slot, prepared.charge_moment + grid * elapsed_hours, True,
+        prepared.charge_not_before, prepared.charge_available_at,
+        prepared.charge_minimum_until, prepared.startup_pv_loss, True,
+    )
+
+
 def _executable_grid_energy(
     interval: _Interval, config: BatteryPlanningConfig, solar_ac: float, grid: float,
+    *, charging_hours: float | None = None,
 ) -> float:
     """Quantize the combined PV/grid command without purchasing extra energy.
 
@@ -411,19 +546,23 @@ def _executable_grid_energy(
     step = config.forced_charge_power_step_w
     if config.forced_charge_min_power_w is None and maximum is None and step is None:
         return grid
-    requested = (solar_ac + grid) * 1000 / interval.hours
+    hours = interval.hours if charging_hours is None else charging_hours
+    if hours <= 0:
+        return 0.
+    requested = (solar_ac + grid) * 1000 / hours
     watts = min(requested, maximum) if maximum is not None else requested
     if step is not None:
         watts = minimum + math.floor((watts - minimum + 1e-9) / step) * step
     if watts <= 0 or watts < minimum:
         return 0.
-    return max(0., min(grid, watts * interval.hours / 1000 - solar_ac))
+    return max(0., min(grid, watts * hours / 1000 - solar_ac))
 
 
 def _search_schedule(
     timeline: list[_Interval], config: BatteryPlanningConfig, efficiency: float,
     initial: _Node, baseline_solar: list[float], bounds: list[float],
     step: float, bucket_step: float, *, transition_budget: int | None = None,
+    baseline_energy: list[float] | None = None,
 ) -> _Node | None:
     """Search one bounded grouping of exact energy states, or abandon it."""
     attempts = 0
@@ -431,12 +570,50 @@ def _search_schedule(
     starts = [interval.start for interval in timeline]
     restart_delay = timedelta(minutes=config.grid_restart_delay_minutes)
     short_intervals = [interval.end - interval.start < restart_delay for interval in timeline]
+    episode_constraints = bool(config.grid_charge_minimum_minutes or config.grid_charge_startup_seconds
+                               or config.grid_charge_enable_seconds or initial.charge_minimum_until)
+    reserve = config.capacity_kwh * config.reserve_soc / 100
+    if baseline_energy is None:
+        baseline_energy = []
+        native_trace = initial
+        for row in timeline:
+            native_trace, _ = _transition(row, native_trace, config, efficiency, "self_consumption")
+            baseline_energy.append(native_trace.energy)
+    native_margin = [max(0., energy - reserve) for energy in baseline_energy]
+    future_margin = list(native_margin)
+    for index in range(len(future_margin) - 2, -1, -1):
+        future_margin[index] = min(future_margin[index], future_margin[index + 1])
+    end = timeline[-1].end
     grid_ceiling = config.capacity_kwh * config.grid_target_soc / 100
     for i, interval in enumerate(timeline):
-        following: dict[tuple[int, int, bool, int], _Node] = {}
+        following: dict[tuple, _Node] = {}
+
+        def loss_debt(candidate: _Node, solar: float) -> float:
+            # Only lost baseline uptake can be unused terminal inventory. Loss
+            # spent before a later native reserve hit must not debit that later
+            # refill. Extra later PV uptake is conservatively not credited.
+            if not candidate.startup_pv_loss:
+                return 0.
+            physical_loss = candidate.slot.startup_pv_loss_kwh * efficiency
+            baseline_loss = min(physical_loss, max(0., baseline_solar[i] - solar))
+            outstanding = max(0., candidate.startup_pv_loss - physical_loss + baseline_loss)
+            return min(outstanding, native_margin[i])
 
         def retain(candidate: _Node, solar: float) -> None:
-            if candidate.energy > bounds[i + 1] + _EPS or solar + _EPS < baseline_solar[i]:
+            outstanding = loss_debt(candidate, solar)
+            if outstanding != candidate.startup_pv_loss:
+                candidate = replace(candidate, startup_pv_loss=outstanding)
+            debit = min(outstanding, future_margin[i])
+            # Only actual setup loss at this same prior energy may relax the
+            # interval solar guard. Later capacity crowding remains forbidden.
+            setup_loss = candidate.slot.startup_pv_loss_kwh * efficiency
+            if (candidate.energy > max(0., bounds[i + 1] - debit) + _EPS
+                    or solar + setup_loss + _EPS < baseline_solar[i]):
+                return
+            if i == len(timeline) - 1 and candidate.charge_active and (
+                not candidate.charge_grid_delivered or candidate.charge_minimum_until is not None
+                or candidate.charge_available_at is not None
+            ):
                 return
             bucket = round(candidate.energy / bucket_step)
             # Two equal-energy states are not interchangeable if one may keep
@@ -445,43 +622,72 @@ def _search_schedule(
             # When the next entire interval already spans the off-delay, both
             # states may charge immediately or stop for that interval and then
             # restart. Keeping their active flags separate adds no capability.
-            active_matters = (candidate.charge_not_before is not None
+            active_matters = (episode_constraints or candidate.charge_not_before is not None
                               or (i + 1 < len(timeline) and short_intervals[i + 1]))
             active = candidate.charge_active if active_matters else False
             eligible = (bisect_left(starts, candidate.charge_not_before, lo=i + 1)
                         if candidate.charge_not_before is not None else i + 1)
-            key = (bucket, 0, active, eligible)
+            minimum = (bisect_left(starts, candidate.charge_minimum_until, lo=i + 1)
+                       if candidate.charge_minimum_until is not None else i + 1)
+            phase = ((candidate.charge_available_at, minimum, candidate.charge_grid_delivered)
+                     if episode_constraints and candidate.charge_active and (
+                         candidate.charge_available_at is not None
+                         or candidate.charge_minimum_until is not None
+                         or not candidate.charge_grid_delivered
+                     ) else None)
+            loss_bucket = round(debit / bucket_step) if future_margin[i] else 0
+            key = (bucket, 0, active, eligible, phase, loss_bucket)
             previous = following.get(key)
             if previous is None or _prefer_economic_node(candidate, previous):
                 following[key] = candidate
             # Preserve exact upper endpoints as well as the cheapest state in a
             # bucket. Otherwise a partial current slot or a precise demand gap
             # can lose its physically available last few Wh through pruning.
-            key = (bucket, 1, active, eligible)
+            key = (bucket, 1, active, eligible, phase, loss_bucket)
             previous = following.get(key)
             if (previous is None or candidate.energy > previous.energy
                     or (candidate.energy == previous.energy and _prefer_economic_node(candidate, previous))):
                 following[key] = candidate
 
-        for node in states.values():
+        # The cheapest and upper-endpoint keys often refer to the same node.
+        # Explore that identical trajectory once; retain both distinct choices.
+        for node in {id(value): value for value in states.values()}.values():
             # Count conservatively before each node's native/hold transitions.
             attempts += 3
             if transition_budget is not None and attempts > transition_budget:
                 return None
-            native, solar = _transition(interval, node, config, efficiency, "self_consumption")
-            retain(native, solar)
-            if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
-                retained, solar = _transition(interval, node, config, efficiency, "hold")
-                retain(retained, solar)
+            unfinished = node.charge_active and (
+                not node.charge_grid_delivered
+                or (node.charge_minimum_until is not None and interval.start < node.charge_minimum_until)
+                or (node.charge_available_at is not None and interval.start < node.charge_available_at)
+            )
+            # A fresh economic evaluation may stop an existing real episode
+            # immediately. Choosing continuation carries its original deadline;
+            # it may not become another short planned pulse at a later subslot.
+            may_stop_now = node.slot is None and config.grid_charge_active
+            if not unfinished or may_stop_now:
+                native, solar = _transition(interval, node, config, efficiency, "self_consumption")
+                retain(native, solar)
+                if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
+                    retained, solar = _transition(interval, node, config, efficiency, "hold")
+                    retain(retained, solar)
             if (interval.price > config.charge_price_limit
                     or (not node.charge_active and node.charge_not_before is not None
                         and interval.start < node.charge_not_before)):
                 continue
-            held, solar = _transition(interval, node, config, efficiency, "hold")
+            available, minimum = _charge_timing(interval, node, config)
+            if minimum is not None and minimum > end:
+                continue
+            held, solar = _transition(interval, node, config, efficiency, "charge")
+            hours = held.slot.charging_hours
+            if hours <= 0:
+                retain(held, solar)
+                continue
+            debit = min(loss_debt(held, solar), future_margin[i])
             maximum_grid = min(
-                config.max_charge_power_w * interval.hours / 1000,
-                config.native_charge_power_w * interval.hours / 1000 - solar / efficiency,
-                (min(grid_ceiling, bounds[i + 1]) - held.energy) / efficiency,
+                config.max_charge_power_w * hours / 1000,
+                config.native_charge_power_w * hours / 1000 - solar / efficiency,
+                (min(grid_ceiling, max(0., bounds[i + 1] - debit)) - held.energy) / efficiency,
             )
             if maximum_grid <= _EPS:
                 continue
@@ -495,11 +701,11 @@ def _search_schedule(
                 attempts += 1
                 if transition_budget is not None and attempts > transition_budget:
                     return None
-                grid = _executable_grid_energy(interval, config, solar / efficiency, grid)
+                grid = _executable_grid_energy(interval, config, solar / efficiency, grid, charging_hours=hours)
                 if grid <= _EPS or grid in seen:
                     continue
                 seen.add(grid)
-                charged, solar = _transition(interval, node, config, efficiency, "charge", grid)
+                charged = _add_grid_charge(node, held, config, efficiency, grid, interval.elapsed_hours)
                 retain(charged, solar)
         states = following
         if not states:
@@ -528,10 +734,12 @@ def build_battery_grid_plan(
     ceiling for grid charging, not a requested fill level. Invalid data returns
     an empty invalid plan. Freshness is checked by the caller before planning.
 
-    Grid charging may never reduce baseline solar uptake or leave additional
-    unused energy at the horizon. This excludes negative-price waste and export
-    arbitrage. Export revenue is not modeled. When holding is unavailable, every
-    non-charging interval follows native self consumption.
+    Grid charging may not crowd out baseline solar uptake or leave additional
+    unused energy at the horizon. Only unavoidable preparation loss at the same
+    starting energy is admitted and explicitly accounted; its remaining unused
+    baseline inventory tightens the terminal bound. This excludes negative-price
+    waste and export arbitrage. Export revenue is not modeled. When holding is
+    unavailable, every non-charging interval follows native self consumption.
 
     Bounded external loads reserve their share of forecast PV exactly once.
     Their remaining demand can receive native battery discharge up to the actual
@@ -543,9 +751,17 @@ def build_battery_grid_plan(
     """
     try:
         _validate_config(config, soc)
+        minimum_until = (_utc(config.grid_charge_minimum_until)
+                         if config.grid_charge_active and config.grid_charge_minimum_until is not None else None)
+        if minimum_until is not None and minimum_until <= _utc(now):
+            minimum_until = None
+        controls = (() if minimum_until is None else (
+            minimum_until, _utc(now) + timedelta(minutes=config.grid_restart_delay_minutes),
+        ))
         timeline = _timeline(
             now, tariff_windows, forecast, hourly_load_w, config.horizon_hours,
             load_commitments, grid_charge_not_before=config.grid_charge_not_before,
+            protected_instants=controls,
         )
     except (ValueError, TypeError, AttributeError) as exc:
         return BatteryGridPlan((), 0.0, 0.0, str(exc), 0.0, valid=False)
@@ -555,12 +771,16 @@ def build_battery_grid_plan(
         soc / 100 * config.capacity_kwh, 0.0, 0.0, None, None,
         charge_active=config.grid_charge_active,
         charge_not_before=_utc(config.grid_charge_not_before) if config.grid_charge_not_before is not None else None,
+        charge_grid_delivered=config.grid_charge_active,
+        charge_minimum_until=minimum_until,
     )
     baseline = initial
     baseline_solar = []
+    baseline_energy = []
     for interval in timeline:
         baseline, solar = _transition(interval, baseline, config, efficiency, "self_consumption")
         baseline_solar.append(solar)
+        baseline_energy.append(baseline.energy)
 
     # The future bounds preserve baseline PV uptake and require all added grid
     # energy to supply forecast household demand before the horizon ends.
@@ -576,13 +796,21 @@ def build_battery_grid_plan(
     # introduce an unverified pseudo-hold through tiny forced-charge commands.
     step = max(config.energy_step_kwh, config.capacity_kwh / 200)
     best = baseline
-    searches = [(step, step, None), (step, step / 2, _REFINEMENT_TRANSITION_BUDGET)]
+    constrained = bool(config.grid_charge_minimum_minutes or config.grid_charge_startup_seconds
+                       or config.grid_charge_enable_seconds or minimum_until)
+    # A small full-horizon candidate provides a useful incumbent even when a
+    # dense sequence of real boundaries exhausts the finer searches' budgets.
+    coarse_step = max(step, config.capacity_kwh / 8)
+    searches = ([(coarse_step, coarse_step, _EPISODE_COARSE_TRANSITION_BUDGET)]
+                if constrained else [])
+    searches += [(step, step, _EPISODE_PRIMARY_TRANSITION_BUDGET if constrained else None),
+                 (step, step / 2, _REFINEMENT_TRANSITION_BUDGET)]
     if config.hold_supported:
         searches.append((step / 2, step / 2, _QUANTITY_REFINEMENT_TRANSITION_BUDGET))
     for quantity_step, bucket_step, budget in searches:
         candidate = _search_schedule(
             timeline, config, efficiency, initial, baseline_solar, bounds,
-            quantity_step, bucket_step, transition_budget=budget,
+            quantity_step, bucket_step, transition_budget=budget, baseline_energy=baseline_energy,
         )
         if candidate is not None and _prefer_economic_node(candidate, best):
             best = candidate

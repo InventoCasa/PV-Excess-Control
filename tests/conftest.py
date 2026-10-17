@@ -105,6 +105,12 @@ def mock_inverter_controller():
     """An AsyncMock standing in for an InverterGridChargeController."""
     ctl = MagicMock()
     ctl.engage = AsyncMock(return_value=None)
+    ctl.prepare = AsyncMock(return_value=None)
+    ctl.set_power = AsyncMock(return_value=None)
+    async def enable_prepared(_power, *, before_enable=None):
+        if before_enable is not None:
+            await before_enable()
+    ctl.enable_prepared = AsyncMock(side_effect=enable_prepared)
     ctl.disengage = AsyncMock(return_value=None)
     ctl.verify_engaged = AsyncMock(return_value=None)
     ctl.verify_disengaged = AsyncMock(return_value=None)
@@ -207,6 +213,7 @@ def coordinator_factory():
         hass = _MockHass()
 
         base_data = {
+            "battery_grid_charge_minimum_minutes": 0,
             CONF_PV_POWER: "sensor.pv_power",
             CONF_GRID_EXPORT: "sensor.grid_export",
             CONF_LOAD_POWER: "sensor.load_power",
