@@ -93,7 +93,7 @@ def test_missing_ev_measurement_resets_unknown_background_history(economic_case)
         case.reading("sensor.appliance_power", 3000, unit_of_measurement="W")
         sample(case, 7000)
     case.reading("sensor.appliance_power", "unavailable")
-    assert sample(case, 7000)[2] == "active_ev_power_missing_or_stale"
+    assert sample(case, 7000)[2] is None
     case.clock["now"] += timedelta(seconds=10)
     case.reading("sensor.appliance_power", 3000, unit_of_measurement="W")
     rows, _, error = sample(case, 4500)

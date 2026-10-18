@@ -57,14 +57,12 @@ def test_ev_stop_invalidates_plan_without_waiting_five_minutes(economic_case):
     assert case.coord._battery_grid_plan.grid_energy_kwh == 0
 
 
-@pytest.mark.parametrize("problem", ["stale", "disabled", "paused", "override", "unbounded"])
+@pytest.mark.parametrize("problem", ["disabled", "paused", "override", "unbounded"])
 def test_uncertain_active_ev_clears_existing_plan(economic_case, problem):
     case = economic_case([.17, .35], [2.5, 0], [0, 2000])
     appliance(case)
     assert refresh(case) is None
-    if problem == "stale":
-        del case.states["sensor.appliance_power"]
-    elif problem == "disabled":
+    if problem == "disabled":
         case.coord.appliance_enabled["load"] = False
     elif problem == "paused":
         case.coord.appliance_paused = {"load": True}
@@ -179,7 +177,10 @@ def test_daily_runtime_ceiling_shortens_active_ev_run(economic_case):
 def test_unknown_runtime_is_not_replaced_by_a_cheap_window_estimate(economic_case):
     case = economic_case([.17, .35], [2.5, 0], [0, 2000])
     appliance(case, remaining_runtime_entity="sensor.missing")
-    assert refresh(case) == "active_ev_duration_unknown"
+    assert refresh(case) is None
+    assert case.coord._battery_load_commitments
+    assert all(row.end <= case.clock["now"] + timedelta(minutes=2)
+               for row in case.coord._battery_load_commitments)
 
 
 def test_end_before_splits_the_actual_cheap_window(economic_case):

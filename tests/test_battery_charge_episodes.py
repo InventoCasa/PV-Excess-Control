@@ -336,6 +336,7 @@ def test_interrupted_episode_search_keeps_complete_native_fallback(monkeypatch):
     monkeypatch.setattr(bp, '_EPISODE_PRIMARY_TRANSITION_BUDGET', 0)
     monkeypatch.setattr(bp, '_REFINEMENT_TRANSITION_BUDGET', 0)
     monkeypatch.setattr(bp, '_QUANTITY_REFINEMENT_TRANSITION_BUDGET', 0)
+    monkeypatch.setattr(bp, '_CHARGE_WINDOW_TRANSITION_BUDGET', 0)
     result = build([(8, .1), (60, .6)])
     assert result.valid and result.grid_energy_kwh == 0
     assert result.slots[0].start == NOW

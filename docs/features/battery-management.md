@@ -75,6 +75,13 @@ verified hold, the additional smaller-quantity search is omitted. All candidates
 must still honor actuator power steps, solar uptake and useful future demand.
 This improves selection without promising a global optimum or realized savings.
 
+With charge-duration constraints and verified hold support, a bounded set of
+cheap executable windows is also considered separately. This preserves useful
+full-window purchases that competing partial purchases can otherwise remove
+from the approximate search. Adjacent accounting intervals may jointly satisfy
+the minimum duration. The same physical and energy constraints apply, and an
+unfinished search cannot replace a completed plan.
+
 The pure search runs outside Home Assistant's event loop. Its detached input
 snapshot is revalidated before a result can drive a command, including current
 SoC, tariff and configured power/price limits. Stop, unload and watchdog requests
@@ -158,9 +165,10 @@ Known metered household runs and bounded EV demand remain immediate. The same
 background estimate accompanies known household runs without counting their
 metered power twice. Actual consumption learning and safety limits use current
 measurements, not the mean. No unknown load is extrapolated unchanged for 24
-hours. An active EV excluded from household history needs valid power and a
-credible duration bound; if these are unavailable, automatic purchases are
-blocked with a diagnostic reason instead of assuming its solar demand is zero.
+hours. A known EV operating limit supports a longer projection. Unavailable
+optional EV measurements use the bounded aggregate-demand estimate described
+below; explicit conflicts with an active consumer's configured policy still
+produce a diagnostic reason.
 
 The calculation also respects the discharge limit expected while those loads
 run. A device whose minimum setting is 100 W is modeled with that remaining
@@ -216,6 +224,16 @@ least **30 minutes of valid samples for every one of the 24 local hours**,
 usually at least one day; missing readings delay readiness. Each hour must have
 recent observations within seven days. The learned profile is persisted across
 reloads and midnight. Clearing the explicit profile returns to learning.
+
+When optional wallbox telemetry is unavailable, fresh total household power
+still supports battery planning. The unknown EV share stays within the measured
+aggregate demand, with a bounded outlook that grows only with sustained fresh
+observations. Known consumers are counted once. An unavailable EV's previous
+discharge limit is not assumed to remain active; normal discharge protection
+and physically confirmed economic hold retain their own control paths.
+Household-only learning pauses while the EV share cannot be separated
+reliably, then resumes when measurements recover. Required battery, household,
+PV and price input checks still apply.
 
 ## Executable charging episodes
 
@@ -416,6 +434,12 @@ If charging does not start, check the reason, data freshness, forecast/price
 coverage, profile readiness, purchase-price ceiling and physical readback
 mappings. A valid plan can correctly buy no energy when the price spread does
 not cover losses, later solar is sufficient, or the remaining demand is small.
+
+Normal native operation reports `self_consumption`, including at zero usable
+SoC. `target_reached` refers to an actual manual or planned charge target; a
+native interval's predicted ending SoC is not a charge target. If a new native
+decision ends an owned charge before its target, its stop record reports
+`plan_changed`. Restart-delay reasons retain precedence.
 
 Automatic economic charging also requires an adjustable charge-power entity.
 A single switch can still be used for manual charging, but cannot execute the

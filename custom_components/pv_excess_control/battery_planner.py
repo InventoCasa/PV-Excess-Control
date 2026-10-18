@@ -24,6 +24,8 @@ _REFINEMENT_TRANSITION_BUDGET = 100_000
 _QUANTITY_REFINEMENT_TRANSITION_BUDGET = 100_000
 _EPISODE_PRIMARY_TRANSITION_BUDGET = 300_000
 _EPISODE_COARSE_TRANSITION_BUDGET = 100_000
+_CHARGE_WINDOW_CANDIDATE_LIMIT = 4
+_CHARGE_WINDOW_TRANSITION_BUDGET = 25_000
 
 
 @dataclass(frozen=True)
@@ -563,8 +565,15 @@ def _search_schedule(
     initial: _Node, baseline_solar: list[float], bounds: list[float],
     step: float, bucket_step: float, *, transition_budget: int | None = None,
     baseline_energy: list[float] | None = None,
+    charge_window: tuple[int, int] | None = None,
 ) -> _Node | None:
-    """Search one bounded grouping of exact energy states, or abandon it."""
+    """Search exact states, optionally requiring one bounded charging window.
+
+    A fixed window explores only its executable upper charge endpoints. Keeping
+    it separate prevents cheaper partial purchases from pruning that complete
+    episode before its stored energy can serve a later peak. All physical,
+    solar, timing and terminal guards remain common to both search modes.
+    """
     attempts = 0
     states = {(round(initial.energy / bucket_step), 0): initial}
     starts = [interval.start for interval in timeline]
@@ -587,6 +596,7 @@ def _search_schedule(
     grid_ceiling = config.capacity_kwh * config.grid_target_soc / 100
     for i, interval in enumerate(timeline):
         following: dict[tuple, _Node] = {}
+        required_charge = charge_window is not None and charge_window[0] <= i < charge_window[1]
 
         def loss_debt(candidate: _Node, solar: float) -> float:
             # Only lost baseline uptake can be unused terminal inventory. Loss
@@ -665,13 +675,14 @@ def _search_schedule(
             # immediately. Choosing continuation carries its original deadline;
             # it may not become another short planned pulse at a later subslot.
             may_stop_now = node.slot is None and config.grid_charge_active
-            if not unfinished or may_stop_now:
+            if (not unfinished or may_stop_now) and not required_charge:
                 native, solar = _transition(interval, node, config, efficiency, "self_consumption")
                 retain(native, solar)
                 if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
                     retained, solar = _transition(interval, node, config, efficiency, "hold")
                     retain(retained, solar)
-            if (interval.price > config.charge_price_limit
+            if ((charge_window is not None and not required_charge)
+                    or interval.price > config.charge_price_limit
                     or (not node.charge_active and node.charge_not_before is not None
                         and interval.start < node.charge_not_before)):
                 continue
@@ -693,7 +704,8 @@ def _search_schedule(
                 continue
             # Include the exact endpoint: small residual demand is useful too.
             options = chain(
-                (j * step for j in range(1, int(maximum_grid / step) + 1)),
+                (() if charge_window is not None else
+                 (j * step for j in range(1, int(maximum_grid / step) + 1))),
                 (maximum_grid,),
             )
             seen = set()
@@ -716,6 +728,37 @@ def _search_schedule(
         if _prefer_economic_node(candidate, best):
             best = candidate
     return best
+
+
+def _charge_windows(
+    timeline: list[_Interval], config: BatteryPlanningConfig, initial: _Node,
+) -> list[tuple[int, int]]:
+    """Select a few cheap windows long enough for an executable new episode.
+
+    Real price/load boundaries remain intact. A short starting interval may
+    extend across adjacent eligible intervals to cover preparation and minimum
+    input time; search transitions validate the resulting physical trajectory.
+    """
+    windows = []
+    duration = timedelta(minutes=config.grid_charge_minimum_minutes,
+                         seconds=config.grid_charge_startup_seconds + config.grid_charge_enable_seconds)
+    for index, row in enumerate(timeline):
+        if (row.price > config.charge_price_limit
+                or (initial.charge_not_before is not None and row.start < initial.charge_not_before
+                    and not (index == 0 and initial.charge_active))):
+            continue
+        minimum = row.start + duration
+        if index == 0:
+            _, minimum = _charge_timing(row, initial, config)
+            minimum = minimum or row.start
+        end = index + 1
+        while timeline[end - 1].end < minimum and end < len(timeline):
+            end += 1
+        if (timeline[end - 1].end >= minimum
+                and all(part.price <= config.charge_price_limit for part in timeline[index:end])):
+            windows.append((index, end))
+    windows.sort(key=lambda window: (timeline[window[0]].price, window[0]))
+    return windows[:_CHARGE_WINDOW_CANDIDATE_LIMIT]
 
 
 def build_battery_grid_plan(
@@ -814,6 +857,18 @@ def build_battery_grid_plan(
         )
         if candidate is not None and _prefer_economic_node(candidate, best):
             best = candidate
+    if constrained and config.hold_supported:
+        # At most four additional searches of 25,000 transitions each. They
+        # retain the established incumbents even when a window is infeasible
+        # or its suffix cannot finish within the deterministic work budget.
+        for window in _charge_windows(timeline, config, initial):
+            candidate = _search_schedule(
+                timeline, config, efficiency, initial, baseline_solar, bounds,
+                step, step / 2, transition_budget=_CHARGE_WINDOW_TRANSITION_BUDGET,
+                baseline_energy=baseline_energy, charge_window=window,
+            )
+            if candidate is not None and _prefer_economic_node(candidate, best):
+                best = candidate
     savings = baseline.cost - best.cost
     if savings <= 1e-6:
         return BatteryGridPlan(_slots(baseline), 0.0, 0.0, "no_economic_benefit", soc)

@@ -1231,8 +1231,17 @@ class BatteryControlMixin:
                     self._battery_hold_retry_after = now + timedelta(minutes=5)
                     await release_control("hold_unconfirmed")
                 return
+            # A native interval's ending SoC is a prediction, not a charge target.
+            charge_target = (target if manual or episode is not None else
+                             self._battery_charge_target_soc if self._grid_charge_engaged else None)
+            if restart_waiting:
+                release_reason = "restart_delay"
+            elif charge_target is not None and soc >= charge_target:
+                release_reason = "target_reached"
+            else:
+                release_reason = "plan_changed" if self._grid_charge_engaged else "self_consumption"
             released = await self._release_battery_locked(
-                "restart_delay" if restart_waiting else "target_reached" if soc >= target else "self_consumption",
+                release_reason,
                 release_discharge=self._shared_discharge_mapping() is None,
             )
             if released and d.get("auto_battery_grid_charge"):
@@ -1539,11 +1548,13 @@ class BatteryControlMixin:
         else:
             self._arm_battery_watchdog(require_fresh_soc=False)
 
-    def _battery_load_policy_allows_run(self, appliance_id, data, now):
+    def _battery_load_policy_allows_run(self, appliance_id, data, now, *, skip_ev_connection=False):
         """Mirror immediate gates relevant to an already observed active run."""
         if self.appliance_overrides.get(appliance_id, False) or data.get("helper_only"):
             return True
         for key in ("ev_connected_entity", "enable_condition_entity"):
+            if key == "ev_connected_entity" and skip_ev_connection:
+                continue
             if key == "enable_condition_entity" and data.get("enable_condition_mode", "start_only") != "while_running":
                 continue
             if entity := data.get(key):
@@ -1706,6 +1717,15 @@ class BatteryControlMixin:
         self._battery_observed_house_runs = ()
         self._battery_observed_house_until = None
 
+    def _battery_load_state_available(self, state, now, max_age=None):
+        """Check optional load telemetry without inferring an on/off state."""
+        if not isinstance(state, State) or state.state in ("unknown", "unavailable"):
+            return False
+        if max_age is None:
+            return True  # On/off states can be event-driven; watts are polled.
+        stamp = getattr(state, "last_reported", None) or state.last_updated
+        return 0 <= (now - stamp).total_seconds() <= max_age
+
     def _battery_load_context(self, now, tariff, profile):
         """Project observed major loads without adding household history twice.
 
@@ -1713,6 +1733,8 @@ class BatteryControlMixin:
         A higher raw reading has a separate sixty-second observation window.
         Managed metered runs can extend to a known policy boundary. EV demand is
         separate because it was excluded when learning the household profile.
+        Missing EV telemetry uses the bounded aggregate outlook immediately;
+        its uncertain decomposition never enters the learned household profile.
         """
         from .battery_planner import BatteryLoadCommitment
 
@@ -1743,6 +1765,7 @@ class BatteryControlMixin:
         signature = []
         sources = []
         assumptions = set()
+        uncertain_ev = []
 
         # The normal discharge controller clamps its zero request to this native
         # minimum. This is a rate limit, not verified full hold capability.
@@ -1775,13 +1798,38 @@ class BatteryControlMixin:
             is_ev = bool(data.get("ev_soc_entity") or data.get("ev_connected_entity"))
             entity_id = data.get("appliance_entity")
             state = self.hass.states.get(entity_id) if entity_id else None
-            off = isinstance(state, State) and state.state in ("off", "0", "false", "False")
+            available = self._battery_load_state_available(state, now)
             watts = self._battery_read_number(data.get("actual_power_entity"), max_age=age, power=True)
+            off = (available and state.state in ("off", "0", "false", "False")
+                   and (watts is not None or self._battery_load_state_available(state, now, age)))
+            managed = (self.appliance_enabled.get(appliance_id, True)
+                       and not getattr(self, "appliance_paused", {}).get(appliance_id, False))
+            override = self.appliance_overrides.get(appliance_id, False)
+            managed = managed or override
+            settings = tuple((key, repr(value)) for key, value in sorted(data.items()))
+            connected_entity = data.get("ev_connected_entity")
+            connection_missing = bool(connected_entity and not self._battery_load_state_available(
+                self.hass.states.get(connected_entity), now))
+            runtime_entity = data.get("remaining_runtime_entity")
+            runtime_missing = bool(runtime_entity and not override and not data.get("on_only")
+                                   and not data.get("helper_only")
+                                   and self._battery_read_number(runtime_entity, max_age=300) is None)
+            telemetry_missing = is_ev and watts != 0 and not off and (
+                watts is None or watts < 0 or not available or connection_missing or runtime_missing)
             sources.append((appliance_id, entity_id, data.get("actual_power_entity"), is_ev,
-                            watts is not None and watts >= 0))
+                            watts is not None and watts >= 0, telemetry_missing))
+            if telemetry_missing:
+                # A fresh aggregate meter still observes this demand. Only its
+                # attribution and policy duration are unknown during the outage.
+                if watts is not None and watts > 0:
+                    if not managed:
+                        return invalid("active_ev_unmanaged")
+                    if not self._battery_load_policy_allows_run(
+                            appliance_id, data, now, skip_ev_connection=connection_missing):
+                        return invalid("active_ev_policy_uncertain")
+                uncertain_ev.append((appliance_id, settings, managed, override))
+                continue
             if watts is None or watts < 0:
-                if is_ev and not off:
-                    return invalid("active_ev_power_missing_or_stale")
                 continue  # Non-EV draw is still captured in aggregate house power.
             if is_ev:
                 ev_total += watts
@@ -1789,10 +1837,6 @@ class BatteryControlMixin:
                 metered_house += watts
             if watts <= 0:
                 continue
-            managed = (self.appliance_enabled.get(appliance_id, True)
-                       and not getattr(self, "appliance_paused", {}).get(appliance_id, False))
-            override = self.appliance_overrides.get(appliance_id, False)
-            managed = managed or override
             if is_ev and (not managed or off):
                 return invalid("active_ev_unmanaged")
             policy_allows = managed and self._battery_load_policy_allows_run(appliance_id, data, now)
@@ -1831,7 +1875,7 @@ class BatteryControlMixin:
             # power/policy change immediately invalidates a cached battery plan.
             projected_w = max(100., round(watts / 100) * 100.)
             signature.append((appliance_id, projected_w, managed, override, end, funded, limit, after_limit,
-                              tuple((key, repr(value)) for key, value in sorted(data.items()))))
+                              settings))
             if is_ev:
                 if funding_end is not None and funding_end < end and limit != after_limit:
                     ev_runs.append(BatteryLoadCommitment(now, funding_end, projected_w, limit))
@@ -1860,7 +1904,8 @@ class BatteryControlMixin:
             self._battery_load_sources = source_key
         try:
             background = self._battery_recent_house_load.observe(
-                reported_at, unmetered_base, min(unmetered_base, profile[now.hour]),
+                reported_at, unmetered_base,
+                unmetered_base if uncertain_ev else min(unmetered_base, profile[now.hour]),
                 reference_watts=max(0., profile[now.hour] - metered_house),
             )
         except ValueError:
@@ -1895,7 +1940,8 @@ class BatteryControlMixin:
         floor_level = observed_floor if floor_active else 0.
         reference = self._battery_recent_house_load.background_reference_watts
         horizon_seconds = self._battery_recent_house_load.persistence_seconds
-        background_active = bool(house_runs) and round(background / 100) > round(reference / 100)
+        background_active = bool(house_runs) and round(background / 100) > round(
+            (min(reference, max(0., profile[now.hour] - metered_house)) if uncertain_ev else reference) / 100)
         projection_active = floor_active or background_active
         unknown_limits = tuple((app_id, limit, funding_end) for app_id, end, limit, funding_end in limited_runs if end is None)
         until = self._battery_observed_load_until
@@ -1939,6 +1985,8 @@ class BatteryControlMixin:
             assumptions.add("observed_household_60_second_persistence")
         if unknown_limits:
             assumptions.add("observed_30_minute_discharge_limit")
+        if uncertain_ev:
+            assumptions.add("ev_telemetry_unavailable_aggregate_load")
         # Combine simultaneous metered household runs into a TOTAL household
         # floor. Taking max(profile, floor) keeps their historical contribution
         # from being charged twice. Unmapped excess is not projected all day.
@@ -1964,7 +2012,7 @@ class BatteryControlMixin:
         base_key = (round(background / 100) * 100., round(reference / 100) * 100.) if house_runs else None
         short_key = (raw_floor, short_end) if short_active else None
         key = (tuple(signature), observed_floor if projection_current else None, until if projection_current else None,
-               cap, base_key, short_key, limit_until, known_until)
+               cap, base_key, short_key, limit_until, known_until, tuple(uncertain_ev))
         return self._battery_load_commitments, key, None
 
     def _battery_charge_startup_seconds(self):
@@ -2237,14 +2285,15 @@ class BatteryControlMixin:
         """Learn non-EV household watts by local hour; never learn missing as zero."""
         d = self.config_entry.data
         now = dt_util.now()
-        watts = self._battery_read_number(d.get("load_power"), max_age=d.get("battery_input_max_age_seconds", 300), power=True)
+        age = d.get("battery_input_max_age_seconds", 300)
+        watts = self._battery_read_number(d.get("load_power"), max_age=age, power=True)
         for subentry in getattr(self.config_entry, "subentries", {}).values():
             if subentry.data.get("ev_soc_entity") or subentry.data.get("ev_connected_entity"):
                 state = self.hass.states.get(subentry.data.get("appliance_entity"))
-                if isinstance(state, State) and state.state in ("off", "0"):
+                if self._battery_load_state_available(state, now, age) and state.state in ("off", "0"):
                     continue
-                ev = self._battery_read_number(subentry.data.get("actual_power_entity"), max_age=300, power=True)
-                if ev is None:
+                ev = self._battery_read_number(subentry.data.get("actual_power_entity"), max_age=age, power=True)
+                if ev is None or ev < 0:
                     watts = None
                     break
                 if watts is not None:
