@@ -26,6 +26,7 @@ _EPISODE_PRIMARY_TRANSITION_BUDGET = 300_000
 _EPISODE_COARSE_TRANSITION_BUDGET = 100_000
 _CHARGE_WINDOW_CANDIDATE_LIMIT = 4
 _CHARGE_WINDOW_TRANSITION_BUDGET = 25_000
+_HOLD_EXCHANGE_CANDIDATE_LIMIT = 4
 
 
 @dataclass(frozen=True)
@@ -761,6 +762,85 @@ def _charge_windows(
     return windows[:_CHARGE_WINDOW_CANDIDATE_LIMIT]
 
 
+def _improve_current_hold(
+    timeline: list[_Interval], config: BatteryPlanningConfig, efficiency: float,
+    initial: _Node, incumbent: _Node, baseline_solar: list[float], bounds: list[float],
+) -> _Node:
+    """Check a few complete alternatives to a quantized current hold.
+
+    Nearby energy buckets can lose a cheaper native-first trajectory. Replaying
+    the completed suffix checks that alternative without another broad search.
+    An equal-energy exchange with a cheaper later discharge also preserves the
+    inventory intended for more expensive demand. Only native/hold plans are
+    eligible: preparation, active charging and future charge commands retain
+    their existing validated trajectories and timing constraints.
+    """
+    slots = _slots(incumbent)
+    if (not config.hold_supported or config.grid_charge_active or config.grid_charge_prepared
+            or not slots or slots[0].action != "hold"
+            or any(slot.action == "charge" for slot in slots)):
+        return incumbent
+
+    def replay(exchange: int | None) -> _Node | None:
+        node = initial
+        for index, (interval, slot) in enumerate(zip(timeline, slots)):
+            parts = [(interval, "self_consumption" if index == 0 else slot.action)]
+            if index == exchange:
+                previous_energy = slots[index - 1].soc_end * config.capacity_kwh / 100
+                debt_ac = (previous_energy - node.energy) * efficiency
+                possible = min(interval.deficit_kwh, interval.discharge_limit(config) * interval.hours / 1000)
+                # No solar charging inside the exchanged interval: a prefix
+                # hold then native discharge can restore its exact endpoint.
+                if (debt_ac <= _EPS or debt_ac > slot.discharge_kwh + _EPS
+                        or possible <= _EPS or interval.pv > interval.load):
+                    return None
+                native_fraction = max(0., slot.discharge_kwh - debt_ac) / possible
+                edge = interval.end - (interval.end - interval.start) * native_fraction
+                if edge <= interval.start:
+                    return None
+                if edge >= interval.end:
+                    parts = [(interval, "hold")]
+                else:
+                    # Scale every extensive quantity by the actual rounded
+                    # timestamp so the split retains the original power rates.
+                    fraction = (edge - interval.start) / (interval.end - interval.start)
+                    held = replace(interval, end=edge, pv=interval.pv * fraction,
+                                   load=interval.load * fraction, reserved_pv=interval.reserved_pv * fraction,
+                                   external_load=interval.external_load * fraction)
+                    native = replace(interval, start=edge, pv=interval.pv * (1 - fraction),
+                                     load=interval.load * (1 - fraction),
+                                     reserved_pv=interval.reserved_pv * (1 - fraction),
+                                     external_load=interval.external_load * (1 - fraction),
+                                     elapsed_hours=interval.elapsed_hours + (edge - interval.start).total_seconds() / 3600)
+                    parts = [(held, "hold"), (native, "self_consumption")]
+            solar = 0.
+            for part, action in parts:
+                node, captured = _transition(part, node, config, efficiency, action)
+                solar += captured
+                if not -_EPS <= node.energy <= config.capacity_kwh + _EPS:
+                    return None
+            # Preserve the existing native-solar, future-use and terminal
+            # bounds. No setup-loss allowance is needed without grid charging.
+            if node.energy > bounds[index + 1] + _EPS or solar + _EPS < baseline_solar[index]:
+                return None
+            if index == exchange and abs(node.energy - slot.soc_end * config.capacity_kwh / 100) > _EPS:
+                return None
+        return node
+
+    exchanges = sorted(
+        (index for index, slot in enumerate(slots[1:], 1)
+         if slot.action == "self_consumption" and slot.discharge_kwh > _EPS
+         and slot.price < slots[0].price),
+        key=lambda index: (slots[index].price, index),
+    )[:_HOLD_EXCHANGE_CANDIDATE_LIMIT]
+    best = incumbent
+    for exchange in [None, *exchanges]:
+        candidate = replay(exchange)
+        if candidate is not None and candidate.cost < best.cost - _ECONOMIC_TIE_EPS:
+            best = candidate
+    return best
+
+
 def build_battery_grid_plan(
     now: datetime,
     soc: float | None,
@@ -770,6 +850,7 @@ def build_battery_grid_plan(
     config: BatteryPlanningConfig,
     *,
     load_commitments: tuple[BatteryLoadCommitment, ...] = (),
+    continuation_plan: BatteryGridPlan | None = None,
 ) -> BatteryGridPlan:
     """Plan useful grid energy within contiguous, complete future input data.
 
@@ -869,6 +950,13 @@ def build_battery_grid_plan(
             )
             if candidate is not None and _prefer_economic_node(candidate, best):
                 best = candidate
+    if continuation_plan is not None:
+        from .battery_continuation import replay_continuation
+
+        candidate = replay_continuation(timeline, config, efficiency, initial, continuation_plan)
+        if candidate is not None and _prefer_economic_node(candidate, best):
+            best = candidate
+    best = _improve_current_hold(timeline, config, efficiency, initial, best, baseline_solar, bounds)
     savings = baseline.cost - best.cost
     if savings <= 1e-6:
         return BatteryGridPlan(_slots(baseline), 0.0, 0.0, "no_economic_benefit", soc)

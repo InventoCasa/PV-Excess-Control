@@ -57,6 +57,7 @@ class _BatteryPlanningRequest:
     profile: tuple
     config: object
     commitments: tuple
+    continuation_plan: object = None
 
     @property
     def inputs(self):
@@ -66,7 +67,7 @@ class _BatteryPlanningRequest:
         from .battery_planner import build_battery_grid_plan
         return build_battery_grid_plan(
             self.now, self.soc, self.tariffs, self.forecast, self.profile, self.config,
-            load_commitments=self.commitments,
+            load_commitments=self.commitments, continuation_plan=self.continuation_plan,
         )
 
 
@@ -2178,6 +2179,7 @@ class BatteryControlMixin:
         return None, _BatteryPlanningRequest(
             key, now, soc, tuple(tariff_info.windows), tuple(grid_forecast),
             tuple(profile), config, tuple(commitments),
+            self._battery_grid_plan if self._grid_charge_engaged else None,
         )
 
     def _battery_plan_needs_refresh(self, request):

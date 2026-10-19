@@ -82,10 +82,25 @@ from the approximate search. Adjacent accounting intervals may jointly satisfy
 the minimum duration. The same physical and energy constraints apply, and an
 unfinished search cannot replace a completed plan.
 
+For a native/hold plan with no charging commands, a bounded follow-up comparison
+checks whether using the battery immediately is cheaper than the current hold.
+It can exchange that discharge with an equal amount scheduled in a later,
+cheaper interval. Each complete alternative must preserve physical limits,
+native solar uptake and the useful-energy bounds. Holding for genuinely more
+expensive future demand remains available; there is no fixed high-price cutoff.
+
 The pure search runs outside Home Assistant's event loop. Its detached input
 snapshot is revalidated before a result can drive a command, including current
 SoC, tariff and configured power/price limits. Stop, unload and watchdog requests
 interrupt waiting for a search; an abandoned computation cannot publish a plan.
+
+While an owned automatic charge is physically active, its previous power
+trajectory is also considered against the new timeline. Current SoC, demand,
+PV, prices, actuator limits and charging deadlines are used to recalculate it.
+Only a fully valid, economically preferable continuation can win; the previous
+plan does not authorize continued charging by itself. This avoids discarding a
+useful running episode solely because confirmation introduces a new accounting
+boundary. Changed inputs and necessary immediate stops retain precedence.
 
 Load metadata that leaves the actual demand, solar availability and discharge
 limit unchanged does not create extra planning boundaries. Tariff, forecast,
