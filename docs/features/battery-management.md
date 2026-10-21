@@ -166,6 +166,29 @@ advice is hidden until that refresh without retargeting the active nominal plan.
 Both scenarios use the same physical limits and timing rules. Their modeled
 savings are not measured savings.
 
+### Recorded plans and actual states
+
+The status entity continues to expose complete `battery_plan` and
+`battery_pv_risk_plan` arrays live. Recorder excludes those two expanded arrays
+because long forecasts can exceed its attribute size limit and prevent all
+status details from being stored. Actual control state, reason, energy summaries
+and source metadata remain recorded.
+
+`battery_plan_archive` stores a bounded, lossless JSON archive compressed with
+zlib and encoded as base64. Its version and encoding are explicit. Use
+`decode_battery_plan_archive` from `battery_plan_archive.py` to recover the
+original `primary` and optional `lower` arrays from a historical state. Decoding
+validates the format and limits decompressed size. Existing live consumers do
+not need to change.
+
+The archive normally contains both plans. If its size budget is exceeded, it
+first retains the primary alone and reports `partial`; if that cannot fit, it
+reports `unavailable` with a reason. This is explicit missing plan history, never
+an empty or zero-energy forecast. Actual state history takes precedence over
+optional future-plan detail. If existing non-plan metadata already uses the
+attribute budget, the archive field is omitted entirely; absence also means
+unavailable, not an empty plan. Home Assistant's configured retention still applies.
+
 ### Actual provider retrieval time
 
 Optionally map **PV provider retrieval timestamp sensor**

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,6 +30,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_APPLIANCE_NAME, CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, DOMAIN
+from .battery_plan_archive import encode_battery_plan_archive
 from .coordinator import PvExcessCoordinator
 from .entity_lifecycle import add_entities_by_subentry, device_info
 from .models import BatteryDischargeAction
@@ -192,6 +194,10 @@ class PvExcessStatusSensor(PvExcessBaseSensor):
     """Top-level integration status sensor exposing coordinator state."""
 
     _attr_icon = "mdi:solar-power-variant"
+    # Keep complete live API plans while recording their lossless archive.
+    # Otherwise long horizons can exceed Recorder's 16 KiB attribute limit,
+    # causing even the actual control state and reason to disappear in history.
+    _unrecorded_attributes = frozenset({"battery_plan", "battery_pv_risk_plan"})
 
     def __init__(self, coordinator: PvExcessCoordinator) -> None:
         super().__init__(coordinator, "status", "Status")
@@ -238,6 +244,23 @@ class PvExcessStatusSensor(PvExcessBaseSensor):
                 self.coordinator, "_dyn_charge_reactive_w", 0
             )
 
+        recorded = {key: value for key, value in attrs.items()
+                    if key not in self._unrecorded_attributes}
+        try:
+            base_bytes = len(json.dumps(recorded, ensure_ascii=False,
+                                        separators=(",", ":")).encode())
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            # Optional archiving cannot break an existing diagnostic producer.
+            return attrs
+        if base_bytes > 15000:
+            # Even an unavailable-envelope must not displace existing actual
+            # state metadata. An absent archive means unavailable, never zero.
+            return attrs
+        remaining = 15000 - base_bytes - 128
+        attrs["battery_plan_archive"] = encode_battery_plan_archive(
+            attrs.get("battery_plan", []), attrs.get("battery_pv_risk_plan"),
+            max_bytes=max(0, min(12288, remaining)),
+        )
         return attrs
 
 
