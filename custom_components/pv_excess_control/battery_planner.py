@@ -143,6 +143,7 @@ class BatteryGridPlan:
     reason: str
     grid_target_soc: float
     valid: bool = True
+    low_pv_plan: BatteryGridPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -733,14 +734,51 @@ def _search_schedule(
 
 def _charge_windows(
     timeline: list[_Interval], config: BatteryPlanningConfig, initial: _Node,
+    native_nodes: list[_Node], baseline_solar: list[float], bounds: list[float],
 ) -> list[tuple[int, int]]:
-    """Select a few cheap windows long enough for an executable new episode.
+    """Select useful cheap windows from distinct charging opportunities.
 
     Real price/load boundaries remain intact. A short starting interval may
     extend across adjacent eligible intervals to cover preparation and minimum
-    input time; search transitions validate the resulting physical trajectory.
+    input time. Native-prefix headroom screens useless solar-filled windows;
+    search transitions still validate every complete physical trajectory.
     """
+    if _CHARGE_WINDOW_CANDIDATE_LIMIT <= 0:
+        return []
     windows = []
+    efficiency = math.sqrt(config.roundtrip_efficiency)
+    reserve = config.capacity_kwh * config.reserve_soc / 100
+    native_margin = [max(0., node.energy - reserve) for node in native_nodes[1:]]
+    future_margin = native_margin[:]
+    for index in range(len(future_margin) - 2, -1, -1):
+        future_margin[index] = min(future_margin[index], future_margin[index + 1])
+
+    def useful_input(start: int, end: int) -> bool:
+        # Native operation supplies the lowest-energy prefix. A window unable
+        # to add grid input there should not consume a scarce extra search just
+        # because its price is low while solar already fills the useful space.
+        node = native_nodes[start]
+        for index in range(start, end):
+            row = timeline[index]
+            held, solar = _transition(row, node, config, efficiency, "charge")
+            physical_loss = held.slot.startup_pv_loss_kwh * efficiency
+            baseline_loss = min(physical_loss, max(0., baseline_solar[index] - solar))
+            outstanding = min(max(0., held.startup_pv_loss - physical_loss + baseline_loss),
+                              native_margin[index])
+            debit = min(outstanding, future_margin[index])
+            if (held.energy > max(0., bounds[index + 1] - debit) + _EPS
+                    or solar + physical_loss + _EPS < baseline_solar[index]):
+                return False
+            hours = held.slot.charging_hours
+            if hours > 0:
+                maximum = min(config.max_charge_power_w * hours / 1000,
+                    config.native_charge_power_w * hours / 1000 - solar / efficiency,
+                    (min(config.capacity_kwh * config.grid_target_soc / 100,
+                         max(0., bounds[index + 1] - debit)) - held.energy) / efficiency)
+                return _executable_grid_energy(row, config, solar / efficiency, maximum,
+                                               charging_hours=hours) > _EPS
+            node = replace(held, startup_pv_loss=outstanding)
+        return False
     duration = timedelta(minutes=config.grid_charge_minimum_minutes,
                          seconds=config.grid_charge_startup_seconds + config.grid_charge_enable_seconds)
     for index, row in enumerate(timeline):
@@ -756,10 +794,29 @@ def _charge_windows(
         while timeline[end - 1].end < minimum and end < len(timeline):
             end += 1
         if (timeline[end - 1].end >= minimum
-                and all(part.price <= config.charge_price_limit for part in timeline[index:end])):
+                and all(part.price <= config.charge_price_limit for part in timeline[index:end])
+                and useful_input(index, end)):
             windows.append((index, end))
-    windows.sort(key=lambda window: (timeline[window[0]].price, window[0]))
-    return windows[:_CHARGE_WINDOW_CANDIDATE_LIMIT]
+    # Consecutive feasible starts compete for the same opportunity. Give each
+    # distinct period a candidate before spending the bounded work on several
+    # adjacent starts that all serve the same demand before a solar refill.
+    groups: list[list[tuple[int, int]]] = []
+    for window in windows:
+        if not groups or window[0] != groups[-1][-1][0] + 1:
+            groups.append([])
+        groups[-1].append(window)
+    key = lambda window: (timeline[window[0]].price, window[0])
+    for group in groups:
+        group.sort(key=key)
+    groups.sort(key=lambda group: key(group[0]))
+    selected = []
+    for depth in range(_CHARGE_WINDOW_CANDIDATE_LIMIT):
+        for group in groups:
+            if depth < len(group):
+                selected.append(group[depth])
+                if len(selected) == _CHARGE_WINDOW_CANDIDATE_LIMIT:
+                    return selected
+    return selected
 
 
 def _improve_current_hold(
@@ -899,12 +956,14 @@ def build_battery_grid_plan(
         charge_minimum_until=minimum_until,
     )
     baseline = initial
+    native_nodes = [initial]
     baseline_solar = []
     baseline_energy = []
     for interval in timeline:
         baseline, solar = _transition(interval, baseline, config, efficiency, "self_consumption")
         baseline_solar.append(solar)
         baseline_energy.append(baseline.energy)
+        native_nodes.append(baseline)
 
     # The future bounds preserve baseline PV uptake and require all added grid
     # energy to supply forecast household demand before the horizon ends.
@@ -942,7 +1001,7 @@ def build_battery_grid_plan(
         # At most four additional searches of 25,000 transitions each. They
         # retain the established incumbents even when a window is infeasible
         # or its suffix cannot finish within the deterministic work budget.
-        for window in _charge_windows(timeline, config, initial):
+        for window in _charge_windows(timeline, config, initial, native_nodes, baseline_solar, bounds):
             candidate = _search_schedule(
                 timeline, config, efficiency, initial, baseline_solar, bounds,
                 step, step / 2, transition_budget=_CHARGE_WINDOW_TRANSITION_BUDGET,

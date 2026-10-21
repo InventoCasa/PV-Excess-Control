@@ -57,6 +57,9 @@ from .const import (
     CONF_BATTERY_SOC_HYSTERESIS,
     CONF_BATTERY_INPUT_MAX_AGE_SECONDS,
     CONF_BATTERY_FORECAST_MAX_AGE_SECONDS,
+    CONF_BATTERY_FORECAST_UPDATED_ENTITY,
+    CONF_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS,
+    DEFAULT_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS,
     CONF_BATTERY_LOAD_PROFILE_W,
     CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY,
     CONF_INVERTER_FORCE_CHARGE_MODE_FEEDBACK_ENTITY,
@@ -715,6 +718,8 @@ _BATTERY_PLANNING_NUMBERS = {
     CONF_BATTERY_SOC_HYSTERESIS: (2, 0, 20, 0.1, "%"),
     CONF_BATTERY_INPUT_MAX_AGE_SECONDS: (300, 30, 3600, 1, "s"),
     CONF_BATTERY_FORECAST_MAX_AGE_SECONDS: (21600, 300, 172800, 60, "s"),
+    CONF_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS: (
+        DEFAULT_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS, 1, 72, 1, "h"),
 }
 _BATTERY_FEEDBACK_KEYS = (
     CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY,
@@ -723,6 +728,7 @@ _BATTERY_FEEDBACK_KEYS = (
     CONF_BATTERY_HOLD_FEEDBACK_ENTITY,
 )
 _BATTERY_PLANNING_OPTIONAL_KEYS = (
+    CONF_BATTERY_FORECAST_UPDATED_ENTITY,
     *_BATTERY_FEEDBACK_KEYS,
     CONF_BATTERY_LOAD_PROFILE_W,
     CONF_BATTERY_HOLD_ENTITY,
@@ -744,6 +750,9 @@ def _battery_planning_schema(defaults: dict[str, Any]) -> dict:
         if unit is not None:
             selector_config["unit_of_measurement"] = unit
         fields[vol.Required(key, default=defaults.get(key, default))] = NumberSelector(selector_config)
+    fields[vol.Optional(CONF_BATTERY_FORECAST_UPDATED_ENTITY, description={
+        "suggested_value": defaults.get(CONF_BATTERY_FORECAST_UPDATED_ENTITY),
+    })] = EntitySelector(EntitySelectorConfig(domain=["sensor"]))
     profile = defaults.get(CONF_BATTERY_LOAD_PROFILE_W)
     fields[vol.Optional(CONF_BATTERY_LOAD_PROFILE_W, description={
         "suggested_value": json.dumps(profile) if isinstance(profile, list) else profile,
@@ -915,6 +924,14 @@ def _validate_battery_section(data: dict) -> None:
         value = data.get(key)
         if isinstance(value, str) and not value.strip():
             data.pop(key, None)
+    if CONF_BATTERY_FORECAST_UPDATED_ENTITY in data:
+        source_entity = data[CONF_BATTERY_FORECAST_UPDATED_ENTITY]
+        if (not isinstance(source_entity, str) or not valid_entity_id(source_entity)
+                or not source_entity.startswith("sensor.")):
+            raise vol.Invalid(
+                "battery_forecast_updated_entity must be a sensor entity ID",
+                path=[CONF_BATTERY_FORECAST_UPDATED_ENTITY],
+            )
     enable_entity = data.get(CONF_INVERTER_FORCE_CHARGE_ENABLE_ENTITY)
     if enable_entity:
         if not data.get(CONF_INVERTER_FORCE_CHARGE_ENABLE_ENGAGE_VALUE):
@@ -1434,6 +1451,8 @@ class PvExcessControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             if not errors:
                 self.data.update(user_input)
+                if CONF_BATTERY_FORECAST_UPDATED_ENTITY not in user_input:
+                    self.data.pop(CONF_BATTERY_FORECAST_UPDATED_ENTITY, None)
                 return await self.async_step_settings()
 
         return self.async_show_form(

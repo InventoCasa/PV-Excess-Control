@@ -163,6 +163,8 @@ CONF_BATTERY_WEAR_COST_PER_KWH = "battery_wear_cost_per_kwh"
 CONF_BATTERY_SOC_HYSTERESIS = "battery_soc_hysteresis"
 CONF_BATTERY_INPUT_MAX_AGE_SECONDS = "battery_input_max_age_seconds"
 CONF_BATTERY_FORECAST_MAX_AGE_SECONDS = "battery_forecast_max_age_seconds"
+CONF_BATTERY_FORECAST_UPDATED_ENTITY = "battery_forecast_updated_entity"
+CONF_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS = "battery_forecast_source_max_age_hours"
 CONF_BATTERY_LOAD_PROFILE_W = "battery_load_profile_w"
 CONF_INVERTER_FORCE_CHARGE_ENABLE_FEEDBACK_ENTITY = "inverter_force_charge_enable_feedback_entity"
 CONF_INVERTER_FORCE_CHARGE_MODE_FEEDBACK_ENTITY = "inverter_force_charge_mode_feedback_entity"
@@ -184,6 +186,7 @@ DEFAULT_BATTERY_WEAR_COST_PER_KWH = 0.0
 DEFAULT_BATTERY_SOC_HYSTERESIS = 2.0
 DEFAULT_BATTERY_INPUT_MAX_AGE_SECONDS = 300
 DEFAULT_BATTERY_FORECAST_MAX_AGE_SECONDS = 21600
+DEFAULT_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS = 24.0
 
 CONF_EXPORT_LIMIT = "export_limit"
 CONF_CONTROLLER_INTERVAL = "controller_interval"

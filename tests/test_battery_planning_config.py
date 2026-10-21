@@ -24,6 +24,7 @@ NUMERIC_LIMITS = {
     "battery_soc_hysteresis": (2, 0, 20),
     "battery_input_max_age_seconds": (300, 30, 3600),
     "battery_forecast_max_age_seconds": (21600, 300, 172800),
+    "battery_forecast_source_max_age_hours": (24, 1, 72),
 }
 
 
@@ -184,7 +185,7 @@ async def test_invalid_profile_is_reported_on_its_field_and_retained_for_editing
 def test_planning_fields_have_labels_and_help_in_both_languages():
     from pathlib import Path
     component = Path(__file__).parents[1] / "custom_components/pv_excess_control"
-    new_fields = set(NUMERIC_LIMITS) | {"battery_load_profile_w","battery_hold_verified","battery_hold_entity","battery_hold_engage_value","battery_hold_release_value","battery_hold_feedback_entity","battery_hold_feedback_engage_value","battery_hold_feedback_release_value","inverter_force_charge_enable_feedback_entity","inverter_force_charge_mode_feedback_entity","inverter_force_charge_power_feedback_entity"}
+    new_fields = set(NUMERIC_LIMITS) | {"battery_forecast_updated_entity","battery_load_profile_w","battery_hold_verified","battery_hold_entity","battery_hold_engage_value","battery_hold_release_value","battery_hold_feedback_entity","battery_hold_feedback_engage_value","battery_hold_feedback_release_value","inverter_force_charge_enable_feedback_entity","inverter_force_charge_mode_feedback_entity","inverter_force_charge_power_feedback_entity"}
     for filename in ["strings.json","translations/en.json","translations/de.json"]:
         data = json.loads((component/filename).read_text())
         for section in ["config", "options"]:
@@ -308,3 +309,80 @@ def test_manual_only_switch_mapping_does_not_require_planner_power_limits():
         "inverter_force_charge_enable_entity":"switch.charge",
         "inverter_force_charge_enable_engage_value":"on",
         "inverter_force_charge_enable_disengage_value":"off"})
+
+
+FORECAST_UPDATED = "battery_forecast_updated_entity"
+
+def test_provider_timestamp_mapping_is_optional_sensor_only_and_keeps_selection():
+    schema = _battery_schema({FORECAST_UPDATED: "sensor.pv_provider_updated"})
+    marker = next((key for key in schema.schema if key.schema == FORECAST_UPDATED), None)
+    assert marker is not None
+    assert isinstance(marker, vol.Optional)
+    assert marker.description["suggested_value"] == "sensor.pv_provider_updated"
+    assert schema.schema[marker].config["domain"] == ["sensor"]
+
+
+@pytest.mark.parametrize("value", [None, False, 17, [], {}, "input_datetime.provider",
+                                  "input_number.provider", "switch.provider",
+                                  "binary_sensor.provider", "sensor.", "sensor.provider.extra",
+                                  "sensor.Provider", "sensor.provider updated"])
+def test_provider_timestamp_mapping_rejects_non_sensor_or_malformed_entities(value):
+    with pytest.raises(vol.Invalid, match=FORECAST_UPDATED) as caught:
+        _validate_battery_section({FORECAST_UPDATED: value})
+    assert caught.value.path == [FORECAST_UPDATED]
+
+
+def test_provider_timestamp_mapping_accepts_sensor_without_reading_live_state():
+    # Availability and timestamp freshness are runtime responsibilities.
+    data = {FORECAST_UPDATED: "sensor.provider_last_updated"}
+    _validate_battery_section(data)
+    assert data[FORECAST_UPDATED] == "sensor.provider_last_updated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow_class", [PvExcessControlConfigFlow, PvExcessControlOptionsFlow])
+@pytest.mark.parametrize("replacement", [None, " ", "sensor.provider_new"])
+async def test_provider_timestamp_mapping_can_be_cleared_or_replaced(flow_class, replacement):
+    flow = flow_class()
+    flow.data = {FORECAST_UPDATED: "sensor.provider_old", "_grid_charge_engaged": True,
+                 "battery_forecast_max_age_seconds": 21600, "unrelated": "keep"}
+    flow.async_step_settings = AsyncMock(return_value={"step_id": "settings"})
+    submitted = {"battery_target_soc": 100}
+    if replacement is not None:
+        submitted[FORECAST_UPDATED] = replacement
+    result = await flow.async_step_battery(submitted)
+    assert result["step_id"] == "settings"
+    if replacement is None or not replacement.strip():
+        assert FORECAST_UPDATED not in flow.data
+    else:
+        assert flow.data[FORECAST_UPDATED] == replacement
+    assert flow.data["_grid_charge_engaged"] is True
+    assert flow.data["battery_forecast_max_age_seconds"] == 21600
+    assert flow.data["unrelated"] == "keep"
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_timestamp_mapping_is_reported_on_its_field():
+    flow = PvExcessControlOptionsFlow()
+    flow.data = {}
+    flow.async_step_settings = AsyncMock(return_value={"step_id": "settings"})
+    result = await flow.async_step_battery({FORECAST_UPDATED: "switch.not_a_timestamp"})
+    assert result.get("errors") == {FORECAST_UPDATED: "invalid_battery_setting"}
+
+
+@pytest.mark.asyncio
+async def test_options_save_does_not_restore_removed_provider_timestamp_mapping(monkeypatch):
+    from unittest.mock import MagicMock
+    entry = MagicMock()
+    entry.data = {"inverter_type": "hybrid", FORECAST_UPDATED: "sensor.old",
+                  "battery_forecast_source_max_age_hours": 24, "_grid_charge_engaged": True}
+    flow = PvExcessControlOptionsFlow()
+    flow.hass = MagicMock()
+    monkeypatch.setattr(PvExcessControlOptionsFlow, "config_entry", property(lambda self: entry))
+    flow.data = {"inverter_type": "hybrid", "battery_forecast_source_max_age_hours": 24}
+    flow.async_create_entry = MagicMock(return_value={"type": "create_entry"})
+    await flow.async_step_settings({"controller_interval": "30", "planner_interval": "900"})
+    saved = flow.hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert FORECAST_UPDATED not in saved
+    assert saved["battery_forecast_source_max_age_hours"] == 24
+    assert saved["_grid_charge_engaged"] is True

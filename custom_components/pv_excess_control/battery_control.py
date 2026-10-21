@@ -18,9 +18,12 @@ from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_BATTERY_FORECAST_UPDATED_ENTITY,
+    CONF_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS,
     CONF_BATTERY_GRID_CHARGE_MINIMUM_MINUTES,
     CONF_BATTERY_PV_FORECAST_FACTOR,
     DEFAULT_BATTERY_GRID_CHARGE_MINIMUM_MINUTES,
+    DEFAULT_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS,
     DEFAULT_BATTERY_PV_FORECAST_FACTOR,
 )
 from .inverter_control import InverterGridChargeController
@@ -58,17 +61,39 @@ class _BatteryPlanningRequest:
     config: object
     commitments: tuple
     continuation_plan: object = None
+    low_forecast: tuple | None = None
+    low_status: str = "unavailable"
 
     @property
     def inputs(self):
         return self.key, self.soc, self.profile, self.config
 
+    @property
+    def risk_key(self):
+        """Optional data cannot invalidate operational decisions."""
+        return (self.low_status,
+                tuple((row.start, row.end, row.expected_kwh) for row in self.low_forecast)
+                if self.low_forecast is not None else None)
+
     def build(self):
-        from .battery_planner import build_battery_grid_plan
-        return build_battery_grid_plan(
+        from .battery_planner import BatteryGridPlan, build_battery_grid_plan
+        primary = build_battery_grid_plan(
             self.now, self.soc, self.tariffs, self.forecast, self.profile, self.config,
             load_commitments=self.commitments, continuation_plan=self.continuation_plan,
         )
+        if not primary.valid or self.low_forecast is None:
+            return primary
+        try:
+            low = build_battery_grid_plan(
+                self.now, self.soc, self.tariffs, self.low_forecast, self.profile, self.config,
+                load_commitments=self.commitments, continuation_plan=self.continuation_plan,
+            )
+        except Exception:
+            # An optional sensitivity calculation never authorizes a command
+            # or invalidates an otherwise complete primary decision.
+            _LOGGER.debug("Lower PV sensitivity calculation failed", exc_info=True)
+            low = BatteryGridPlan((), 0., 0., "low_pv_calculation_failed", self.soc, valid=False)
+        return replace(primary, low_pv_plan=low)
 
 
 def _finite(value):
@@ -111,6 +136,10 @@ class BatteryControlMixin:
         self._battery_grid_plan = None
         self._battery_plan_key = None
         self._battery_plan_created = None
+        self._battery_pv_low_status = "unavailable"
+        self._battery_pv_risk_key = None
+        self._battery_pv_nominal_energy = None
+        self._battery_pv_low_energy = None
         self._battery_planning_abort = None
         self._battery_charge_power = None
         self._battery_charge_deadline = None
@@ -2044,6 +2073,34 @@ class BatteryControlMixin:
             raise ValueError("invalid_charge_startup_budget")
         return timeout
 
+    def _battery_forecast_source(self):
+        """Read actual acquisition time; HA report times are not acquisitions."""
+        data = self.config_entry.data
+        entity = data.get(CONF_BATTERY_FORECAST_UPDATED_ENTITY)
+        if not entity:
+            return "not_configured", None, None
+        hours = data.get(CONF_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS,
+                         DEFAULT_BATTERY_FORECAST_SOURCE_MAX_AGE_HOURS)
+        maximum = _finite(hours)
+        if isinstance(hours, bool) or maximum is None or not 1 <= maximum <= 72:
+            return "invalid_forecast_source_age", None, None
+        if not isinstance(entity, str) or not entity.startswith("sensor."):
+            return "forecast_source_unavailable", None, None
+        state = self.hass.states.get(entity)
+        try:
+            stamp = datetime.fromisoformat(state.state) if isinstance(state, State) else None
+            if stamp is None or stamp.tzinfo is None or stamp.utcoffset() is None:
+                raise ValueError
+            stamp = stamp.astimezone(timezone.utc)
+            age = (dt_util.utcnow() - stamp).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return "forecast_source_unavailable", None, None
+        if age < -5:
+            return "forecast_source_unavailable", stamp, age
+        if age > maximum * 3600:
+            return "forecast_source_stale", stamp, age
+        return "available", stamp, max(0., age)
+
     def _battery_planning_request(self, tariff_info, power_state):
         """Validate observations before passing immutable inputs to pure planning."""
         from .battery_planner import BatteryPlanningConfig
@@ -2076,6 +2133,10 @@ class BatteryControlMixin:
                 or not math.isfinite(factor) or not .1 <= factor <= 1.):
             self._battery_grid_plan = None
             return "invalid_pv_forecast_factor", None
+        source_status, source_time, _ = self._battery_forecast_source()
+        if source_status not in ("not_configured", "available"):
+            self._battery_grid_plan = None
+            return source_status, None
         age = d.get("battery_input_max_age_seconds", 300)
         # Use the live State object: REST serialization can cache old report
         # timestamps for unchanged zero readings even while polls keep arriving.
@@ -2120,8 +2181,24 @@ class BatteryControlMixin:
             if not isinstance(state, State) or state.state in ("unknown", "unavailable"):
                 return "forecast_unavailable", None
             stamp = getattr(state, "last_reported", None) or state.last_updated
-            if not -5 <= (dt_util.utcnow() - stamp).total_seconds() <= d.get("battery_forecast_max_age_seconds", 21600):
+            if (source_status == "not_configured"
+                    and not -5 <= (dt_util.utcnow() - stamp).total_seconds() <= d.get("battery_forecast_max_age_seconds", 21600)):
                 return "forecast_stale", None
+        from .battery_forecast import build_battery_forecast_scenarios
+        detached_states = {entity: {"state": self.hass.states.get(entity).state,
+                                   "attributes": dict(self.hass.states.get(entity).attributes)}
+                           for entity in sources}
+        try:
+            scenarios = build_battery_forecast_scenarios(
+                provider_type=d.get("forecast_provider", "none"),
+                nominal=forecast.hourly_breakdown, states=detached_states,
+                entities=tuple(getattr(self, "_forecast_entities", ())),
+                tomorrow_entities=tuple(getattr(self, "_forecast_tomorrow_entities", ())),
+                now=now, factor=factor,
+            )
+        except (ValueError, TypeError, AttributeError, ArithmeticError):
+            self._battery_grid_plan = None
+            return "invalid_forecast_data", None
         profile = self._battery_load_profile()
         if profile is None:
             self._battery_grid_plan = None
@@ -2159,6 +2236,7 @@ class BatteryControlMixin:
             roundtrip_efficiency=d.get("battery_roundtrip_efficiency", .85),
             wear_cost_per_kwh=d.get("battery_wear_cost_per_kwh", 0),
             charge_price_limit=price_limit, hold_supported=hold,
+            horizon_hours=48.,
             forced_charge_min_power_w=charge_constraints[0],
             forced_charge_max_power_w=charge_constraints[1],
             forced_charge_power_step_w=charge_constraints[2],
@@ -2173,24 +2251,49 @@ class BatteryControlMixin:
         )
         # Calibration belongs to grid-purchase planning only. The shared
         # provider forecast still drives independent solar/appliance plans.
-        grid_forecast = [replace(row, expected_kwh=row.expected_kwh * factor,
-                                 expected_watts=row.expected_watts * factor)
-                         for row in forecast.hourly_breakdown]
         return None, _BatteryPlanningRequest(
-            key, now, soc, tuple(tariff_info.windows), tuple(grid_forecast),
+            key, now, soc, tuple(tariff_info.windows), scenarios.nominal,
             tuple(profile), config, tuple(commitments),
             self._battery_grid_plan if self._grid_charge_engaged else None,
+            scenarios.low, scenarios.low_status,
         )
 
     def _battery_plan_needs_refresh(self, request):
         stale = (self._battery_plan_created is None
-                 or (request.now - self._battery_plan_created).total_seconds() >= 300)
+                 or (request.now.astimezone(timezone.utc)
+                     - self._battery_plan_created.astimezone(timezone.utc)).total_seconds() >= 300)
         return request.key != self._battery_plan_key or self._current_battery_slot() is None or stale
 
-    def _commit_battery_grid_plan(self, request, plan):
+    def _invalidate_battery_risk_if_changed(self, request):
+        """Hide stale advice without moving the primary target or refresh time."""
+        if self._battery_grid_plan is not None and request.risk_key != self._battery_pv_risk_key:
+            self._battery_grid_plan = replace(self._battery_grid_plan, low_pv_plan=None)
+            self._battery_pv_low_status = "refresh_pending" if request.low_forecast is not None else request.low_status
+            self._battery_pv_low_energy = None
+            self._battery_pv_risk_key = request.risk_key
+
+    def _commit_battery_grid_plan(self, request, plan, *, current_risk=None):
+        stale_risk = current_risk is not None and current_risk.risk_key != request.risk_key
+        if stale_risk:
+            plan = replace(plan, low_pv_plan=None)
         self._battery_grid_plan = plan
         self._battery_plan_key = request.key
         self._battery_plan_created = request.now
+        self._battery_pv_risk_key = (current_risk or request).risk_key
+        self._battery_pv_low_status = ("refresh_pending" if current_risk.low_forecast is not None else current_risk.low_status
+                                      ) if stale_risk else request.low_status
+        def energy(rows):
+            if rows is None or not plan.valid or not plan.slots:
+                return None
+            start = plan.slots[0].start.astimezone(timezone.utc)
+            end = plan.slots[-1].end.astimezone(timezone.utc)
+            total = 0.
+            for row in rows:
+                left, right = row.start.astimezone(timezone.utc), row.end.astimezone(timezone.utc)
+                total += row.expected_kwh * max(0., (min(right, end) - max(left, start)).total_seconds()) / (right - left).total_seconds()
+            return total
+        self._battery_pv_nominal_energy = energy(request.forecast)
+        self._battery_pv_low_energy = None if stale_risk else energy(request.low_forecast)
         return None if plan.valid else plan.reason
 
     def _interrupt_battery_planning(self):
@@ -2225,6 +2328,7 @@ class BatteryControlMixin:
         reason, request = self._battery_planning_request(tariff_info, power_state)
         if reason:
             return reason
+        self._invalidate_battery_risk_if_changed(request)
         if self._battery_plan_needs_refresh(request):
             return self._commit_battery_grid_plan(request, request.build())
         return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason
@@ -2253,6 +2357,7 @@ class BatteryControlMixin:
                 reason, request = self._battery_planning_request(tariff_info, power_state)
                 if reason:
                     return reject(reason)
+                self._invalidate_battery_risk_if_changed(request)
                 if not self._battery_plan_needs_refresh(request):
                     return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason
                 latest_tariff = self._latest_tariff
@@ -2269,7 +2374,7 @@ class BatteryControlMixin:
                 covers_now = (not plan.valid or (plan.slots and
                               plan.slots[0].start <= dt_util.utcnow() < plan.slots[0].end))
                 if current.inputs == request.inputs and covers_now:
-                    return self._commit_battery_grid_plan(request, plan)
+                    return self._commit_battery_grid_plan(request, plan, current_risk=current)
                 reject("planning_input_changed")
             return reject("planning_input_changed")
         except asyncio.CancelledError:
@@ -2368,6 +2473,10 @@ class BatteryControlMixin:
     def battery_control_diagnostics(self):
         self._init_battery_control()
         plan = self._battery_grid_plan
+        low = plan.low_pv_plan if plan and plan.valid else None
+        source_status, source_time, source_age = self._battery_forecast_source()
+        low_status = ("available" if low and low.valid else low.reason if low is not None
+                      else self._battery_pv_low_status if plan and plan.valid else "unavailable")
         measured_flow = self._measured_battery_grid_flow()
         minimum = self.config_entry.data.get(CONF_BATTERY_GRID_CHARGE_MINIMUM_MINUTES,
                                              DEFAULT_BATTERY_GRID_CHARGE_MINIMUM_MINUTES)
@@ -2375,6 +2484,26 @@ class BatteryControlMixin:
         return {
             "battery_control_state": self._battery_control_state,
             "battery_control_reason": self._battery_control_reason,
+            "battery_plan_known_until": (plan.slots[-1].end.isoformat()
+                                         if plan and plan.valid and plan.slots else None),
+            "battery_forecast_source_status": source_status,
+            "battery_forecast_source_time": source_time.isoformat() if source_time else None,
+            "battery_forecast_source_age_seconds": source_age,
+            "battery_pv_forecast_kwh": (round(self._battery_pv_nominal_energy, 3)
+                                        if plan and plan.valid and self._battery_pv_nominal_energy is not None else None),
+            "battery_pv_risk_status": low_status,
+            "battery_pv_risk_forecast_kwh": (round(self._battery_pv_low_energy, 3)
+                                             if low and low.valid and self._battery_pv_low_energy is not None else None),
+            "battery_pv_risk_grid_energy_kwh": round(low.grid_energy_kwh, 3) if low and low.valid else None,
+            "battery_pv_risk_known_until": low.slots[-1].end.isoformat() if low and low.valid and low.slots else None,
+            "battery_pv_risk_created_at": self._battery_plan_created.isoformat()
+                                         if low and low.valid and self._battery_plan_created else None,
+            "battery_pv_risk_plan": [{"start": s.start.isoformat(), "end": s.end.isoformat(),
+                                      "action": s.action, "grid_charge_kwh": round(s.grid_charge_kwh, 3),
+                                      "soc_end": round(s.soc_end, 1),
+                                      **({"grid_charge_available_at": s.grid_charge_available_at.isoformat()}
+                                         if s.grid_charge_available_at is not None else {})}
+                                     for s in low.slots] if low and low.valid else [],
             "battery_grid_charge_minimum_minutes": (minutes if not isinstance(minimum, bool)
                                                      and minutes is not None and 0 <= minutes <= 60 else None),
             "battery_charge_available_at": (self._battery_charge_available_at.isoformat()

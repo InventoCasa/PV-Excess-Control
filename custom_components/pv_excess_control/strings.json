@@ -107,7 +107,7 @@
           "battery_wear_cost_per_kwh": "Battery wear allowance (€/kWh)",
           "battery_soc_hysteresis": "Grid-charge SoC hysteresis (%)",
           "battery_input_max_age_seconds": "Maximum input age (s)",
-          "battery_forecast_max_age_seconds": "Maximum forecast age (s)",
+          "battery_forecast_max_age_seconds": "Maximum forecast sensor report age (s)",
           "battery_load_profile_w": "Hourly household demand (JSON, optional)",
           "inverter_force_charge_enable_feedback_entity": "Charge command readback",
           "inverter_force_charge_mode_feedback_entity": "Inverter mode readback",
@@ -121,7 +121,9 @@
           "battery_hold_feedback_release_value": "Release readback value (optional)",
           "battery_pv_forecast_factor": "PV forecast factor for grid charging",
           "battery_hold_reassert_entity": "Command retry automation (optional)",
-          "battery_grid_charge_minimum_minutes": "Minimum planned grid-charge duration (min)"
+          "battery_grid_charge_minimum_minutes": "Minimum planned grid-charge duration (min)",
+          "battery_forecast_updated_entity": "PV provider retrieval timestamp sensor",
+          "battery_forecast_source_max_age_hours": "Maximum provider forecast age (h)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -150,7 +152,7 @@
           "battery_wear_cost_per_kwh": "Optional assumed wear cost per later delivered kWh. Default 0; 0.03 means 3 ct/kWh. Added to purchase price divided by round-trip efficiency.",
           "battery_soc_hysteresis": "Charge again only after SoC has fallen this far below the grid target, to avoid repeated small charging cycles.",
           "battery_input_max_age_seconds": "Automatic charging requires fresh SoC and required measurement inputs. Allow several sensor polling intervals; default 300 seconds.",
-          "battery_forecast_max_age_seconds": "Reject automatic plans when solar forecast inputs are older than this limit. Default 21600 seconds (6 hours).",
+          "battery_forecast_max_age_seconds": "Without a mapped retrieval timestamp, Home Assistant forecast sensor reports must be no older than this limit. Default 21600 seconds (6 hours). With a retrieval sensor, actual provider forecast age takes precedence; unavailable forecasts still block planning.",
           "battery_load_profile_w": "JSON list of 24 average watts values for local hours 00–23, e.g. [500, 500, ...]. Exclude EV charging and other separately scheduled loads. Leave empty to learn demand; all 24 local hours need at least 30 minutes of valid samples, usually at least one day, before using the learned profile.",
           "inverter_force_charge_enable_feedback_entity": "Physical inverter readback of the requested charging or stop command. Required for charging when the command uses an input helper.",
           "inverter_force_charge_mode_feedback_entity": "Physical inverter readback of forced or self-consumption mode. Required for charging when the mode uses an input helper.",
@@ -164,7 +166,9 @@
           "battery_hold_feedback_release_value": "Expected physical readback after release. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
           "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged.",
           "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units.",
-          "battery_grid_charge_minimum_minutes": "New automatic charging requires at least this much continuous charging time after preparation. Safety stops remain immediate."
+          "battery_grid_charge_minimum_minutes": "New automatic charging requires at least this much continuous charging time after preparation. Safety stops remain immediate.",
+          "battery_forecast_updated_entity": "Optional sensor whose state gives the actual PV forecast retrieval timestamp with a time zone. Its age check replaces the HA sensor report age check. A missing, invalid, future or outdated retrieval timestamp blocks automatic battery planning.",
+          "battery_forecast_source_max_age_hours": "Applies only when a provider retrieval timestamp sensor is configured. Default 24 hours allows an afternoon forecast to remain usable until the next morning. Choose a limit that covers the provider retrieval schedule; this does not trigger extra requests."
         }
       },
       "settings": {
@@ -572,7 +576,7 @@
           "battery_wear_cost_per_kwh": "Battery wear allowance (€/kWh)",
           "battery_soc_hysteresis": "Grid-charge SoC hysteresis (%)",
           "battery_input_max_age_seconds": "Maximum input age (s)",
-          "battery_forecast_max_age_seconds": "Maximum forecast age (s)",
+          "battery_forecast_max_age_seconds": "Maximum forecast sensor report age (s)",
           "battery_load_profile_w": "Hourly household demand (JSON, optional)",
           "inverter_force_charge_enable_feedback_entity": "Charge command readback",
           "inverter_force_charge_mode_feedback_entity": "Inverter mode readback",
@@ -586,7 +590,9 @@
           "battery_hold_feedback_release_value": "Release readback value (optional)",
           "battery_pv_forecast_factor": "PV forecast factor for grid charging",
           "battery_hold_reassert_entity": "Command retry automation (optional)",
-          "battery_grid_charge_minimum_minutes": "Minimum planned grid-charge duration (min)"
+          "battery_grid_charge_minimum_minutes": "Minimum planned grid-charge duration (min)",
+          "battery_forecast_updated_entity": "PV provider retrieval timestamp sensor",
+          "battery_forecast_source_max_age_hours": "Maximum provider forecast age (h)"
         },
         "data_description": {
           "battery_strategy": "How to prioritize battery charging vs. appliance control.",
@@ -615,7 +621,7 @@
           "battery_wear_cost_per_kwh": "Optional assumed wear cost per later delivered kWh. Default 0; 0.03 means 3 ct/kWh. Added to purchase price divided by round-trip efficiency.",
           "battery_soc_hysteresis": "Charge again only after SoC has fallen this far below the grid target, to avoid repeated small charging cycles.",
           "battery_input_max_age_seconds": "Automatic charging requires fresh SoC and required measurement inputs. Allow several sensor polling intervals; default 300 seconds.",
-          "battery_forecast_max_age_seconds": "Reject automatic plans when solar forecast inputs are older than this limit. Default 21600 seconds (6 hours).",
+          "battery_forecast_max_age_seconds": "Without a mapped retrieval timestamp, Home Assistant forecast sensor reports must be no older than this limit. Default 21600 seconds (6 hours). With a retrieval sensor, actual provider forecast age takes precedence; unavailable forecasts still block planning.",
           "battery_load_profile_w": "JSON list of 24 average watts values for local hours 00–23, e.g. [500, 500, ...]. Exclude EV charging and other separately scheduled loads. Leave empty to learn demand; all 24 local hours need at least 30 minutes of valid samples, usually at least one day, before using the learned profile.",
           "inverter_force_charge_enable_feedback_entity": "Physical inverter readback of the requested charging or stop command. Required for charging when the command uses an input helper.",
           "inverter_force_charge_mode_feedback_entity": "Physical inverter readback of forced or self-consumption mode. Required for charging when the mode uses an input helper.",
@@ -629,7 +635,9 @@
           "battery_hold_feedback_release_value": "Expected physical readback after release. Numeric values use the feedback entity’s own unit; provide explicit values when its unit differs from the command. Empty uses the command value.",
           "battery_pv_forecast_factor": "Scale PV only for battery grid-charge planning: 0.9 means 90% of the forecast. Range 0.1–1.0; default 1.0 leaves forecasts unchanged. Calibrate using past forecasts available at planning time and subsequent measured production. Solar and appliance planning remain unchanged.",
           "battery_hold_reassert_entity": "Optional existing automation that writes the numeric command to the device. Retriggered only when the unchanged target lacks confirmed physical feedback. Requires separate readback; command and feedback values retain their respective native units.",
-          "battery_grid_charge_minimum_minutes": "New automatic charging requires at least this much continuous charging time after preparation. Safety stops remain immediate."
+          "battery_grid_charge_minimum_minutes": "New automatic charging requires at least this much continuous charging time after preparation. Safety stops remain immediate.",
+          "battery_forecast_updated_entity": "Optional sensor whose state gives the actual PV forecast retrieval timestamp with a time zone. Its age check replaces the HA sensor report age check. A missing, invalid, future or outdated retrieval timestamp blocks automatic battery planning.",
+          "battery_forecast_source_max_age_hours": "Applies only when a provider retrieval timestamp sensor is configured. Default 24 hours allows an afternoon forecast to remain usable until the next morning. Choose a limit that covers the provider retrieval schedule; this does not trigger extra requests."
         }
       },
       "settings": {

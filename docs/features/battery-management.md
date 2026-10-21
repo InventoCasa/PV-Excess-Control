@@ -45,7 +45,9 @@ price, using complete gross prices in €/kWh. Its default remains 0 €/kWh; no
 20 ct/kWh or seasonal target is enabled automatically.
 
 The planner compares future schedules with normal self-consumption over the
-shared, continuously covered forecast and price horizon, up to 24 hours. It
+shared, continuously covered forecast and price horizon, up to 48 hours.
+The published plan ends when either source runs out; unavailable future prices
+or forecast intervals are not invented. It
 accounts for household demand, PV production, current storage, reserve, charging
 and discharging power, later prices and conversion losses. It can wait for a
 later cheaper slot. It only buys energy that is expected to supply household
@@ -80,7 +82,11 @@ cheap executable windows is also considered separately. This preserves useful
 full-window purchases that competing partial purchases can otherwise remove
 from the approximate search. Adjacent accounting intervals may jointly satisfy
 the minimum duration. The same physical and energy constraints apply, and an
-unfinished search cannot replace a completed plan.
+unfinished search cannot replace a completed plan. Candidate selection includes
+useful windows at different times of day, rather than spending every comparison
+on adjacent pieces of one cheap period. Up to four additional searches each
+retain their fixed 25,000-transition budget; this is still a bounded search,
+not a guarantee of the cheapest possible schedule.
 
 For a native/hold plan with no charging commands, a bounded follow-up comparison
 checks whether using the battery immediately is cheaper than the current hold.
@@ -113,7 +119,7 @@ Native solar charging keeps its separate physical limit. These numeric limits
 do not measure efficiency at low charging power. A reached SoC target or a
 safety condition can still stop charging before the forecast interval ends.
 
- When cost and
+When cost and
 total purchased energy are otherwise equal, it prefers earlier useful charging
 to avoid arbitrary shifts between equally priced windows. Lower prices and
 solar headroom retain their priority. Forecasts and household demand remain
@@ -136,6 +142,53 @@ and shading may change the bias, so review the factor as conditions change and
 avoid applying the same correction twice if the provider already calibrates
 its estimates. A lower forecast remains an assumption, not a guarantee of
 production. Missing, invalid or stale forecast inputs still block charging.
+
+### Lower-PV advisory scenario
+
+When all configured Solcast sources provide valid lower estimates for the whole
+remaining horizon, the integration also calculates a **lower-PV scenario**.
+Each interval uses the raw `pv_estimate10`, capped at the nominal forecast after
+its configured PV factor. The factor is not applied a second time. This separate
+scenario reports its solar energy, grid energy, covered end time and proposed
+schedule in the `battery_pv_risk_*` status attributes.
+
+This is an advisory comparison: **only the nominal `battery_plan` controls
+charging and holding**. A lower scenario does not change the configured PV
+factor, activate a conservative mode or authorize extra purchases. Provider
+lower estimates and sums across arrays are not calibrated probabilities for the
+whole installation and are not guaranteed minimum production. Missing,
+inconsistent, partial or invalid lower data removes the advisory result; it is
+never replaced with zero PV and does not block a valid nominal plan.
+
+The advisory calculation follows the ordinary nominal plan refresh, normally
+within five minutes. If only the lower forecast changes in the meantime, stale
+advice is hidden until that refresh without retargeting the active nominal plan.
+Both scenarios use the same physical limits and timing rules. Their modeled
+savings are not measured savings.
+
+### Actual provider retrieval time
+
+Optionally map **PV provider retrieval timestamp sensor**
+(`battery_forecast_updated_entity`) to a sensor whose state is the actual
+provider retrieval timestamp, including its time zone. A refreshed Home
+Assistant report of an unchanged forecast is not a new provider retrieval.
+With this mapping, the timestamp is authoritative for forecast age: a missing,
+invalid, future or older-than-allowed timestamp blocks automatic battery
+planning. Forecast inputs that are themselves unknown or unavailable still
+block it.
+
+**Maximum provider forecast age** (`battery_forecast_source_max_age_hours`)
+defaults to **24 hours**, configurable from one to seventy-two hours. This
+separate limit allows a regularly retrieved afternoon forecast to remain valid
+until the next morning. Choose a limit appropriate to the provider's existing
+retrieval schedule; configuring it does not create extra requests or timers.
+
+Without the mapping, the existing **Maximum forecast sensor report age**
+(`battery_forecast_max_age_seconds`, default 21,600 seconds) remains the fallback.
+The two age limits are alternatives, not simultaneous gates. Status attributes
+`battery_forecast_source_status`, `battery_forecast_source_time` and
+`battery_forecast_source_age_seconds` expose the chosen source check. Existing
+configurations retain their nominal PV factor and opt-in charging settings.
 
 ### Consumers and available solar energy
 
@@ -220,7 +273,9 @@ Automatic charging requires:
 - Future tariff windows and solar forecast intervals with continuous coverage
   throughout the planning horizon. Gaps and overlaps invalidate the plan;
   missing prices or PV values are not replaced by zero. The current price must
-  match its tariff window. Forecast freshness defaults to six hours.
+  match its tariff window. Without an actual provider retrieval timestamp,
+  forecast sensor report freshness defaults to six hours. A configured retrieval
+  timestamp instead uses the independent provider-age limit described above.
 - A household demand profile for all 24 local hours.
 - Physical acknowledgement of automatic inverter commands.
 

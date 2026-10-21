@@ -134,7 +134,7 @@
           "battery_wear_cost_per_kwh": "Verschleißpuffer (€/kWh)",
           "battery_soc_hysteresis": "SoC-Hysterese für Netzladen (%)",
           "battery_input_max_age_seconds": "Maximales Messwertalter (s)",
-          "battery_forecast_max_age_seconds": "Maximales Prognosealter (s)",
+          "battery_forecast_max_age_seconds": "Maximales Alter der Prognose-Sensormeldung (s)",
           "battery_load_profile_w": "Stündlicher Hausbedarf (JSON, optional)",
           "inverter_force_charge_enable_feedback_entity": "Rückmeldung des Ladebefehls",
           "inverter_force_charge_mode_feedback_entity": "Rückmeldung des Wechselrichtermodus",
@@ -148,7 +148,9 @@
           "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)",
           "battery_pv_forecast_factor": "PV-Prognosefaktor für Netzladen",
           "battery_hold_reassert_entity": "Automation zur erneuten Befehlsübertragung (optional)",
-          "battery_grid_charge_minimum_minutes": "Mindestdauer geplanter Netzladephasen (min)"
+          "battery_grid_charge_minimum_minutes": "Mindestdauer geplanter Netzladephasen (min)",
+          "battery_forecast_updated_entity": "Sensor für den letzten PV-Prognoseabruf",
+          "battery_forecast_source_max_age_hours": "Maximales Alter der Anbieterprognose (h)"
         },
         "data_description": {
           "battery_strategy": "Priorität zwischen Batterieladung und Verbrauchersteuerung.",
@@ -177,7 +179,7 @@
           "battery_wear_cost_per_kwh": "Optional angenommene Verschleißkosten pro später nutzbarer kWh. Standard 0; 0,03 entspricht 3 ct/kWh. Wird zum Einkaufspreis geteilt durch den Gesamtwirkungsgrad addiert.",
           "battery_soc_hysteresis": "Erneutes Laden erst, wenn der SoC um diesen Abstand unter das Netzladeziel gefallen ist. Vermeidet ständiges Nachladen kleiner Mengen.",
           "battery_input_max_age_seconds": "Automatisches Laden benötigt einen aktuellen SoC und aktuelle erforderliche Messwerte. Mehrere Sensor-Abfrageintervalle einplanen; Standard 300 Sekunden.",
-          "battery_forecast_max_age_seconds": "Automatische Pläne bei älteren PV-Prognosen sperren. Standard 21600 Sekunden (6 Stunden).",
+          "battery_forecast_max_age_seconds": "Ohne zugeordneten Abrufzeitpunkt dürfen Prognose-Sensormeldungen in Home Assistant höchstens so alt sein. Standard 21600 Sekunden (6 Stunden). Mit Abrufsensor gilt stattdessen das tatsächliche Anbieterprognosealter; unbekannte Prognosen bleiben gesperrt.",
           "battery_load_profile_w": "JSON-Liste mit 24 mittleren Wattwerten für die lokalen Stunden 00–23, z. B. [500, 500, ...]. Autoladen und andere separat geplante Lasten ausschließen. Leer lassen zum Erlernen des Bedarfs; zuvor sind mindestens 30 Minuten gültige Messwerte für jede der 24 lokalen Stunden nötig, üblicherweise mindestens ein Tag.",
           "inverter_force_charge_enable_feedback_entity": "Physische Wechselrichter-Rückmeldung für den Lade- oder Stoppbefehl. Für Laden mit einem Eingabehelfer erforderlich.",
           "inverter_force_charge_mode_feedback_entity": "Physische Rückmeldung für Zwangslade- oder Eigenverbrauchsmodus. Für Laden mit einem Eingabehelfer erforderlich.",
@@ -191,7 +193,9 @@
           "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Zahlenwerte verwenden die Einheit der Rückmeldeentität. Bei abweichender Einheit eigene Werte angeben. Leer verwendet den Befehlswert.",
           "battery_pv_forecast_factor": "Skaliert die PV-Prognose nur für die Batterie-Netzladeplanung: 0,9 bedeutet 90 % der Prognose. Bereich 0,1–1,0; Standard 1,0 lässt die Prognose unverändert. Anhand früherer, zum Planungszeitpunkt verfügbarer Prognosen und der später gemessenen Erzeugung kalibrieren. Solar- und Geräteplanung bleiben unverändert.",
           "battery_hold_reassert_entity": "Optional: Die vorhandene Automation, die den Zahlenwert an das Gerät überträgt. Sie wird nur erneut ausgelöst, wenn der unveränderte Sollwert keine bestätigte physische Rückmeldung hat. Separate Rückmeldung erforderlich; Befehls- und Rückmeldewerte behalten die jeweilige Einheit.",
-          "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich."
+          "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich.",
+          "battery_forecast_updated_entity": "Optionaler Sensor mit dem Zeitpunkt des tatsächlichen PV-Prognoseabrufs einschließlich Zeitzone. Seine Altersprüfung ersetzt die Prüfung des HA-Sensormeldungsalters. Ein fehlender, ungültiger, zukünftiger oder veralteter Abrufzeitpunkt sperrt die automatische Batterieplanung.",
+          "battery_forecast_source_max_age_hours": "Gilt nur mit zugeordnetem Sensor für den tatsächlichen Abrufzeitpunkt. Standard 24 Stunden lässt eine Nachmittagsprognose bis zum nächsten Morgen gelten. Grenze passend zum Abrufplan wählen; zusätzliche Abrufe werden dadurch nicht ausgelöst."
         }
       }
     },
@@ -256,7 +260,7 @@
           "battery_wear_cost_per_kwh": "Verschleißpuffer (€/kWh)",
           "battery_soc_hysteresis": "SoC-Hysterese für Netzladen (%)",
           "battery_input_max_age_seconds": "Maximales Messwertalter (s)",
-          "battery_forecast_max_age_seconds": "Maximales Prognosealter (s)",
+          "battery_forecast_max_age_seconds": "Maximales Alter der Prognose-Sensormeldung (s)",
           "battery_load_profile_w": "Stündlicher Hausbedarf (JSON, optional)",
           "inverter_force_charge_enable_feedback_entity": "Rückmeldung des Ladebefehls",
           "inverter_force_charge_mode_feedback_entity": "Rückmeldung des Wechselrichtermodus",
@@ -270,7 +274,9 @@
           "battery_hold_feedback_release_value": "Rückmeldewert bei Freigabe (optional)",
           "battery_pv_forecast_factor": "PV-Prognosefaktor für Netzladen",
           "battery_hold_reassert_entity": "Automation zur erneuten Befehlsübertragung (optional)",
-          "battery_grid_charge_minimum_minutes": "Mindestdauer geplanter Netzladephasen (min)"
+          "battery_grid_charge_minimum_minutes": "Mindestdauer geplanter Netzladephasen (min)",
+          "battery_forecast_updated_entity": "Sensor für den letzten PV-Prognoseabruf",
+          "battery_forecast_source_max_age_hours": "Maximales Alter der Anbieterprognose (h)"
         },
         "data_description": {
           "battery_strategy": "Priorität zwischen Batterieladung und Verbrauchersteuerung.",
@@ -299,7 +305,7 @@
           "battery_wear_cost_per_kwh": "Optional angenommene Verschleißkosten pro später nutzbarer kWh. Standard 0; 0,03 entspricht 3 ct/kWh. Wird zum Einkaufspreis geteilt durch den Gesamtwirkungsgrad addiert.",
           "battery_soc_hysteresis": "Erneutes Laden erst, wenn der SoC um diesen Abstand unter das Netzladeziel gefallen ist. Vermeidet ständiges Nachladen kleiner Mengen.",
           "battery_input_max_age_seconds": "Automatisches Laden benötigt einen aktuellen SoC und aktuelle erforderliche Messwerte. Mehrere Sensor-Abfrageintervalle einplanen; Standard 300 Sekunden.",
-          "battery_forecast_max_age_seconds": "Automatische Pläne bei älteren PV-Prognosen sperren. Standard 21600 Sekunden (6 Stunden).",
+          "battery_forecast_max_age_seconds": "Ohne zugeordneten Abrufzeitpunkt dürfen Prognose-Sensormeldungen in Home Assistant höchstens so alt sein. Standard 21600 Sekunden (6 Stunden). Mit Abrufsensor gilt stattdessen das tatsächliche Anbieterprognosealter; unbekannte Prognosen bleiben gesperrt.",
           "battery_load_profile_w": "JSON-Liste mit 24 mittleren Wattwerten für die lokalen Stunden 00–23, z. B. [500, 500, ...]. Autoladen und andere separat geplante Lasten ausschließen. Leer lassen zum Erlernen des Bedarfs; zuvor sind mindestens 30 Minuten gültige Messwerte für jede der 24 lokalen Stunden nötig, üblicherweise mindestens ein Tag.",
           "inverter_force_charge_enable_feedback_entity": "Physische Wechselrichter-Rückmeldung für den Lade- oder Stoppbefehl. Für Laden mit einem Eingabehelfer erforderlich.",
           "inverter_force_charge_mode_feedback_entity": "Physische Rückmeldung für Zwangslade- oder Eigenverbrauchsmodus. Für Laden mit einem Eingabehelfer erforderlich.",
@@ -313,7 +319,9 @@
           "battery_hold_feedback_release_value": "Erwartete physische Rückmeldung nach Freigabe. Zahlenwerte verwenden die Einheit der Rückmeldeentität. Bei abweichender Einheit eigene Werte angeben. Leer verwendet den Befehlswert.",
           "battery_pv_forecast_factor": "Skaliert die PV-Prognose nur für die Batterie-Netzladeplanung: 0,9 bedeutet 90 % der Prognose. Bereich 0,1–1,0; Standard 1,0 lässt die Prognose unverändert. Anhand früherer, zum Planungszeitpunkt verfügbarer Prognosen und der später gemessenen Erzeugung kalibrieren. Solar- und Geräteplanung bleiben unverändert.",
           "battery_hold_reassert_entity": "Optional: Die vorhandene Automation, die den Zahlenwert an das Gerät überträgt. Sie wird nur erneut ausgelöst, wenn der unveränderte Sollwert keine bestätigte physische Rückmeldung hat. Separate Rückmeldung erforderlich; Befehls- und Rückmeldewerte behalten die jeweilige Einheit.",
-          "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich."
+          "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich.",
+          "battery_forecast_updated_entity": "Optionaler Sensor mit dem Zeitpunkt des tatsächlichen PV-Prognoseabrufs einschließlich Zeitzone. Seine Altersprüfung ersetzt die Prüfung des HA-Sensormeldungsalters. Ein fehlender, ungültiger, zukünftiger oder veralteter Abrufzeitpunkt sperrt die automatische Batterieplanung.",
+          "battery_forecast_source_max_age_hours": "Gilt nur mit zugeordnetem Sensor für den tatsächlichen Abrufzeitpunkt. Standard 24 Stunden lässt eine Nachmittagsprognose bis zum nächsten Morgen gelten. Grenze passend zum Abrufplan wählen; zusätzliche Abrufe werden dadurch nicht ausgelöst."
         }
       }
     },
