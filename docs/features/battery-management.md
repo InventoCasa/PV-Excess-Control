@@ -88,6 +88,13 @@ on adjacent pieces of one cheap period. Up to four additional searches each
 retain their fixed 25,000-transition budget; this is still a bounded search,
 not a guarantee of the cheapest possible schedule.
 
+Up to twenty additional fixed-power episode comparisons follow native operation
+outside one useful charging window. Each has a 2,500-transition ceiling and uses
+the same physical, timing, PV-uptake and terminal guards as the wider search.
+These complete trajectories can survive when broader searches exhaust their
+budgets. They preserve every prior completed incumbent; modeled improvements
+are not proof of actual savings or global optimality.
+
 For a native/hold plan with no charging commands, a bounded follow-up comparison
 checks whether using the battery immediately is cheaper than the current hold.
 It can exchange that discharge with an equal amount scheduled in a later,
@@ -214,6 +221,15 @@ The two age limits are alternatives, not simultaneous gates. Status attributes
 configurations retain their nominal PV factor and opt-in charging settings.
 
 ### Consumers and available solar energy
+
+Configured [SOC-based EV tariff forecasts](ev-charging.md#soc-based-tariff-demand-forecast)
+share their exact future windows with battery planning. They reserve vehicle
+demand separately from the learned household profile, without resetting energy
+need at midnight. Actual measured runs replace only overlapping predictions of
+the same vehicle. An optional conservative full-PV reservation can exclude solar
+surplus from battery charging; the excluded energy is reported as withheld PV,
+not invented EV load. Missing future EV data remains explicit uncertainty while
+the established actual aggregate-load fallback remains available.
 
 A forecast of PV production is not automatically a forecast of battery charging.
 The battery planner accounts for current consumers before assigning solar energy

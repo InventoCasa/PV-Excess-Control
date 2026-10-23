@@ -30,18 +30,34 @@
       "step": {
         "current": {
           "data": {
-            "phase_count_entity": "Sensor für die tatsächliche Phasenzahl"
+            "phase_count_entity": "Sensor für die tatsächliche Phasenzahl",
+            "ev_battery_capacity_entity": "Sensor für die Fahrzeug-Batteriekapazität",
+            "ev_battery_capacity_kwh": "Fahrzeugkapazität für die Prognose (kWh, optional)",
+            "ev_charge_efficiency": "Angenommener EV-Ladewirkungsgrad",
+            "ev_reserve_all_pv": "Solarstrom während erwarteter EV-Ladung reservieren"
           },
           "data_description": {
-            "phase_count_entity": "Optionaler ganzzahliger Wert von 1 bis 3 für die Leistungsberechnung. Bei 0 oder unbekannt bleibt der letzte gültige Wert erhalten; beim Start gilt die konfigurierte Phasenzahl. Schaltet keine Hardwarephasen um."
+            "phase_count_entity": "Optionaler ganzzahliger Wert von 1 bis 3 für die Leistungsberechnung. Bei 0 oder unbekannt bleibt der letzte gültige Wert erhalten; beim Start gilt die konfigurierte Phasenzahl. Schaltet keine Hardwarephasen um.",
+            "ev_battery_capacity_entity": "Optionaler Sensor in kWh, Wh, kJ, MJ oder J. Aktiviert mit SoC- und Anschlusssensor die SoC-basierte Tarifladeprognose. Hat Vorrang vor einer festen Kapazität; unbekannt ist nicht null.",
+            "ev_battery_capacity_kwh": "Alternative feste Kapazität ohne Kapazitätssensor. Der Bedarf ergibt sich aus tatsächlichem SoC und Ladeziel; keine feste Mindestlaufzeit.",
+            "ev_charge_efficiency": "Angenommener Wirkungsgrad vom AC-Anschluss zur Fahrzeugbatterie, getrennt von der Hausbatterie. Standard 0,90 ist eine Planungsannahme. Zusätzliche PV-Ladung reagiert weiterhin auf Istwerte.",
+            "ev_reserve_all_pv": "Konservative Prognose: Während erwarteter EV-Ladung keinen PV-Überschuss für die Hausbatterie einplanen. Gemessene laufende Verbraucher haben Vorrang."
           }
         },
         "reconfigure_current": {
           "data": {
-            "phase_count_entity": "Sensor für die tatsächliche Phasenzahl"
+            "phase_count_entity": "Sensor für die tatsächliche Phasenzahl",
+            "ev_battery_capacity_entity": "Sensor für die Fahrzeug-Batteriekapazität",
+            "ev_battery_capacity_kwh": "Fahrzeugkapazität für die Prognose (kWh, optional)",
+            "ev_charge_efficiency": "Angenommener EV-Ladewirkungsgrad",
+            "ev_reserve_all_pv": "Solarstrom während erwarteter EV-Ladung reservieren"
           },
           "data_description": {
-            "phase_count_entity": "Optionaler ganzzahliger Wert von 1 bis 3 für die Leistungsberechnung. Bei 0 oder unbekannt bleibt der letzte gültige Wert erhalten; beim Start gilt die konfigurierte Phasenzahl. Schaltet keine Hardwarephasen um."
+            "phase_count_entity": "Optionaler ganzzahliger Wert von 1 bis 3 für die Leistungsberechnung. Bei 0 oder unbekannt bleibt der letzte gültige Wert erhalten; beim Start gilt die konfigurierte Phasenzahl. Schaltet keine Hardwarephasen um.",
+            "ev_battery_capacity_entity": "Optionaler Sensor in kWh, Wh, kJ, MJ oder J. Aktiviert mit SoC- und Anschlusssensor die SoC-basierte Tarifladeprognose. Hat Vorrang vor einer festen Kapazität; unbekannt ist nicht null.",
+            "ev_battery_capacity_kwh": "Alternative feste Kapazität ohne Kapazitätssensor. Der Bedarf ergibt sich aus tatsächlichem SoC und Ladeziel; keine feste Mindestlaufzeit.",
+            "ev_charge_efficiency": "Angenommener Wirkungsgrad vom AC-Anschluss zur Fahrzeugbatterie, getrennt von der Hausbatterie. Standard 0,90 ist eine Planungsannahme. Zusätzliche PV-Ladung reagiert weiterhin auf Istwerte.",
+            "ev_reserve_all_pv": "Konservative Prognose: Während erwarteter EV-Ladung keinen PV-Überschuss für die Hausbatterie einplanen. Gemessene laufende Verbraucher haben Vorrang."
           }
         },
         "constraints": {
@@ -78,7 +94,13 @@
         }
       },
       "error": {
-        "helper_only_with_gate": "Hilfsgeräte dürfen keine eigene Freigabebedingung oder Startverzögerung haben. Am abhängigen Verbraucher konfigurieren."
+        "helper_only_with_gate": "Hilfsgeräte dürfen keine eigene Freigabebedingung oder Startverzögerung haben. Am abhängigen Verbraucher konfigurieren.",
+        "invalid_ev_capacity_source": "Gültige Sensor-Entität für die Fahrzeugkapazität auswählen.",
+        "invalid_ev_capacity": "Fahrzeugkapazität muss größer als null und höchstens 300 kWh sein.",
+        "invalid_ev_efficiency": "EV-Wirkungsgrad muss eine gültige Zahl zwischen 0,50 und 1,00 sein.",
+        "ev_forecast_requires_inputs": "Die SoC-basierte EV-Prognose benötigt dynamische Stromsteuerung, SoC- und Anschlusssensor.",
+        "invalid_ev_reservation": "Gültige Einstellung für die PV-Reservierung wählen.",
+        "ev_runtime_conflict": "SoC-basierten EV-Bedarf ohne Mindest-/Restlaufzeitquelle oder geschützte zusammenhängende Laufzeit verwenden. Tägliche Höchstgrenzen bleiben verfügbar."
       }
     }
   },

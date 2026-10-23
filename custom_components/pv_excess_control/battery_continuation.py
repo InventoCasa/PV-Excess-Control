@@ -33,6 +33,7 @@ def replay_continuation(timeline, config, efficiency, initial, previous_plan):
                 refined.append(replace(row, start=start, end=end, pv=row.pv * fraction,
                     load=row.load * fraction, reserved_pv=row.reserved_pv * fraction,
                     external_load=row.external_load * fraction,
+                    withheld_pv=row.withheld_pv * fraction,
                     elapsed_hours=row.elapsed_hours + (start - row.start).total_seconds() / 3600))
         if len(refined) > 576:
             return None

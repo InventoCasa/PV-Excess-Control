@@ -115,6 +115,10 @@ from .const import (
     CONF_EV_CONNECTED_ENTITY,
     CONF_EV_SOC_ENTITY,
     CONF_EV_TARGET_SOC,
+    CONF_EV_BATTERY_CAPACITY_ENTITY,
+    CONF_EV_BATTERY_CAPACITY_KWH,
+    CONF_EV_CHARGE_EFFICIENCY,
+    CONF_EV_RESERVE_ALL_PV,
     CONF_EXPORT_LIMIT,
     CONF_FEED_IN_TARIFF,
     CONF_FEED_IN_TARIFF_SENSOR,
@@ -399,8 +403,33 @@ def _appliance_current_schema(defaults: dict[str, Any] | None = None) -> vol.Sch
                     mode=NumberSelectorMode.SLIDER,
                 )
             ),
+            vol.Optional(CONF_EV_BATTERY_CAPACITY_ENTITY, description={"suggested_value":d.get(CONF_EV_BATTERY_CAPACITY_ENTITY)}): SENSOR_ENTITY_SELECTOR,
+            vol.Optional(CONF_EV_BATTERY_CAPACITY_KWH, description={"suggested_value":d.get(CONF_EV_BATTERY_CAPACITY_KWH)}): NumberSelector(NumberSelectorConfig(min=.1,max=300,step=.1,unit_of_measurement="kWh",mode=NumberSelectorMode.BOX)),
+            vol.Optional(CONF_EV_CHARGE_EFFICIENCY, default=d.get(CONF_EV_CHARGE_EFFICIENCY,.9)): NumberSelector(NumberSelectorConfig(min=.5,max=1,step=.01,mode=NumberSelectorMode.BOX)),
+            vol.Optional(CONF_EV_RESERVE_ALL_PV, default=d.get(CONF_EV_RESERVE_ALL_PV,False)): BooleanSelector(),
         }
     )
+
+
+def _validate_ev_forecast_settings(data):
+    errors = {}
+    source = data.get(CONF_EV_BATTERY_CAPACITY_ENTITY)
+    capacity = data.get(CONF_EV_BATTERY_CAPACITY_KWH)
+    configured = bool(source) or capacity is not None
+    if source and (not isinstance(source,str) or not valid_entity_id(source) or not source.startswith("sensor.")):
+        errors[CONF_EV_BATTERY_CAPACITY_ENTITY] = "invalid_ev_capacity_source"
+    if capacity is not None and (isinstance(capacity,bool) or not isinstance(capacity,(int,float))
+                                or not math.isfinite(capacity) or not .1<=capacity<=300):
+        errors[CONF_EV_BATTERY_CAPACITY_KWH] = "invalid_ev_capacity"
+    efficiency=data.get(CONF_EV_CHARGE_EFFICIENCY,.9)
+    if isinstance(efficiency,bool) or not isinstance(efficiency,(int,float)) or not math.isfinite(efficiency) or not .5<=efficiency<=1:
+        errors[CONF_EV_CHARGE_EFFICIENCY] = "invalid_ev_efficiency"
+    if configured and (not data.get(CONF_DYNAMIC_CURRENT) or not data.get(CONF_EV_SOC_ENTITY)
+                       or not data.get(CONF_EV_CONNECTED_ENTITY)):
+        errors[CONF_EV_BATTERY_CAPACITY_ENTITY] = "ev_forecast_requires_inputs"
+    if not isinstance(data.get(CONF_EV_RESERVE_ALL_PV,False),bool):
+        errors[CONF_EV_RESERVE_ALL_PV] = "invalid_ev_reservation"
+    return errors
 
 
 def _appliance_constraints_schema(
@@ -1909,11 +1938,14 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
             if not dynamic and user_input.get(CONF_CHEAP_GRID_TARGET_CURRENT) is not None:
                 errors[CONF_CHEAP_GRID_TARGET_CURRENT] = "cheap_grid_target_current_requires_dynamic"
 
+            errors.update(_validate_ev_forecast_settings(user_input))
+
             if not errors:
                 self._data.update(user_input)
                 # Clean optional current/EV keys not present in user_input
                 for key in ["phase_count_entity", CONF_CURRENT_ENTITY, CONF_EV_SOC_ENTITY, CONF_EV_CONNECTED_ENTITY,
-                            CONF_EV_TARGET_SOC, CONF_CHEAP_GRID_TARGET_CURRENT, CONF_CURRENT_UPDATE_INTERVAL, CONF_CURRENT_MIN_CHANGE]:
+                            CONF_EV_TARGET_SOC, CONF_CHEAP_GRID_TARGET_CURRENT, CONF_CURRENT_UPDATE_INTERVAL, CONF_CURRENT_MIN_CHANGE,
+                            CONF_EV_BATTERY_CAPACITY_ENTITY, CONF_EV_BATTERY_CAPACITY_KWH, CONF_EV_CHARGE_EFFICIENCY, CONF_EV_RESERVE_ALL_PV]:
                     if key not in user_input:
                         self._data.pop(key, None)
                 return await self.async_step_constraints()
@@ -1973,6 +2005,10 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
 
             min_rt = user_input.get(CONF_MIN_DAILY_RUNTIME)
             max_rt = user_input.get(CONF_MAX_DAILY_RUNTIME)
+            ev_demand = (self._data.get(CONF_EV_BATTERY_CAPACITY_ENTITY)
+                         or self._data.get(CONF_EV_BATTERY_CAPACITY_KWH) is not None)
+            if ev_demand and (user_input.get("remaining_runtime_entity") or user_input.get("require_contiguous_runtime") or (min_rt or 0)>0):
+                errors[CONF_MIN_DAILY_RUNTIME] = "ev_runtime_conflict"
             if user_input.get("remaining_runtime_entity") and (min_rt or 0) > 0:
                 errors[CONF_MIN_DAILY_RUNTIME] = "runtime_source_conflict"
             if user_input.get("require_contiguous_runtime") and (max_rt or 0) <= 0:
@@ -2102,11 +2138,14 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
             if not dynamic and user_input.get(CONF_CHEAP_GRID_TARGET_CURRENT) is not None:
                 errors[CONF_CHEAP_GRID_TARGET_CURRENT] = "cheap_grid_target_current_requires_dynamic"
 
+            errors.update(_validate_ev_forecast_settings(user_input))
+
             if not errors:
                 self._data.update(user_input)
                 # Clean optional current/EV keys not present in user_input
                 for key in ["phase_count_entity", CONF_CURRENT_ENTITY, CONF_EV_SOC_ENTITY, CONF_EV_CONNECTED_ENTITY,
-                            CONF_EV_TARGET_SOC, CONF_CHEAP_GRID_TARGET_CURRENT, CONF_CURRENT_UPDATE_INTERVAL, CONF_CURRENT_MIN_CHANGE]:
+                            CONF_EV_TARGET_SOC, CONF_CHEAP_GRID_TARGET_CURRENT, CONF_CURRENT_UPDATE_INTERVAL, CONF_CURRENT_MIN_CHANGE,
+                            CONF_EV_BATTERY_CAPACITY_ENTITY, CONF_EV_BATTERY_CAPACITY_KWH, CONF_EV_CHARGE_EFFICIENCY, CONF_EV_RESERVE_ALL_PV]:
                     if key not in user_input:
                         self._data.pop(key, None)
                 return await self.async_step_reconfigure_constraints()
@@ -2162,6 +2201,10 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
 
             min_rt = user_input.get(CONF_MIN_DAILY_RUNTIME)
             max_rt = user_input.get(CONF_MAX_DAILY_RUNTIME)
+            ev_demand = (self._data.get(CONF_EV_BATTERY_CAPACITY_ENTITY)
+                         or self._data.get(CONF_EV_BATTERY_CAPACITY_KWH) is not None)
+            if ev_demand and (user_input.get("remaining_runtime_entity") or user_input.get("require_contiguous_runtime") or (min_rt or 0)>0):
+                errors[CONF_MIN_DAILY_RUNTIME] = "ev_runtime_conflict"
             if user_input.get("remaining_runtime_entity") and (min_rt or 0) > 0:
                 errors[CONF_MIN_DAILY_RUNTIME] = "runtime_source_conflict"
             if user_input.get("require_contiguous_runtime") and (max_rt or 0) <= 0:

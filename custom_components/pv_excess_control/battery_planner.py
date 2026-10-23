@@ -26,6 +26,7 @@ _EPISODE_PRIMARY_TRANSITION_BUDGET = 300_000
 _EPISODE_COARSE_TRANSITION_BUDGET = 100_000
 _CHARGE_WINDOW_CANDIDATE_LIMIT = 4
 _CHARGE_WINDOW_TRANSITION_BUDGET = 25_000
+_NATIVE_WINDOW_TRANSITION_BUDGET = 2_500
 _HOLD_EXCHANGE_CANDIDATE_LIMIT = 4
 
 
@@ -48,6 +49,8 @@ class BatteryLoadCommitment:
     power_w: float
     max_discharge_power_w: float | None = None
     household_power_floor_w: float | None = None
+    reserve_all_pv: bool = False
+    appliance_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,7 @@ class BatteryGridSlot:
     external_load_kwh: float = 0.0
     grid_charge_available_at: datetime | None = None
     startup_pv_loss_kwh: float = 0.0
+    withheld_pv_kwh: float = 0.0
 
     @property
     def charging_hours(self) -> float:
@@ -195,6 +199,7 @@ class _Interval:
     max_discharge_power_w: float | None = None
     external_load: float = 0.0
     elapsed_hours: float = 0.0
+    withheld_pv: float = 0.0
 
     @property
     def hours(self) -> float:
@@ -346,11 +351,12 @@ def _timeline(
             or row.power_w < 0
             or (cap is not None and (not _finite(cap) or cap < 0))
             or (floor is not None and (not _finite(floor) or floor < 0))
+            or not isinstance(row.reserve_all_pv, bool)
         ):
             raise ValueError("invalid_load_commitment")
         if row_end > start and row_start < end:
             clipped_start, clipped_end = max(start, row_start), min(end, row_end)
-            commitments.append((clipped_start, clipped_end, row.power_w, cap, floor))
+            commitments.append((clipped_start, clipped_end, row.power_w, cap, floor, row.reserve_all_pv))
             boundaries.update((clipped_start, clipped_end))
     normalized = []
     for rows, kind in ((prices, "tariff"), (solar, "forecast")):
@@ -397,11 +403,14 @@ def _timeline(
         caps = [row[3] for row in active if row[3] is not None]
         floors = [row[4] for row in active if row[4] is not None]
         household_power = max(load_w[left.astimezone(now.tzinfo).hour], max(floors, default=0))
+        withheld_pv = (max(0., pv-reserved_pv-household_power*duration/3_600_000)
+                       if any(row[5] for row in active) else 0.)
         interval = _Interval(
-            left, right, prices[pi][2], pv - reserved_pv,
+            left, right, prices[pi][2], pv - reserved_pv - withheld_pv,
             household_power * duration / 3_600_000,
             reserved_pv, min(caps) if caps else None, external_load,
             (left - start).total_seconds() / 3600,
+            withheld_pv,
         )
         # Only load metadata may introduce removable boundaries. Price, solar,
         # local-hour and restart-eligibility edges remain authoritative even
@@ -414,6 +423,7 @@ def _timeline(
                 load=previous.load + interval.load,
                 reserved_pv=previous.reserved_pv + interval.reserved_pv,
                 external_load=previous.external_load + interval.external_load,
+                withheld_pv=previous.withheld_pv + interval.withheld_pv,
             )
         else:
             result.append(interval)
@@ -428,6 +438,7 @@ def _same_physical_rates(left: _Interval, right: _Interval) -> bool:
         and all(math.isclose(a / left.hours, b / right.hours, rel_tol=1e-12, abs_tol=1e-12)
                 for a, b in ((left.pv, right.pv), (left.load, right.load),
                              (left.reserved_pv, right.reserved_pv),
+                             (left.withheld_pv, right.withheld_pv),
                              (left.external_load, right.external_load)))
     )
 
@@ -488,7 +499,7 @@ def _transition(
         interval.start, interval.end, interval.price, interval.pv, interval.load,
         grid_charge, solar_stored / efficiency, discharge, energy / capacity * 100, action,
         interval.reserved_pv, interval.external_load,
-        available, startup_loss,
+        available, startup_loss, interval.withheld_pv,
     )
     not_before = node.charge_not_before
     if node.charge_active and action != "charge" and config.grid_restart_delay_minutes:
@@ -526,7 +537,7 @@ def _add_grid_charge(
         base.start, base.end, base.price, base.pv_kwh, base.load_kwh,
         grid, base.pv_charge_kwh, 0., energy / config.capacity_kwh * 100,
         "charge", base.reserved_pv_kwh, base.external_load_kwh,
-        base.grid_charge_available_at, base.startup_pv_loss_kwh,
+        base.grid_charge_available_at, base.startup_pv_loss_kwh, base.withheld_pv_kwh,
     )
     return _Node(
         energy, prepared.cost + grid * base.price, prepared.grid_energy + grid,
@@ -568,6 +579,7 @@ def _search_schedule(
     step: float, bucket_step: float, *, transition_budget: int | None = None,
     baseline_energy: list[float] | None = None,
     charge_window: tuple[int, int] | None = None,
+    window_power_w: float | None = None,
 ) -> _Node | None:
     """Search exact states, optionally requiring one bounded charging window.
 
@@ -680,7 +692,7 @@ def _search_schedule(
             if (not unfinished or may_stop_now) and not required_charge:
                 native, solar = _transition(interval, node, config, efficiency, "self_consumption")
                 retain(native, solar)
-                if config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
+                if window_power_w is None and config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
                     retained, solar = _transition(interval, node, config, efficiency, "hold")
                     retain(retained, solar)
             if ((charge_window is not None and not required_charge)
@@ -705,11 +717,17 @@ def _search_schedule(
             if maximum_grid <= _EPS:
                 continue
             # Include the exact endpoint: small residual demand is useful too.
-            options = chain(
-                (() if charge_window is not None else
-                 (j * step for j in range(1, int(maximum_grid / step) + 1))),
-                (maximum_grid,),
-            )
+            if window_power_w is not None:
+                fixed_grid = window_power_w*hours/1000-solar/efficiency
+                if fixed_grid <= _EPS or fixed_grid > maximum_grid+_EPS:
+                    continue
+                options = (fixed_grid,)
+            else:
+                options = chain(
+                    (() if charge_window is not None else
+                     (j * step for j in range(1, int(maximum_grid / step) + 1))),
+                    (maximum_grid,),
+                )
             seen = set()
             for grid in options:
                 attempts += 1
@@ -1009,6 +1027,18 @@ def build_battery_grid_plan(
             )
             if candidate is not None and _prefer_economic_node(candidate, best):
                 best = candidate
+            # Complete fixed-power episodes with a native prefix/suffix cannot
+            # be lost to beam pruning. All ordinary physical/timing/PV/terminal
+            # guards still apply. At most20 checks,2500 transitions each.
+            for fraction in (.2,.4,.6,.8,1.):
+                candidate = _search_schedule(
+                    timeline, config, efficiency, initial, baseline_solar, bounds,
+                    step, step/2, transition_budget=_NATIVE_WINDOW_TRANSITION_BUDGET,
+                    baseline_energy=baseline_energy, charge_window=window,
+                    window_power_w=config.max_charge_power_w*fraction,
+                )
+                if candidate is not None and _prefer_economic_node(candidate,best):
+                    best=candidate
     if continuation_plan is not None:
         from .battery_continuation import replay_continuation
 

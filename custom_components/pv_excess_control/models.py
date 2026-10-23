@@ -122,6 +122,10 @@ class ApplianceConfig:
     phase_count_entity: str | None = None
     remaining_runtime_entity: str | None = None
     require_contiguous_runtime: bool = False
+    ev_battery_capacity_kwh: float | None = None
+    ev_battery_capacity_entity: str | None = None
+    ev_charge_efficiency: float = 0.9
+    ev_reserve_all_pv: bool = False
 
 
 @dataclass
@@ -144,6 +148,9 @@ class ApplianceState:
     remaining_runtime_minutes: float | None = None
     # The counter observation's clock is stable during asynchronous planning.
     runtime_observed_at: datetime | None = None
+    ev_soc_observed_at: datetime | None = None
+    ev_capacity_kwh: float | None = None
+    current_power_observed_at: datetime | None = None
 
 
 def runtime_demand_seconds(config: ApplianceConfig, state: ApplianceState) -> float | None:
@@ -283,6 +290,7 @@ class Plan:
     battery_target: BatteryTarget
     confidence: float  # 0.0-1.0
     battery_charge_curve: BatteryChargeCurve | None = None
+    ev_forecasts: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

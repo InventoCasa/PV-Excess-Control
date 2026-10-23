@@ -171,6 +171,9 @@ class PvPlanConfidenceSensor(PvExcessBaseSensor):
         attrs = {key: data.get(key) for key in (
             "forecast_status", "forecast_error", "forecast_sources", "forecast_tomorrow_sources",
             "forecast_remaining_today_kwh", "forecast_tomorrow_total_kwh", "forecast_interval_count")}
+        ev_details = getattr(self.coordinator, "_ev_forecast_details", None)
+        if isinstance(ev_details, dict) and ev_details:
+            attrs["ev_demand_forecasts"] = ev_details
         plan = data.get("current_plan")
         if plan is None or not plan.entries:
             return {**attrs, "plan_entries": [], "plan_entry_count": 0}

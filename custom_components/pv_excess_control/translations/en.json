@@ -263,7 +263,11 @@
             "ev_target_soc": "EV Target SoC",
             "current_update_interval": "Minimum interval for current increases (s)",
             "current_min_change": "Minimum current increase (A)",
-            "phase_count_entity": "Actual phase count sensor"
+            "phase_count_entity": "Actual phase count sensor",
+            "ev_battery_capacity_entity": "EV battery capacity sensor",
+            "ev_battery_capacity_kwh": "EV forecast capacity (kWh, optional)",
+            "ev_charge_efficiency": "EV charging efficiency assumption",
+            "ev_reserve_all_pv": "Reserve all solar during forecast EV charging"
           },
           "data_description": {
             "dynamic_current": "Enable to control this appliance by adjusting its current rather than simple on/off.",
@@ -277,7 +281,11 @@
             "ev_target_soc": "Stop charging when EV reaches this state of charge (%)",
             "current_update_interval": "Delay automatic increases after a successful current change. Reductions and manual overrides remain immediate. 0 disables the delay.",
             "current_min_change": "Ignore automatic increases smaller than this value. Reductions remain immediate. 0 disables the minimum.",
-            "phase_count_entity": "Optional integer 1–3 for power accounting. Zero or unavailable retains the last valid count (configured phases at startup). Does not switch charger hardware."
+            "phase_count_entity": "Optional integer 1–3 for power accounting. Zero or unavailable retains the last valid count (configured phases at startup). Does not switch charger hardware.",
+            "ev_battery_capacity_entity": "Optional sensor in kWh, Wh, kJ, MJ or J. Enables SOC-based tariff-funded EV forecasts with SOC and connection sensors. This source takes precedence over a fixed capacity; unavailable data is not zero.",
+            "ev_battery_capacity_kwh": "Alternative explicit capacity when no capacity sensor is mapped. Estimates need from actual SOC and target; does not impose a fixed charging runtime.",
+            "ev_charge_efficiency": "Assumed AC-to-vehicle efficiency, separate from the home battery. Default 0.90 is a planning assumption, not a measurement. Future windows follow tariff permission; actual solar-following charging remains reactive.",
+            "ev_reserve_all_pv": "Conservative forecast: do not count surplus solar for the home battery while this EV is expected to charge. Actual observed running loads take precedence."
           }
         },
         "constraints": {
@@ -371,7 +379,11 @@
             "ev_target_soc": "EV Target SoC",
             "current_update_interval": "Minimum interval for current increases (s)",
             "current_min_change": "Minimum current increase (A)",
-            "phase_count_entity": "Actual phase count sensor"
+            "phase_count_entity": "Actual phase count sensor",
+            "ev_battery_capacity_entity": "EV battery capacity sensor",
+            "ev_battery_capacity_kwh": "EV forecast capacity (kWh, optional)",
+            "ev_charge_efficiency": "EV charging efficiency assumption",
+            "ev_reserve_all_pv": "Reserve all solar during forecast EV charging"
           },
           "data_description": {
             "dynamic_current": "Enable to control this appliance by adjusting its current rather than simple on/off.",
@@ -385,7 +397,11 @@
             "ev_target_soc": "Stop charging when EV reaches this state of charge (%)",
             "current_update_interval": "Delay automatic increases after a successful current change. Reductions and manual overrides remain immediate. 0 disables the delay.",
             "current_min_change": "Ignore automatic increases smaller than this value. Reductions remain immediate. 0 disables the minimum.",
-            "phase_count_entity": "Optional integer 1–3 for power accounting. Zero or unavailable retains the last valid count (configured phases at startup). Does not switch charger hardware."
+            "phase_count_entity": "Optional integer 1–3 for power accounting. Zero or unavailable retains the last valid count (configured phases at startup). Does not switch charger hardware.",
+            "ev_battery_capacity_entity": "Optional sensor in kWh, Wh, kJ, MJ or J. Enables SOC-based tariff-funded EV forecasts with SOC and connection sensors. This source takes precedence over a fixed capacity; unavailable data is not zero.",
+            "ev_battery_capacity_kwh": "Alternative explicit capacity when no capacity sensor is mapped. Estimates need from actual SOC and target; does not impose a fixed charging runtime.",
+            "ev_charge_efficiency": "Assumed AC-to-vehicle efficiency, separate from the home battery. Default 0.90 is a planning assumption, not a measurement. Future windows follow tariff permission; actual solar-following charging remains reactive.",
+            "ev_reserve_all_pv": "Conservative forecast: do not count surplus solar for the home battery while this EV is expected to charge. Actual observed running loads take precedence."
           }
         },
         "reconfigure_constraints": {
@@ -460,7 +476,13 @@
         "helper_only_with_gate": "Helper-only appliances cannot have their own enable condition or start delay. Configure these on the dependent appliance.",
         "runtime_source_conflict": "A remaining-runtime entity cannot be combined with a positive fixed minimum.",
         "contiguous_requires_maximum": "Continuous runtime requires a positive daily maximum.",
-        "helper_only_with_runtime": "Helper-only appliances cannot have independent runtime demand."
+        "helper_only_with_runtime": "Helper-only appliances cannot have independent runtime demand.",
+        "invalid_ev_capacity_source": "Select a valid sensor entity for EV capacity.",
+        "invalid_ev_capacity": "EV capacity must be greater than zero and at most 300 kWh.",
+        "invalid_ev_efficiency": "EV efficiency must be a finite number between 0.50 and 1.00.",
+        "ev_forecast_requires_inputs": "SOC-based EV forecasting requires dynamic current control, an SOC sensor and a connection sensor.",
+        "invalid_ev_reservation": "Select a valid solar reservation setting.",
+        "ev_runtime_conflict": "Use SOC-based EV demand without a minimum/remaining runtime source or protected continuous-runtime requirement. Daily maximum limits remain available."
       },
       "abort": {
         "reconfigure_successful": "Appliance configuration updated successfully.",

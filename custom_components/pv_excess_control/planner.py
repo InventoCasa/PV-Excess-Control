@@ -607,6 +607,11 @@ class Planner:
                 reason=reason_override or reason, priority=app.priority,
             ))
             seconds -= take
+        self._deduct_runtime_entries(timeline, remaining_excess, entries, app)
+        return entries
+
+    def _deduct_runtime_entries(self, timeline, remaining_excess, entries, app):
+        """Reserve exact spans for ordinary and shared EV forecasts."""
         # Preserve the actual time span of each allocation. Averaging a half-hour
         # load over a whole hour would falsely make its first half available again.
         residual_timeline = []
@@ -624,12 +629,13 @@ class Planner:
                              if entry.target_current is not None else app.nominal_power)
                             for entry in entries if entry.window is not None
                             and entry.window.start <= start < entry.window.end)
+                if app.ev_reserve_all_pv and drawn > 0:
+                    drawn = max(drawn, solar_watts)
                 residual_excess[len(residual_timeline)] = max(0, solar_watts - drawn) * (end - start).total_seconds() / 3600000
                 residual_timeline.append(replace(slot, start=start, end=end))
         timeline[:] = residual_timeline
         remaining_excess.clear()
         remaining_excess.update(residual_excess)
-        return entries
 
     def _schedule_single_appliance(
         self,
@@ -1201,6 +1207,7 @@ class Planner:
         battery_max_charge_power_w: int = 0,
         battery_trickle_charge_power_w: int = 100,
         appliance_states: dict[str, ApplianceState] | None = None,
+        ev_forecasts: dict[str, object] | None = None,
     ) -> Plan:
         """Create a complete plan for the next 24 hours.
 
@@ -1245,6 +1252,9 @@ class Planner:
             for app in appliances:
                 state = appliance_states.get(app.id)
                 if state is None:
+                    continue
+                if ev_forecasts is not None and app.id in ev_forecasts:
+                    normalized.append(app)  # EV helper handles per-day limits across midnight.
                     continue
                 demand = runtime_demand_seconds(app, state)
                 if app.remaining_runtime_entity and (demand is None or demand <= 0):
@@ -1302,6 +1312,15 @@ class Planner:
             runtime_excess = dict(battery_allocation.excess_after_battery)
             runtime_timeline = list(timeline)
             for app in sorted(appliances, key=lambda app: app.priority):
+                if ev_forecasts is not None and app.id in ev_forecasts:
+                    ev = ev_forecasts[app.id]
+                    predicted = [PlanEntry(app.id, Action.SET_CURRENT,
+                        run.target_current,
+                        TariffWindow(run.start, run.end, run.price, True),
+                        PlanReason.CHEAP_TARIFF, app.priority) for run in ev.runs]
+                    entries.extend(predicted)
+                    self._deduct_runtime_entries(runtime_timeline, runtime_excess, predicted, app)
+                    continue
                 entries.extend(self._schedule_runtime_appliance(
                     runtime_timeline, runtime_excess, app, tariff.cheap_price_threshold, now,
                     must_continue=app.require_contiguous_runtime and appliance_states[app.id].is_on,
@@ -1314,7 +1333,7 @@ class Planner:
         # 4/5. Weather/export extensions share the real residual timeline and
         # exclude the appliance's occupied spans; live/continuous/capped demand
         # never receives opportunistic extra runtime.
-        extensible = [a for a in appliances if not a.remaining_runtime_entity
+        extensible = [a for a in appliances if a.id not in (ev_forecasts or {}) and not a.remaining_runtime_entity
                       and not a.require_contiguous_runtime and a.max_daily_runtime is None]
         if appliance_states is None:
             entries = self.apply_weather_preplanning(
@@ -1385,6 +1404,9 @@ class Planner:
                 horizon = timedelta(hours=1)
         else:
             horizon = timedelta(hours=24)
+        if ev_forecasts:
+            horizon = max(horizon, max((run.end-now.astimezone(timezone.utc)
+                for model in ev_forecasts.values() for run in model.runs),default=horizon))
 
         plan = Plan(
             created_at=now,
@@ -1393,6 +1415,7 @@ class Planner:
             battery_target=battery_target,
             confidence=confidence,
             battery_charge_curve=battery_charge_curve,
+            ev_forecasts=dict(ev_forecasts or {}),
         )
         _LOGGER.debug(
             "Planner: %d timeline slots, %d plan entries, confidence=%.1f%%",

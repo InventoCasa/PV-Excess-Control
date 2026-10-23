@@ -332,6 +332,7 @@ def test_small_episode_candidate_completes_dense_real_boundary_horizon(monkeypat
 
 
 def test_interrupted_episode_search_keeps_complete_native_fallback(monkeypatch):
+    monkeypatch.setattr(bp, '_NATIVE_WINDOW_TRANSITION_BUDGET', 1)
     monkeypatch.setattr(bp, '_EPISODE_COARSE_TRANSITION_BUDGET', 0)
     monkeypatch.setattr(bp, '_EPISODE_PRIMARY_TRANSITION_BUDGET', 0)
     monkeypatch.setattr(bp, '_REFINEMENT_TRANSITION_BUDGET', 0)

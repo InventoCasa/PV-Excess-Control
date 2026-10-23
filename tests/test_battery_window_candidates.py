@@ -157,6 +157,7 @@ def test_aborted_window_candidates_preserve_the_best_completed_plan(monkeypatch,
         disabled.setattr(bp, '_CHARGE_WINDOW_CANDIDATE_LIMIT', 0)
         incumbent = bp.build_battery_grid_plan(START, 0, *inputs(), CONFIG)
     monkeypatch.setattr(bp, '_CHARGE_WINDOW_TRANSITION_BUDGET', budget)
+    monkeypatch.setattr(bp, '_NATIVE_WINDOW_TRANSITION_BUDGET', budget)
     result = bp.build_battery_grid_plan(START, 0, *inputs(), CONFIG)
     assert result == incumbent
     assert result.slots[-1].end == START + timedelta(hours=10)
@@ -177,11 +178,13 @@ def test_additional_window_work_has_a_fixed_total_transition_budget(monkeypatch)
 
     def record(*args, **kwargs):
         if kwargs.get('charge_window') is not None:
-            budgets.append(kwargs['transition_budget'])
+            budgets.append((kwargs['transition_budget'], kwargs.get('window_power_w')))
         return search(*args, **kwargs)
 
     monkeypatch.setattr(bp, '_search_schedule', record)
     result = bp.build_battery_grid_plan(START, 0, *inputs(), CONFIG)
     assert result.valid
-    assert 0 < len(budgets) <= 4
-    assert sum(budgets) <= 100_000
+    broad = [budget for budget,power in budgets if power is None]
+    native = [budget for budget,power in budgets if power is not None]
+    assert 0 < len(broad) <= 4 and sum(broad) <= 100_000
+    assert 0 < len(native) <= 20 and sum(native) <= 50_000

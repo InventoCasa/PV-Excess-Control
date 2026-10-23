@@ -13,7 +13,7 @@ import asyncio
 import logging
 import math
 import time as _time
-from dataclasses import replace
+from dataclasses import replace, fields
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
@@ -939,6 +939,10 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
         self._latest_tariff = tariff_info
         self._latest_power_state = power_state
 
+        ev_forecasts, ev_key = self._get_ev_forecasts(tariff_info)
+        if ev_forecasts and ev_key != getattr(self, "_published_ev_forecast_key", None):
+            await self._run_planner()
+
         # Run the inverter forced grid-charge state machine
         await self._run_grid_charge_state_machine(tariff_info, power_state)
 
@@ -1459,6 +1463,10 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
                 phase_count_entity=sub_data.get("phase_count_entity"),
                 remaining_runtime_entity=sub_data.get("remaining_runtime_entity"),
                 require_contiguous_runtime=sub_data.get("require_contiguous_runtime", False),
+                ev_battery_capacity_kwh=sub_data.get("ev_battery_capacity_kwh"),
+                ev_battery_capacity_entity=sub_data.get("ev_battery_capacity_entity"),
+                ev_charge_efficiency=sub_data.get("ev_charge_efficiency", .9),
+                ev_reserve_all_pv=sub_data.get("ev_reserve_all_pv", False),
             )
             configs.append(config)
 
@@ -1611,8 +1619,13 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
                 last_state_change=last_state_change,
                 ev_connected=ev_connected,
                 ev_soc=ev_soc,
+                ev_soc_observed_at=(getattr(self.hass.states.get(config.ev_soc_entity), "last_reported", None)
+                                    if config.ev_soc_entity else None),
+                ev_capacity_kwh=self._ev_capacity_kwh(config),
                 activations_today=self._activations_today.get(config.id, 0),
                 current_power_available=current_power_available,
+                current_power_observed_at=(getattr(self.hass.states.get(config.actual_power_entity), "last_reported", None)
+                                           if config.actual_power_entity else None),
                 remaining_runtime_minutes=_parse_sensor_float(self.hass, config.remaining_runtime_entity) if config.remaining_runtime_entity else None,
                 runtime_observed_at=(runtime_observed_at if update_runtime or previous is None
                                      else getattr(previous, "runtime_observed_at", None)),
@@ -1669,6 +1682,116 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
     # Planner
     # ------------------------------------------------------------------
 
+    def _ev_capacity_kwh(self, config):
+        """Resolve explicit EV capacity; a mapped unavailable source is authoritative."""
+        value = config.ev_battery_capacity_kwh
+        if config.ev_battery_capacity_entity:
+            state = self.hass.states.get(config.ev_battery_capacity_entity)
+            if state is None:
+                return None
+            factors = {"kwh": 1., "wh": .001, "kj": 1/3600, "mj": 1/3.6, "j": 1/3600000}
+            factor = factors.get(str(state.attributes.get("unit_of_measurement", "")).lower())
+            try:
+                value = float(state.state)*factor if factor is not None else None
+            except (ValueError, TypeError, OverflowError):
+                return None
+        if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or not 0 < value <= 300:
+            return None
+        return float(value)
+
+    def _get_ev_forecasts(self, tariff, *, now=None):
+        """Share frozen future EV runs without sliding async planning inputs.
+
+        A five-minute epoch and observed input changes cause re-estimation from
+        actual SOC. Previously predicted consumption is never credited as real.
+        Optional power-meter outages do not erase valid SOC/connection data.
+        """
+        from .ev_charge_forecast import configured_ev_forecast, build_ev_charge_forecast, EvChargeForecast
+        subs = getattr(self.config_entry, "subentries", {})
+        if not any(s.data.get("ev_battery_capacity_entity") or s.data.get("ev_battery_capacity_kwh") is not None
+                   for s in subs.values()):
+            self._ev_forecast_details = {}
+            return {}, ()
+        now = now or dt_util.now()
+        instant = now.astimezone(timezone.utc)
+        epoch = int(instant.timestamp()//300)
+        configs = self._get_appliance_configs()
+        states = self._get_appliance_states(configs, update_runtime=False)
+        by_id = {app.id: app for app in configs}
+        rows = []
+        configured = [app for app in configs if configured_ev_forecast(app)]
+        def dependency_ready(app, seen=()):
+            if not app.requires_appliance:
+                return True
+            if app.id in seen:
+                return False
+            dep = by_id.get(app.requires_appliance)
+            dep_state = states.get(app.requires_appliance)
+            if dep is None or dep_state is None:
+                return False
+            if (dep.enable_condition_entity and not dep.override_active and dep_state.enable_condition is not True
+                    and (not dep_state.is_on or dep.enable_condition_mode == "while_running")):
+                return False
+            if not dep.override_active and not dep_state.is_on and dep.start_delay > dep_state.solar_start_elapsed:
+                return False
+            # Future dependency operating/runtime restrictions need their own
+            # schedule; absence is explicit uncertainty, never invented uptime.
+            if any((dep.start_after,dep.end_before,dep.remaining_runtime_entity,
+                    dep.max_daily_runtime,dep.max_daily_activations is not None)):
+                return False
+            return dependency_ready(dep,(*seen,app.id))
+        for app in configured:
+            state = states[app.id]
+            stamp = state.ev_soc_observed_at
+            fresh = (isinstance(stamp,datetime) and stamp.tzinfo is not None
+                     and -5 <= (instant-stamp.astimezone(timezone.utc)).total_seconds() <= 86400)
+            power_stamp = state.current_power_observed_at
+            observed_power = (max(100.,round(state.current_power/100)*100.)
+                if state.is_on and state.current_power_available and state.current_power>=100
+                and isinstance(power_stamp,datetime) and power_stamp.tzinfo is not None
+                and 0 <= (instant-power_stamp.astimezone(timezone.utc)).total_seconds()<=300 else None)
+            rows.append((app.id,tuple((f.name,repr(getattr(app,f.name))) for f in fields(app)),
+                         state.ev_soc, state.ev_connected, state.ev_capacity_kwh, fresh, state.is_on, observed_power,
+                         state.enable_condition, dependency_ready(app),
+                         state.runtime_today.total_seconds() if app.max_daily_runtime is not None else None,
+                         state.activations_today if app.max_daily_activations is not None else None))
+        prices = tuple((r.start,r.end,r.price) for r in tariff.windows) if tariff is not None else ()
+        key = (epoch,tuple(rows),prices,tariff.cheap_price_threshold if tariff else None,
+               tariff.feed_in_tariff if tariff else None,self.config_entry.data.get(CONF_GRID_VOLTAGE,230))
+        old_key = getattr(self, "_ev_forecast_cache_key", None)
+        # Clock-only refresh may wait for an in-flight economic calculation;
+        # real connection/SOC/policy/price changes must still invalidate it.
+        keep_during_worker = (old_key is not None and key[1:]==old_key[1:]
+                              and getattr(self, "_ev_forecast_transaction", False))
+        if key == old_key or keep_during_worker:
+            return self._ev_forecast_cache, old_key
+        forecasts,details = {},{}
+        for app in configured:
+            state = states[app.id]
+            if tariff is None:
+                forecast = EvChargeForecast("missing_tariff")
+            elif not dependency_ready(app):
+                forecast = EvChargeForecast("dependency_unavailable")
+            else:
+                forecast = build_ev_charge_forecast(now,app,state,tariff,
+                    grid_voltage=self.config_entry.data.get(CONF_GRID_VOLTAGE,230))
+            forecasts[app.id] = forecast
+            def rounded(value):
+                return round(value,3) if isinstance(value,(int,float)) and math.isfinite(value) else None
+            details[app.id] = {"name":app.name,"status":forecast.status,"scope":"grid_funded_windows",
+                "capacity_kwh":rounded(state.ev_capacity_kwh),"soc":rounded(state.ev_soc),
+                "target_soc":rounded(app.ev_target_soc),"charging_efficiency":rounded(app.ev_charge_efficiency),
+                "remaining_ac_kwh":rounded(forecast.remaining_ac_kwh),
+                "planned_ac_kwh":rounded(forecast.planned_ac_kwh),"unmet_ac_kwh":rounded(forecast.unmet_ac_kwh),
+                "estimated_required_minutes":rounded(forecast.required_minutes),
+                "known_until":forecast.known_until.isoformat() if forecast.known_until else None,
+                "reserve_all_pv":app.ev_reserve_all_pv,"conditional_on_connection_and_target":True}
+        self._ev_forecast_cache_key = key
+        self._ev_forecast_cache = forecasts
+        self._ev_forecast_configs = {app.id:app for app in configured}
+        self._ev_forecast_details = details
+        return forecasts,key
+
     async def _run_planner(self) -> None:
         """Run the planner to generate a new plan."""
         if self._forecast_provider is None:
@@ -1710,11 +1833,13 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
         export_limit = data.get(CONF_EXPORT_LIMIT)
 
         try:
+            ev_forecasts,ev_key = self._get_ev_forecasts(tariff_info)
             self.current_plan = self.planner.create_plan(
                 forecast=forecast_data,
                 tariff=tariff_info,
                 appliances=appliance_configs,
                 appliance_states=self._get_appliance_states(appliance_configs, update_runtime=False),
+                ev_forecasts=ev_forecasts,
                 now=dt_util.now(),
                 battery_config=battery_config,
                 current_soc=battery_soc,
@@ -1732,6 +1857,7 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
                     )
                 ),
             )
+            self._published_ev_forecast_key = ev_key
             _LOGGER.debug(
                 "Planner generated plan with %d entries, confidence %.2f",
                 len(self.current_plan.entries),
@@ -2297,6 +2423,10 @@ class PvExcessCoordinator(BatteryControlMixin, DataUpdateCoordinator[dict[str, A
             phase_count_entity=sub_data.get("phase_count_entity"),
             remaining_runtime_entity=sub_data.get("remaining_runtime_entity"),
             require_contiguous_runtime=sub_data.get("require_contiguous_runtime", False),
+            ev_battery_capacity_kwh=sub_data.get("ev_battery_capacity_kwh"),
+            ev_battery_capacity_entity=sub_data.get("ev_battery_capacity_entity"),
+            ev_charge_efficiency=sub_data.get("ev_charge_efficiency", .9),
+            ev_reserve_all_pv=sub_data.get("ev_reserve_all_pv", False),
         )
 
     async def _turn_off_all_managed(self) -> None:

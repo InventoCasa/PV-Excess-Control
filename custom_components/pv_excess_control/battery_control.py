@@ -1768,6 +1768,9 @@ class BatteryControlMixin:
         """
         from .battery_planner import BatteryLoadCommitment
 
+        future_provider = getattr(self, "_get_ev_forecasts", None)
+        future,future_key = future_provider(tariff,now=now) if callable(future_provider) else ({},())
+
         self._battery_load_commitments = ()
         self._battery_load_assumptions = ()
         self._battery_runtime_observations = {
@@ -1873,6 +1876,11 @@ class BatteryControlMixin:
             if is_ev and (not policy_allows or not isinstance(state, State) or state.state in ("unknown", "unavailable")):
                 return invalid("active_ev_policy_uncertain")
             end, funded = self._battery_load_run_end(appliance_id, data, now, tariff) if policy_allows else (None, False)
+            forecast = future.get(appliance_id)
+            if is_ev and funded and forecast is not None and forecast.status == "available":
+                current_prediction = next((r for r in forecast.runs if r.start<=now<r.end),None)
+                if current_prediction is not None:
+                    end = min(end,current_prediction.end) if end is not None else current_prediction.end
             if is_ev and end is None:
                 return invalid("active_ev_duration_unknown")
             funding_end = self._battery_load_funding(appliance_id, data, now, tariff)[1] if funded else None
@@ -1908,10 +1916,10 @@ class BatteryControlMixin:
                               settings))
             if is_ev:
                 if funding_end is not None and funding_end < end and limit != after_limit:
-                    ev_runs.append(BatteryLoadCommitment(now, funding_end, projected_w, limit))
-                    ev_runs.append(BatteryLoadCommitment(funding_end, end, projected_w, after_limit))
+                    ev_runs.append(BatteryLoadCommitment(now, funding_end, projected_w, limit, appliance_id=appliance_id))
+                    ev_runs.append(BatteryLoadCommitment(funding_end, end, projected_w, after_limit, appliance_id=appliance_id))
                 else:
-                    ev_runs.append(BatteryLoadCommitment(now, end, projected_w, limit))
+                    ev_runs.append(BatteryLoadCommitment(now, end, projected_w, limit, appliance_id=appliance_id))
             elif end is not None:
                 house_runs.append((end, projected_w))
             else:
@@ -2037,12 +2045,42 @@ class BatteryControlMixin:
                                     else min(reference, profile[left.astimezone(now.tzinfo).hour]))
             floor = active_w + projected_background
             commitments.append(BatteryLoadCommitment(left, right, 0., household_power_floor_w=floor))
+        if callable(future_provider):
+            measured = tuple(commitments)
+            for appliance_id, forecast in future.items():
+                if forecast.status not in ("available", "target_reached", "disconnected"):
+                    assumptions.add("future_ev_unknown")
+                    continue
+                config = self._ev_forecast_configs[appliance_id]
+                for run in forecast.runs:
+                    pieces = [(max(run.start,now),run.end)]
+                    for actual in measured:
+                        if actual.appliance_id != appliance_id:
+                            continue
+                        residual=[]
+                        for left,right in pieces:
+                            if actual.end <= left or actual.start >= right:
+                                residual.append((left,right))
+                            else:
+                                if left < actual.start:
+                                    residual.append((left,actual.start))
+                                if actual.end < right:
+                                    residual.append((actual.end,right))
+                        pieces=residual
+                    for left,right in pieces:
+                        if right > left:
+                            commitments.append(BatteryLoadCommitment(left,right,run.power_w,
+                                max_discharge_power_w=cap, reserve_all_pv=config.ev_reserve_all_pv,
+                                appliance_id=appliance_id))
+                            assumptions.add("future_ev_grid_funded_estimate")
+                            if config.ev_reserve_all_pv:
+                                assumptions.add("future_ev_reserves_all_pv")
         self._battery_load_commitments = tuple(commitments)
         self._battery_load_assumptions = tuple(sorted(assumptions))
         base_key = (round(background / 100) * 100., round(reference / 100) * 100.) if house_runs else None
         short_key = (raw_floor, short_end) if short_active else None
         key = (tuple(signature), observed_floor if projection_current else None, until if projection_current else None,
-               cap, base_key, short_key, limit_until, known_until, tuple(uncertain_ev))
+               cap, base_key, short_key, limit_until, known_until, tuple(uncertain_ev), future_key)
         return self._battery_load_commitments, key, None
 
     def _battery_charge_startup_seconds(self):
@@ -2346,6 +2384,7 @@ class BatteryControlMixin:
             self._battery_plan_key = None
             return reason
 
+        previous_ev_transaction = getattr(self, "_ev_forecast_transaction", False)
         try:
             for _ in range(2):
                 if not self._automatic_battery_planning_requested():
@@ -2361,6 +2400,7 @@ class BatteryControlMixin:
                 if not self._battery_plan_needs_refresh(request):
                     return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason
                 latest_tariff = self._latest_tariff
+                self._ev_forecast_transaction = True
                 plan = await self._build_battery_plan_async(request)
                 if plan is None:
                     return reject("planning_interrupted")
@@ -2387,6 +2427,8 @@ class BatteryControlMixin:
         except Exception:
             _LOGGER.exception("Battery planning failed; owned controls must release")
             return reject("planning_failed")
+        finally:
+            self._ev_forecast_transaction = previous_ev_transaction
 
     def _observe_battery_load(self):
         """Learn non-EV household watts by local hour; never learn missing as zero."""
@@ -2527,10 +2569,14 @@ class BatteryControlMixin:
             "battery_estimated_savings": round(plan.estimated_savings, 3) if plan and plan.valid else None,
             "battery_load_profile_ready": self._battery_load_profile() is not None,
             "battery_load_assumptions": list(self._battery_load_assumptions),
+            "battery_pv_withheld_for_ev_kwh": (round(sum(s.withheld_pv_kwh for s in plan.slots),3)
+                                                if plan and plan.valid else None),
             "battery_load_commitments": [
                 {"start": row.start.isoformat(), "end": row.end.isoformat(),
                  "external_power_w": row.power_w, "household_power_floor_w": row.household_power_floor_w,
-                 "max_discharge_power_w": row.max_discharge_power_w}
+                 "max_discharge_power_w": row.max_discharge_power_w,
+                 **({"appliance_id":row.appliance_id} if row.appliance_id is not None else {}),
+                 **({"reserve_all_pv":True} if row.reserve_all_pv else {})}
                 for row in self._battery_load_commitments
             ],
             "battery_plan": [{"start": s.start.isoformat(), "end": s.end.isoformat(), "action": s.action,
