@@ -2466,24 +2466,20 @@ class BatteryControlMixin:
             self._battery_load_store.async_delay_save(lambda: {"hours": self._battery_load_hours}, 300)
 
     def _battery_load_profile(self):
+        profile = self._battery_load_profile_resolution()
+        return list(profile.watts) if profile.watts is not None else None
+
+    def _battery_load_profile_resolution(self):
+        from .battery_load_forecast import HouseholdLoadProfile, resolve_household_profile
+
         explicit = self.config_entry.data.get("battery_load_profile_w")
         if explicit is not None:
             if not isinstance(explicit, list) or len(explicit) != 24:
-                return None
+                return HouseholdLoadProfile(reason="invalid_configuration")
             if any(_finite(v) is None or float(v) < 0 for v in explicit):
-                return None
-            return [float(v) for v in explicit]
-        now = dt_util.utcnow()
-        for watts, seconds, stamp in self._battery_load_hours:
-            if seconds < 1800 or stamp is None:
-                return None
-            try:
-                age = (now - datetime.fromisoformat(stamp)).total_seconds()
-            except (ValueError, TypeError):
-                return None
-            if not 0 <= age <= 7 * 86400:
-                return None
-        return [row[0] for row in self._battery_load_hours]
+                return HouseholdLoadProfile(reason="invalid_configuration")
+            return HouseholdLoadProfile(tuple(float(v) for v in explicit), "configured")
+        return resolve_household_profile(self._battery_load_hours, dt_util.utcnow())
 
     async def async_restore_battery_load(self):
         self._init_battery_control()
@@ -2514,6 +2510,7 @@ class BatteryControlMixin:
 
     def battery_control_diagnostics(self):
         self._init_battery_control()
+        profile = self._battery_load_profile_resolution()
         plan = self._battery_grid_plan
         low = plan.low_pv_plan if plan and plan.valid else None
         source_status, source_time, source_age = self._battery_forecast_source()
@@ -2567,7 +2564,12 @@ class BatteryControlMixin:
             "battery_grid_energy_kwh": round(plan.grid_energy_kwh, 3) if plan and plan.valid else None,
             "battery_grid_target_soc": round(plan.grid_target_soc, 1) if plan and plan.valid else None,
             "battery_estimated_savings": round(plan.estimated_savings, 3) if plan and plan.valid else None,
-            "battery_load_profile_ready": self._battery_load_profile() is not None,
+            "battery_load_profile_ready": profile.watts is not None,
+            "battery_load_profile_source": profile.source,
+            "battery_load_profile_retained_hours": list(profile.retained_hours),
+            "battery_load_profile_oldest_age_hours": (round(profile.oldest_age_seconds / 3600, 2)
+                                                       if profile.oldest_age_seconds is not None else None),
+            "battery_load_profile_reason": profile.reason,
             "battery_load_assumptions": list(self._battery_load_assumptions),
             "battery_pv_withheld_for_ev_kwh": (round(sum(s.withheld_pv_kwh for s in plan.slots),3)
                                                 if plan and plan.valid else None),

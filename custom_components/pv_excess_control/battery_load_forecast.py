@@ -1,7 +1,56 @@
 """Short-term estimates for household demand without a separate meter."""
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
+
+
+@dataclass(frozen=True)
+class HouseholdLoadProfile:
+    """Resolution of measured hourly demand, without synthetic observations."""
+
+    watts: tuple[float, ...] | None = None
+    source: str = "unavailable"
+    retained_hours: tuple[int, ...] = ()
+    oldest_age_seconds: float | None = None
+    reason: str | None = None
+
+
+def resolve_household_profile(rows, now: datetime) -> HouseholdLoadProfile:
+    """Retain at most six mature hours for a second week of telemetry gaps.
+
+    Seven days remains the freshness threshold. Fourteen days is a hard age
+    limit, and at least eighteen hours must still be fresh. These are bounded
+    availability guardrails, not a forecast accuracy guarantee. No stored
+    values, observation counts or timestamps are changed by this resolver.
+    """
+    if not isinstance(rows, (list, tuple)) or len(rows) != 24:
+        return HouseholdLoadProfile(reason="incomplete")
+    watts, ages = [], []
+    try:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError
+        for row in rows:
+            value, seconds, stamp = row
+            if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not isfinite(v)
+                    for v in (value, seconds)) or value < 0 or seconds < 1800):
+                raise ValueError
+            observed = datetime.fromisoformat(stamp)
+            if observed.tzinfo is None or observed.utcoffset() is None:
+                raise ValueError
+            age = (now.astimezone(timezone.utc)-observed.astimezone(timezone.utc)).total_seconds()
+            if age < 0:
+                raise ValueError
+            watts.append(value)
+            ages.append(age)
+    except (ValueError, TypeError, OverflowError):
+        return HouseholdLoadProfile(reason="incomplete")
+    retained = tuple(hour for hour, age in enumerate(ages) if age > 7*86400)
+    oldest = max(ages)
+    if oldest > 14*86400 or len(retained) > 6:
+        return HouseholdLoadProfile(retained_hours=retained, oldest_age_seconds=oldest,
+                                    reason="expired")
+    return HouseholdLoadProfile(tuple(watts), "retained" if retained else "learned", retained, oldest)
 
 
 class RecentHouseholdLoad:

@@ -330,9 +330,15 @@ mapped EV charging, but include the usual non-EV household consumers. A constant
 Leave the field empty to learn demand from household load measurements. Mapped
 EV demand is subtracted when its power reading is available. Learning needs at
 least **30 minutes of valid samples for every one of the 24 local hours**,
-usually at least one day; missing readings delay readiness. Each hour must have
-recent observations within seven days. The learned profile is persisted across
-reloads and midnight. Clearing the explicit profile returns to learning.
+usually at least one day; missing readings delay readiness. Observations within
+seven elapsed days are fresh. Up to six mature hourly values may be retained
+unchanged for at most fourteen elapsed days, provided at least eighteen hours
+remain fresh. This bounded fallback is reported in the status attributes; it
+does not create measurements or refresh their timestamps. Missing, immature,
+invalid or older values still block automatic planning. These age limits are
+availability guardrails, not a guarantee of forecast accuracy. The learned
+profile is persisted across reloads and midnight. Clearing the explicit profile
+returns to learning.
 
 When optional wallbox telemetry is unavailable, fresh total household power
 still supports battery planning. The unknown EV share stays within the measured
@@ -535,6 +541,9 @@ The integration's status sensor includes:
 | `battery_charge_cleanup_pending`, `battery_hold_cleanup_pending`, `battery_discharge_cleanup_pending` | Release still needs confirmation |
 | `battery_hold_supported` | Verified hold mapping with physical acknowledgement is available |
 | `battery_load_profile_ready` | All required hourly household demand values are available |
+| `battery_load_profile_source` | `configured`, `learned`, `retained` or `unavailable` household profile |
+| `battery_load_profile_retained_hours` | Local-hour indexes using mature observations older than seven days |
+| `battery_load_profile_oldest_age_hours`, `battery_load_profile_reason` | Actual oldest observation age and any profile rejection reason |
 | `battery_grid_energy_kwh`, `battery_grid_target_soc` | Planned purchased energy and computed grid target |
 | `battery_estimated_savings` | Forecast saving relative to normal self-consumption |
 | `battery_plan` | Time slots, actions, grid energy and expected ending SoC |
