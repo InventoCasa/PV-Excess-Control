@@ -162,14 +162,14 @@ def test_active_continuation_preserves_remaining_confirmed_minimum():
     assert episode.end >= deadline
 
 
-def test_active_commitment_may_stop_immediately_when_continuation_is_not_allowed():
+def test_active_commitment_rejects_when_remaining_minimum_crosses_price_limit():
     result = build([(2, .1), (3, .6), (20, .1), (60, .6)], cfg=config(
         grid_charge_active=True, grid_charge_minimum_until=NOW + timedelta(minutes=5),
         grid_restart_delay_minutes=5,
     ))
-    assert result.valid
-    assert result.slots[0].action != 'charge'
-    assert all(s.start >= NOW + timedelta(minutes=5) for s in result.slots if s.action == 'charge')
+    assert not result.valid
+    assert result.reason == 'confirmed_charge_minimum_infeasible'
+    assert result.slots == ()
 
 
 def test_expired_active_minimum_does_not_restart_a_five_minute_requirement():

@@ -8,7 +8,8 @@ def replay_continuation(timeline, config, efficiency, initial, previous_plan):
 
     Existing action and power boundaries remain fixed. Fresh measurements,
     forecasts, tariffs and limits determine every new balance. A failed guard
-    simply excludes this candidate; the normal search and immediate stops remain.
+    simply excludes this candidate; the normal search and safety stops remain.
+    An existing confirmed minimum is retained without extending its deadline.
     """
     from . import battery_planner as bp
 

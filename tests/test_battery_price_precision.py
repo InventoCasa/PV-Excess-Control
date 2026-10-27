@@ -80,6 +80,6 @@ async def test_purchase_ceiling_uses_full_current_price_despite_rounded_window(e
     await case.coord._run_grid_charge_state_machine(case.tariff, None)
     assert case.coord._battery_grid_plan is not None
     assert case.coord._battery_grid_plan.valid
-    assert case.coord._battery_grid_plan.slots[0].action == "charge"
+    assert case.coord._battery_grid_plan.slots[0].action == "self_consumption"
     assert not case.coord._grid_charge_engaged
     case.controller.engage.assert_not_awaited()

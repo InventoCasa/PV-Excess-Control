@@ -66,8 +66,8 @@ class BatteryPlanningConfig:
     continue. A new episode reserves preparation, enable confirmation and the
     requested minimum charging time. ``grid_charge_prepared`` skips only the
     initial preparation. ``grid_charge_minimum_until`` carries the unchanged
-    deadline of an already confirmed episode: it may stop immediately or plan
-    continuation through that deadline. These are planning constraints, never
+    deadline of an already confirmed episode: economic replanning must retain
+    feasible charging through that deadline. These are planning constraints, never
     a physical lock against safety stops. Zero defaults preserve pure callers.
     """
 
@@ -685,11 +685,10 @@ def _search_schedule(
                 or (node.charge_minimum_until is not None and interval.start < node.charge_minimum_until)
                 or (node.charge_available_at is not None and interval.start < node.charge_available_at)
             )
-            # A fresh economic evaluation may stop an existing real episode
-            # immediately. Choosing continuation carries its original deadline;
-            # it may not become another short planned pulse at a later subslot.
-            may_stop_now = node.slot is None and config.grid_charge_active
-            if (not unfinished or may_stop_now) and not required_charge:
+            # A confirmed episode retains its original minimum deadline.
+            # Economics cannot release it early; infeasible physical, price or
+            # future-use constraints still reject the charging trajectory.
+            if not unfinished and not required_charge:
                 native, solar = _transition(interval, node, config, efficiency, "self_consumption")
                 retain(native, solar)
                 if window_power_w is None and config.hold_supported and interval.deficit_kwh > 0 and native.energy < node.energy - _EPS:
@@ -996,7 +995,9 @@ def build_battery_grid_plan(
     # purchases are considered only with verified hold support, so they cannot
     # introduce an unverified pseudo-hold through tiny forced-charge commands.
     step = max(config.energy_step_kwh, config.capacity_kwh / 200)
-    best = baseline
+    # Native operation remains the cost/PV reference, but is not an admissible
+    # active command before an existing confirmed minimum has elapsed.
+    best = None if minimum_until is not None else baseline
     constrained = bool(config.grid_charge_minimum_minutes or config.grid_charge_startup_seconds
                        or config.grid_charge_enable_seconds or minimum_until)
     # A small full-horizon candidate provides a useful incumbent even when a
@@ -1013,7 +1014,7 @@ def build_battery_grid_plan(
             timeline, config, efficiency, initial, baseline_solar, bounds,
             quantity_step, bucket_step, transition_budget=budget, baseline_energy=baseline_energy,
         )
-        if candidate is not None and _prefer_economic_node(candidate, best):
+        if candidate is not None and (best is None or _prefer_economic_node(candidate, best)):
             best = candidate
     if constrained and config.hold_supported:
         # At most four additional searches of 25,000 transitions each. They
@@ -1025,7 +1026,7 @@ def build_battery_grid_plan(
                 step, step / 2, transition_budget=_CHARGE_WINDOW_TRANSITION_BUDGET,
                 baseline_energy=baseline_energy, charge_window=window,
             )
-            if candidate is not None and _prefer_economic_node(candidate, best):
+            if candidate is not None and (best is None or _prefer_economic_node(candidate, best)):
                 best = candidate
             # Complete fixed-power episodes with a native prefix/suffix cannot
             # be lost to beam pruning. All ordinary physical/timing/PV/terminal
@@ -1037,18 +1038,21 @@ def build_battery_grid_plan(
                     baseline_energy=baseline_energy, charge_window=window,
                     window_power_w=config.max_charge_power_w*fraction,
                 )
-                if candidate is not None and _prefer_economic_node(candidate,best):
-                    best=candidate
+                if candidate is not None and (best is None or _prefer_economic_node(candidate, best)):
+                    best = candidate
     if continuation_plan is not None:
         from .battery_continuation import replay_continuation
 
         candidate = replay_continuation(timeline, config, efficiency, initial, continuation_plan)
-        if candidate is not None and _prefer_economic_node(candidate, best):
+        if candidate is not None and (best is None or _prefer_economic_node(candidate, best)):
             best = candidate
+    if best is None:
+        return BatteryGridPlan((), 0.0, 0.0, "confirmed_charge_minimum_infeasible", soc, valid=False)
     best = _improve_current_hold(timeline, config, efficiency, initial, best, baseline_solar, bounds)
     savings = baseline.cost - best.cost
-    if savings <= 1e-6:
+    if savings <= 1e-6 and minimum_until is None:
         return BatteryGridPlan(_slots(baseline), 0.0, 0.0, "no_economic_benefit", soc)
     slots = _slots(best)
     target = max((slot.soc_end for slot in slots if slot.action == "charge"), default=soc)
-    return BatteryGridPlan(slots, best.grid_energy, savings, "economic_plan", target)
+    reason = "confirmed_charge_minimum" if minimum_until is not None and savings <= 1e-6 else "economic_plan"
+    return BatteryGridPlan(slots, best.grid_energy, savings, reason, target)

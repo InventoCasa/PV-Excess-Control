@@ -370,7 +370,18 @@ The search can continue charging across these boundaries, updating power and
 using the episode's final SoC target. A short first accounting interval is not
 itself a reason to stop a valid longer charge. A running episode keeps its
 original minimum deadline through replanning; the countdown does not restart
-every update. New data may still justify an immediate stop.
+every update. Purely economic replanning cannot choose an earlier stop while a
+feasible continuation remains. This commitment can temporarily have negative
+estimated savings relative to an immediate stop; the comparison is reported
+honestly rather than treated as a new profitable purchase.
+The control reason is then `minimum_charge_continuation`.
+
+At tariff boundaries the controller obtains a coherent provider observation
+when the coordinator's previous snapshot disagrees with the live price. It
+validates unique current-window coverage and uses the full-precision live price
+for the active window. A contradictory or missing refreshed observation still
+stops control; a scheduled price change does not itself require a stop and
+restart pause when the updated plan remains valid.
 
 During preparation the model credits no grid energy or battery discharge and
 accounts for a possible interruption of solar charging. Only this explicit
@@ -386,10 +397,13 @@ retain a safety deadline while commands are confirmed; an unrelated discharge
 limit acknowledgement cannot extend an expired charging authorization. Only a
 freshly validated charging decision can authorize a later end.
 
-The minimum is a planning and admission requirement. It does not force continued
-charging when control is disabled, required data is missing, the target is
+The minimum begins at physical command confirmation and protects economic
+continuation. It is not a guarantee of measured energy flow and does not force
+continued charging when control is disabled, required data is missing, the target is
 reached, the price is no longer permitted, or another necessary stop applies.
-Manual forced charging retains its separate behavior.
+PV-uptake and useful-energy feasibility bounds remain enforced; an infeasible
+protected continuation is rejected. Manual forced charging retains its separate
+behavior.
 
 ## Restart eligibility
 
@@ -444,9 +458,20 @@ feedback values when the inverter reports different text from the command.
 Helper controls require a distinct physical feedback entity.
 
 Exactly adjacent hold intervals in a valid plan share one hold deadline, avoiding
-a release at their common boundary. A gap, a different planned action, invalid
-inputs or an explicit stop still ends holding; sensor freshness continues to
-limit the watchdog deadline. A changed plan is revalidated after hardware waits.
+a release at their common boundary. When an already confirmed economic hold
+receives a new self-consumption proposal under unchanged tariffs, forecasts,
+configuration and external-load commitments, release requires that proposal to
+persist for up to sixty elapsed seconds. Repeated checks do not extend the
+confirmation time. The previous hold deadline and current tariff-window end
+remain hard limits. New charging, relevant input changes, invalid required data
+and explicit stops are not delayed. This adds no minimum-profit threshold, but
+can briefly defer a small economic improvement in exchange for fewer switches.
+
+The published plan remains the economic proposal. During confirmation, actual
+control reports `hold_release_pending` and `battery_hold_release_pending_until`;
+no artificial hold-energy trajectory replaces the proposal. Sensor freshness
+continues to limit the watchdog deadline. A changed plan is revalidated after
+hardware waits, including on a shared numeric discharge control.
 
 Numeric `number` and `input_number` controls are also supported. Enter command
 values in the control entity's native units and, when needed, separate numeric
@@ -540,12 +565,13 @@ The integration's status sensor includes:
 | `battery_confirmation` | Physical, helper-only or unconfigured acknowledgement |
 | `battery_charge_cleanup_pending`, `battery_hold_cleanup_pending`, `battery_discharge_cleanup_pending` | Release still needs confirmation |
 | `battery_hold_supported` | Verified hold mapping with physical acknowledgement is available |
+| `battery_hold_release_pending_until` | Bounded confirmation deadline before an economic hold is released; `null` when none is pending |
 | `battery_load_profile_ready` | All required hourly household demand values are available |
 | `battery_load_profile_source` | `configured`, `learned`, `retained` or `unavailable` household profile |
 | `battery_load_profile_retained_hours` | Local-hour indexes using mature observations older than seven days |
 | `battery_load_profile_oldest_age_hours`, `battery_load_profile_reason` | Actual oldest observation age and any profile rejection reason |
 | `battery_grid_energy_kwh`, `battery_grid_target_soc` | Planned purchased energy and computed grid target |
-| `battery_estimated_savings` | Forecast saving relative to normal self-consumption |
+| `battery_estimated_savings` | Forecast saving relative to normal self-consumption; may be negative while preserving a feasible confirmed charge minimum |
 | `battery_plan` | Time slots, actions, grid energy and expected ending SoC |
 
 If charging does not start, check the reason, data freshness, forecast/price

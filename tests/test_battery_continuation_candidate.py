@@ -131,14 +131,17 @@ def test_unchanged_candidate_preserves_immutable_source_and_fresh_balances(conti
     assert slots[0].battery_charge_power_w == pytest.approx(1000.)
 
 
-def test_material_price_change_can_choose_immediate_stop(continuation_case):
+def test_price_reversal_within_limit_preserves_confirmed_minimum(continuation_case):
     from dataclasses import replace
     case = continuation_case
     case.reading('sensor.price', .7)
     case.tariff.current_price = .7
     case.tariff.windows[0] = replace(case.tariff.windows[0], price=.7)
     assert case.coord._refresh_battery_grid_plan(case.tariff, None) is None
-    assert case.coord._battery_grid_plan.slots[0].action != 'charge'
+    plan = case.coord._battery_grid_plan
+    deadline = case.coord._battery_charge_minimum_until
+    assert all(row.action == 'charge' for row in plan.slots if row.start < deadline)
+    assert deadline in {row.end for row in plan.slots}
 
 
 @pytest.mark.parametrize('change', ['disabled', 'missing_soc', 'missing_load', 'price_limit', 'forecast_gap'])
