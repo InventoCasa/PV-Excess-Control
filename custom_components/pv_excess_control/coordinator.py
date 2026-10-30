@@ -2367,6 +2367,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Turn off all currently-ON managed appliances (M11).
 
         Called when the master switch transitions from enabled to disabled.
+        On-only, paused and overridden appliances are left running (#71):
+        the integration never turns on-only appliances off, and paused or
+        overridden ones are under manual control.
         """
         subentries = getattr(self.config_entry, "subentries", {})
         for subentry_id, subentry in subentries.items():
@@ -2380,6 +2383,20 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             domain = entity_id.split(".")[0] if "." in entity_id else "switch"
             name = subentry.data.get(CONF_APPLIANCE_NAME, subentry_id)
+            if subentry.data.get(CONF_ON_ONLY, False):
+                keep_reason = "on-only"
+            elif getattr(self, "appliance_paused", {}).get(subentry_id, False):
+                keep_reason = "paused"
+            elif self.appliance_overrides.get(subentry_id, False):
+                keep_reason = "override active"
+            else:
+                keep_reason = None
+            if keep_reason:
+                _LOGGER.info(
+                    "Master switch disabled: left %s (%s) on (%s)",
+                    name, entity_id, keep_reason,
+                )
+                continue
             try:
                 async with asyncio.timeout(10):
                     await self.hass.services.async_call(
