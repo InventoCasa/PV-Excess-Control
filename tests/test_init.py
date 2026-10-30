@@ -2299,3 +2299,91 @@ class TestActivationCountingOnStateTransition:
 
         # Stale cleanup should have removed it
         assert "sub_1" not in coord._previous_is_on
+
+
+# ---------------------------------------------------------------------------
+# Tests: master switch disable keeps manual/on-only appliances running (#71)
+# ---------------------------------------------------------------------------
+
+
+class TestMasterDisableTurnOff:
+    """_turn_off_all_managed() on the master switch enabled -> disabled edge."""
+
+    @staticmethod
+    def _sub(entity_id: str, on_only: bool = False) -> MagicMock:
+        from custom_components.pv_excess_control.const import (
+            CONF_APPLIANCE_ENTITY,
+            CONF_APPLIANCE_NAME,
+            CONF_ON_ONLY,
+        )
+
+        sub = MagicMock()
+        sub.data = {
+            CONF_APPLIANCE_NAME: entity_id,
+            CONF_APPLIANCE_ENTITY: entity_id,
+            CONF_ON_ONLY: on_only,
+        }
+        return sub
+
+    def _coord(self, subs: dict[str, MagicMock]):
+        from custom_components.pv_excess_control.const import CONF_APPLIANCE_ENTITY
+
+        states = {
+            sub.data[CONF_APPLIANCE_ENTITY]: MockState("on") for sub in subs.values()
+        }
+        coord = _make_coordinator(
+            states=states, entry=_make_config_entry(subentries=subs),
+        )
+        coord.appliance_paused = {}
+        return coord
+
+    @staticmethod
+    def _turned_off(coord) -> set[str]:
+        return {
+            data["entity_id"]
+            for _domain, service, data in coord.hass.services.calls
+            if service == "turn_off"
+        }
+
+    @pytest.mark.asyncio
+    async def test_regular_appliance_is_turned_off(self):
+        coord = self._coord({"sub_1": self._sub("switch.heater")})
+
+        await coord._turn_off_all_managed()
+
+        assert self._turned_off(coord) == {"switch.heater"}
+
+    @pytest.mark.asyncio
+    async def test_on_only_appliance_is_left_on(self):
+        coord = self._coord({
+            "sub_1": self._sub("switch.laptop", on_only=True),
+            "sub_2": self._sub("switch.heater"),
+        })
+
+        await coord._turn_off_all_managed()
+
+        assert self._turned_off(coord) == {"switch.heater"}
+
+    @pytest.mark.asyncio
+    async def test_paused_appliance_is_left_on(self):
+        coord = self._coord({
+            "sub_1": self._sub("switch.dryer"),
+            "sub_2": self._sub("switch.heater"),
+        })
+        coord.appliance_paused = {"sub_1": True}
+
+        await coord._turn_off_all_managed()
+
+        assert self._turned_off(coord) == {"switch.heater"}
+
+    @pytest.mark.asyncio
+    async def test_overridden_appliance_is_left_on(self):
+        coord = self._coord({
+            "sub_1": self._sub("switch.pump"),
+            "sub_2": self._sub("switch.heater"),
+        })
+        coord.appliance_overrides = {"sub_1": True}
+
+        await coord._turn_off_all_managed()
+
+        assert self._turned_off(coord) == {"switch.heater"}
