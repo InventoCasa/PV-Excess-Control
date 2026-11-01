@@ -24,6 +24,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from .daily_state import nonnegative_number
 from .power_policy import battery_first_budget
+from .price_forecast import PriceForecastError, parse_price_forecast
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -94,6 +95,7 @@ from .const import (
     CONF_PLANNER_INTERVAL,
     CONF_PROTECT_FROM_PREEMPTION,
     CONF_PRICE_SENSOR,
+    CONF_PRICE_FORECAST_SENSOR,
     CONF_PV_POWER,
     CONF_REQUIRES_APPLIANCE,
     CONF_HELPER_ONLY,
@@ -2409,6 +2411,32 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             confidence=0.0,
         )
 
+    def _read_price_forecast(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Read an optional forecast for diagnostics, outside tariff/control data."""
+        entity_id = self.config_entry.data.get(CONF_PRICE_FORECAST_SENSOR)
+        result = {
+            "source_entity": entity_id or None,
+            "status": "not_configured",
+            "automation_eligible": False,
+            "snapshot": None,
+        }
+        if not entity_id:
+            return result
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            result["status"] = "missing_sensor"
+        elif state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            result["status"] = "unavailable"
+        else:
+            try:
+                snapshot = parse_price_forecast(state.attributes, now=now or dt_util.utcnow())
+            except PriceForecastError as err:
+                result["status"] = str(err)
+            else:
+                result["status"] = "available"
+                result["snapshot"] = snapshot.as_dict()
+        return result
+
     def _build_coordinator_data(self) -> dict[str, Any]:
         """Build a data dict that entity platforms can read."""
         latest_power = self.power_history[-1] if self.power_history else None
@@ -2427,6 +2455,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "battery_priority_status": getattr(self, "_battery_priority_status", "inactive"),
             "power_history": list(self.power_history),
             "current_plan": self.current_plan,
+            "price_forecast": self._read_price_forecast(),
             "forecast_status": getattr(self, "_forecast_status", "not_configured"),
             "forecast_remaining_today_kwh": getattr(getattr(self, "_forecast_data", None), "remaining_today_kwh", None),
             "forecast_tomorrow_total_kwh": getattr(getattr(self, "_forecast_data", None), "tomorrow_total_kwh", None),

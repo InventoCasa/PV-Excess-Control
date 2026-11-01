@@ -24,11 +24,11 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_APPLIANCE_NAME, CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, DOMAIN
+from .const import CONF_APPLIANCE_NAME, CONF_DYNAMIC_BATTERY_CHARGE_ENABLED, CONF_PRICE_FORECAST_SENSOR, DOMAIN
 from .coordinator import PvExcessCoordinator
 from .entity_lifecycle import add_entities_by_subentry, device_info
 from .models import BatteryDischargeAction
@@ -50,6 +50,10 @@ async def async_setup_entry(
         PvExcessPowerSensor(coordinator),
         PvPlanConfidenceSensor(coordinator),
     ]
+
+    forecast_entity = getattr(config_entry, "data", {}).get(CONF_PRICE_FORECAST_SENSOR)
+    if isinstance(forecast_entity, str) and forecast_entity:
+        entities.append(PvPriceForecastSensor(coordinator))
 
     # Per-appliance sensors from subentries
     subentries = getattr(config_entry, "subentries", {})
@@ -105,6 +109,34 @@ class PvExcessBaseSensor(CoordinatorEntity[PvExcessCoordinator], SensorEntity):
 # ---------------------------------------------------------------------------
 # System sensors
 # ---------------------------------------------------------------------------
+
+
+class PvPriceForecastSensor(PvExcessBaseSensor):
+    """Diagnostic status and validated external forecast, without control effects."""
+
+    _attr_icon = "mdi:chart-timeline-variant"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _unrecorded_attributes = frozenset({"intervals"})
+
+    def __init__(self, coordinator: PvExcessCoordinator) -> None:
+        super().__init__(coordinator, "price_forecast", "Price Forecast")
+
+    @property
+    def native_value(self) -> str:
+        """Report the input status, not a forecast price as a confirmed tariff."""
+        return (self._data or {}).get("price_forecast", {}).get("status", "pending")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose provenance and the current validated snapshot only."""
+        data = (self._data or {}).get("price_forecast", {})
+        attrs = {"source_entity": data.get("source_entity"), "automation_eligible": False}
+        if snapshot := data.get("snapshot"):
+            attrs.update(snapshot)
+            attrs["interval_count"] = len(snapshot["intervals"])
+            attrs["forecast_start"] = snapshot["intervals"][0]["start"]
+            attrs["forecast_end"] = snapshot["intervals"][-1]["end"]
+        return attrs
 
 
 class PvExcessPowerSensor(PvExcessBaseSensor):
