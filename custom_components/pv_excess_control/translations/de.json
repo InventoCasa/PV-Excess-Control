@@ -103,6 +103,15 @@
           "additional_forecast_sensors": "Prognosen separater PV-Flächen. Doppelte Entity-IDs zählen nur einmal; keinen bereits enthaltenen Summensensor ergänzen.",
           "additional_forecast_tomorrow_sensors": "Diese Quellen und der einzelne Morgen-Sensor ersetzen gemeinsam den morgigen Anteil der primären Prognosen. Alle morgigen Flächen angeben."
         }
+      },
+      "energy": {
+        "title": "Strompreise",
+        "data": {
+          "price_forecast_sensor": "Strompreis-Prognosesensor (optional)"
+        },
+        "data_description": {
+          "price_forecast_sensor": "Optionaler externer Sensor mit versionierten Preisprognosen. Nur Diagnose: Prognosen ersetzen keine veröffentlichten Tarifpreise und lösen keine Ladung aus."
+        }
       }
     }
   },
@@ -126,6 +135,15 @@
         "data_description": {
           "additional_forecast_sensors": "Prognosen separater PV-Flächen. Doppelte Entity-IDs zählen nur einmal; keinen bereits enthaltenen Summensensor ergänzen.",
           "additional_forecast_tomorrow_sensors": "Diese Quellen und der einzelne Morgen-Sensor ersetzen gemeinsam den morgigen Anteil der primären Prognosen. Alle morgigen Flächen angeben."
+        }
+      },
+      "energy": {
+        "title": "Strompreise",
+        "data": {
+          "price_forecast_sensor": "Strompreis-Prognosesensor (optional)"
+        },
+        "data_description": {
+          "price_forecast_sensor": "Optionaler externer Sensor mit versionierten Preisprognosen. Nur Diagnose: Prognosen ersetzen keine veröffentlichten Tarifpreise und lösen keine Ladung aus."
         }
       }
     }
