@@ -32,6 +32,8 @@ docs/generic-controls.md
 docs/installation.md
 docs/inverter-grid-charge-setup.md
 docs/migration.md
+docs/price-forecast-input.de.md
+docs/price-forecast-input.md
 docs/release-candidate.de.md
 docs/release-candidate.md
 docs/stabilization.md

@@ -53,6 +53,7 @@ The [0.4.0rc1 candidate notes](docs/release-candidate.md) explain migration and 
 
 ### Tariffs & Grid
 - **Tariff Integration** - Support for Tibber, Awattar, Nordpool, Octopus Energy, and generic price sensors.
+- **External Price Forecasts** - An optional [forecast sensor](docs/price-forecast-input.md) accepts predictions from a separate model for diagnostics. Published tariffs remain the basis for control.
 - **Export Limit Management** - Absorb would-be-curtailed power when feed-in caps apply.
 - **Grid Supplementation** - Allow a small amount of grid power to top up appliances.
 

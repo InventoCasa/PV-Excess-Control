@@ -52,6 +52,7 @@ Diese Integration ist Open Source, weil ich daran glaube, der Community, die Hom
 
 ### Stromtarife & -netz
 - **Tarif-Integration** - Unterstützung für Tibber, Awattar, Nordpool, Octopus Energy und generische Preissensoren.
+- **Externe Preisprognosen** - Ein optionaler [Prognosesensor](docs/price-forecast-input.de.md) übernimmt Vorhersagen eines eigenständigen Modells zur Diagnose. Veröffentlichte Tarifpreise bleiben die Grundlage der Steuerung.
 - **Einspeiselimit-Management** - Absorbieren potenziell abgeregelter Leistung möglich, z.B. wenn Einspeisebegrenzungen gelten.
 - **Netzsupplementierung** - Möglichkeit, eine bestimmte Menge an Netzstrom zu erlauben, um Geräte zusätzlich zu supplementieren.
 

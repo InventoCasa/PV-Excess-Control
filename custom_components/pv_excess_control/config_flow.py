@@ -150,6 +150,7 @@ from .const import (
     CONF_PLANNER_INTERVAL,
     CONF_PROTECT_FROM_PREEMPTION,
     CONF_PRICE_SENSOR,
+    CONF_PRICE_FORECAST_SENSOR,
     CONF_PV_POWER,
     CONF_HELPER_ONLY,
     CONF_REQUIRES_APPLIANCE,
@@ -667,6 +668,11 @@ def _energy_schema(
 
     if tariff_provider != TariffProvider.NONE:
         schema_dict[vol.Required(CONF_PRICE_SENSOR, description={"suggested_value": d.get(CONF_PRICE_SENSOR)})] = SENSOR_ENTITY_SELECTOR
+
+    schema_dict[vol.Optional(
+        CONF_PRICE_FORECAST_SENSOR,
+        description={"suggested_value": d.get(CONF_PRICE_FORECAST_SENSOR)},
+    )] = SENSOR_ENTITY_SELECTOR
 
     schema_dict[vol.Optional(
         CONF_CHEAP_PRICE_THRESHOLD,
@@ -1370,7 +1376,7 @@ class PvExcessControlConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors:
                 self.data.update(user_input)
                 # Clean optional energy keys not present in user_input
-                for key in [CONF_FEED_IN_TARIFF_SENSOR]:
+                for key in [CONF_FEED_IN_TARIFF_SENSOR, CONF_PRICE_FORECAST_SENSOR]:
                     if key not in user_input:
                         self.data.pop(key, None)
                 return await self.async_step_forecast()
@@ -1655,7 +1661,7 @@ class PvExcessControlOptionsFlow(config_entries.OptionsFlow):
             if not errors:
                 self.data.update(user_input)
                 # Clean optional energy keys not present in user_input
-                for key in [CONF_FEED_IN_TARIFF_SENSOR]:
+                for key in [CONF_FEED_IN_TARIFF_SENSOR, CONF_PRICE_FORECAST_SENSOR]:
                     if key not in user_input:
                         self.data.pop(key, None)
                 return await self.async_step_forecast()

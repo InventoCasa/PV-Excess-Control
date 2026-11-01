@@ -219,6 +219,15 @@
           "battery_forecast_updated_entity": "Optionaler Sensor mit dem Zeitpunkt des tatsächlichen PV-Prognoseabrufs einschließlich Zeitzone. Seine Altersprüfung ersetzt die Prüfung des HA-Sensormeldungsalters. Ein fehlender, ungültiger, zukünftiger oder veralteter Abrufzeitpunkt sperrt die automatische Batterieplanung.",
           "battery_forecast_source_max_age_hours": "Gilt nur mit zugeordnetem Sensor für den tatsächlichen Abrufzeitpunkt. Standard 24 Stunden lässt eine Nachmittagsprognose bis zum nächsten Morgen gelten. Grenze passend zum Abrufplan wählen; zusätzliche Abrufe werden dadurch nicht ausgelöst."
         }
+      },
+      "energy": {
+        "title": "Strompreise",
+        "data": {
+          "price_forecast_sensor": "Strompreis-Prognosesensor (optional)"
+        },
+        "data_description": {
+          "price_forecast_sensor": "Optionaler externer Sensor mit versionierten Preisprognosen. Nur Diagnose: Prognosen ersetzen keine veröffentlichten Tarifpreise und lösen keine Ladung aus."
+        }
       }
     },
     "error": {
@@ -344,6 +353,15 @@
           "battery_grid_charge_minimum_minutes": "Neue automatische Ladungen benötigen mindestens diese zusammenhängende Ladezeit nach dem Umschalten. Sicherheitsabschaltungen bleiben sofort möglich.",
           "battery_forecast_updated_entity": "Optionaler Sensor mit dem Zeitpunkt des tatsächlichen PV-Prognoseabrufs einschließlich Zeitzone. Seine Altersprüfung ersetzt die Prüfung des HA-Sensormeldungsalters. Ein fehlender, ungültiger, zukünftiger oder veralteter Abrufzeitpunkt sperrt die automatische Batterieplanung.",
           "battery_forecast_source_max_age_hours": "Gilt nur mit zugeordnetem Sensor für den tatsächlichen Abrufzeitpunkt. Standard 24 Stunden lässt eine Nachmittagsprognose bis zum nächsten Morgen gelten. Grenze passend zum Abrufplan wählen; zusätzliche Abrufe werden dadurch nicht ausgelöst."
+        }
+      },
+      "energy": {
+        "title": "Strompreise",
+        "data": {
+          "price_forecast_sensor": "Strompreis-Prognosesensor (optional)"
+        },
+        "data_description": {
+          "price_forecast_sensor": "Optionaler externer Sensor mit versionierten Preisprognosen. Nur Diagnose: Prognosen ersetzen keine veröffentlichten Tarifpreise und lösen keine Ladung aus."
         }
       }
     },
