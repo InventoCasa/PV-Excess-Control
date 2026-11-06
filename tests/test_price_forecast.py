@@ -53,7 +53,7 @@ def test_zero_and_negative_prices_are_preserved_and_input_is_not_mutated():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("schema_version", True), ("schema_version", 1.0), ("schema_version", 2),
+    ("schema_version", True), ("schema_version", 1.0), ("schema_version", 3),
     ("unit", "ct/kWh"), ("market", "FR"), ("price_basis", "unknown"),
     ("model", ""), ("generated_at", "2026-11-01T12:00:00"),
     ("generated_at", (NOW + timedelta(seconds=1)).isoformat()),
