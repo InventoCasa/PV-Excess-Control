@@ -5,7 +5,7 @@ Home-Assistant-Sensor unter **Konfigurieren → Strompreise → Strompreis-Progn
 Die Angabe ist optional und unabhängig vom Tarifanbieter. Zum Entfernen die
 Auswahl leeren. Nach Abschluss der Optionen wird der Eintrag neu geladen.
 
-Version 1 dient der Beobachtung und Auswertung. Sie erstellt einen Diagnosesensor
+Versionen 1 und 2 dienen der Beobachtung und Auswertung. Sie liefern einen Diagnosesensor
 **Price Forecast** mit Quelle, Modell, Zeitstempeln und angenommenen Intervallen.
 `available` bedeutet, dass Struktur und Datenfrische geprüft wurden; es bestätigt
 keine Prognosegenauigkeit. Prognosen ersetzen keine bestätigten Tarifintervalle,
@@ -40,7 +40,7 @@ keine aktuelle Prognose.
 }
 ```
 
-- `schema_version` ist die ganze Zahl `1`, der Markt `DE-LU`, die Einheit
+- `schema_version` ist die ganze Zahl `1` oder `2`, der Markt `DE-LU`, die Einheit
   `EUR/kWh`.
 - `price_basis` ist `wholesale` oder `retail`. Großhandelspreise enthalten keine
   Gebühren und Steuern des Haushaltstarifs; dieser Eingang rechnet sie nicht um.
@@ -52,9 +52,15 @@ keine aktuelle Prognose.
   jeweils 15, 30 oder 60 Minuten Dauer. Jedes Ende liegt höchstens sieben
   tatsächlich vergangene Tage nach der Erstellung. Mindestens ein Intervall
   reicht noch in die Zukunft. UTC-Vergleiche erhalten Zeitumstellungen korrekt.
-- Preise und Grenzen sind endliche JSON-Zahlen mit `lower <= price <= upper`.
-  Null und negative Preise sind gültig. Fehlende Zahlen, Wahrheitswerte, NaN und
-  Unendlich werden abgewiesen; fehlende Daten werden niemals zu null.
+- Preise sind endliche JSON-Zahlen; der Zahlenwert `0` und negative Preise sind gültig.
+  Version 1 benötigt endliche Grenzen mit `lower <= price <= upper`. Version 2
+  erlaubt entweder solche Grenzen oder ausdrücklich `lower: null` und
+  `upper: null` gemeinsam. Beide Schlüssel bleiben Pflicht. Fehlende Preise,
+  Wahrheitswerte, NaN und Unendlich werden abgewiesen.
+- Jedes Intervall der Version 2 benötigt zusätzlich eine nichtleere Zeichenkette
+  `source` mit höchstens 128 Zeichen. Diese Anbieterkennung wird unverändert in
+  die Diagnose übernommen; die Integration interpretiert sie nicht und leitet
+  daraus keine Steuerungsfreigabe ab.
 - `model` ist eine nichtleere Zeichenkette mit höchstens 128 Zeichen. Unterstützt
   wird `experimental` mit dem booleschen Wert `automation_eligible: false`.
   Grenzen beschreiben empirische Streuung und keine nachgewiesene
@@ -66,12 +72,36 @@ Ein unabhängiger Anbieter kann dieses JSON über einen Home-Assistant-REST- ode
 MQTT-Sensor bereitstellen. Anbieter können dasselbe Format liefern, ohne
 Modellabhängigkeiten in dieser Integration zu installieren.
 
+## Punktprognosen in Version 2
+
+Die übrigen Angaben bleiben gleich. Setze `schema_version` auf `2` und ergänze
+`source` in jedem Intervall. Ein Intervall ohne angegebenes Unsicherheitsband
+sieht so aus:
+
+```json
+{
+  "start": "2026-11-01T13:00:00+00:00",
+  "end": "2026-11-01T14:00:00+00:00",
+  "price": 0.08,
+  "lower": null,
+  "upper": null,
+  "source": "external-provider"
+}
+```
+
+Dieser Preis wird ohne Band dargestellt. Die Integration erhält beide `null`-
+Werte und die Anbieterkennung. Ein Datensatz der Version 2 darf Punktprognosen
+und Intervalle mit Grenzen kombinieren; eine einzelne `null`-Grenze zusammen mit
+einer Zahl ist ungültig. Version 1 behält ihre verpflichtenden numerischen
+Grenzen und ihr Ausgabeformat. Für beide Versionen gelten dieselben Regeln für
+Frische, zeitliche Abdeckung und reine Beobachtung.
+
 ## Diagnose und Historie
 
 Der Diagnosesensor meldet `not_configured`, `missing_sensor`, `unavailable`,
 `expired`, `no_future_intervals` oder einen Prüfgrund wie `unsupported_schema`,
 `unsupported_market_or_unit`, `unsupported_quality`, `future_generation`,
-`invalid_price`, `invalid_bounds` oder `noncontiguous_intervals`. Abgewiesene Daten
+`invalid_price`, `invalid_bounds`, `invalid_source` oder `noncontiguous_intervals`. Abgewiesene Daten
 entfernen den angenommenen Datensatz bei der nächsten Koordinatoraktualisierung;
 eine frühere erfolgreiche Prognose wird nicht als aktuell weitergeführt.
 
