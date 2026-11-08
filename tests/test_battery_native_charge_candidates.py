@@ -9,6 +9,7 @@ from tests.test_battery_charge_opportunities import START, CONFIG, solar_refill_
 
 
 def disable_broad_searches(monkeypatch):
+    monkeypatch.setattr(bp, '_EPISODE_RESOLUTION_SEARCHES', ())
     for name in ['_EPISODE_COARSE_TRANSITION_BUDGET','_EPISODE_PRIMARY_TRANSITION_BUDGET',
                  '_REFINEMENT_TRANSITION_BUDGET','_QUANTITY_REFINEMENT_TRANSITION_BUDGET',
                  '_CHARGE_WINDOW_TRANSITION_BUDGET']:

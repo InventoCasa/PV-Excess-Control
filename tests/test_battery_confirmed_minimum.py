@@ -113,6 +113,7 @@ def test_expired_active_deadline_is_not_renewed_from_minimum_minutes():
 def test_completed_continuation_survives_exhausted_search_budgets(monkeypatch):
     previous = plan()
     assert_protected(previous)
+    monkeypatch.setattr(bp, '_EPISODE_RESOLUTION_SEARCHES', ())
     for name in ('_EPISODE_COARSE_TRANSITION_BUDGET', '_EPISODE_PRIMARY_TRANSITION_BUDGET',
                  '_REFINEMENT_TRANSITION_BUDGET', '_QUANTITY_REFINEMENT_TRANSITION_BUDGET',
                  '_CHARGE_WINDOW_TRANSITION_BUDGET', '_NATIVE_WINDOW_TRANSITION_BUDGET'):
@@ -124,6 +125,7 @@ def test_completed_continuation_survives_exhausted_search_budgets(monkeypatch):
 
 
 def test_exhausted_search_cannot_return_an_unprotected_baseline(monkeypatch):
+    monkeypatch.setattr(bp, '_EPISODE_RESOLUTION_SEARCHES', ())
     for name in ('_EPISODE_COARSE_TRANSITION_BUDGET', '_EPISODE_PRIMARY_TRANSITION_BUDGET',
                  '_REFINEMENT_TRANSITION_BUDGET', '_QUANTITY_REFINEMENT_TRANSITION_BUDGET',
                  '_CHARGE_WINDOW_TRANSITION_BUDGET', '_NATIVE_WINDOW_TRANSITION_BUDGET'):

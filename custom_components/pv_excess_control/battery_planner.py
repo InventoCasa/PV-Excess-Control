@@ -24,6 +24,7 @@ _REFINEMENT_TRANSITION_BUDGET = 100_000
 _QUANTITY_REFINEMENT_TRANSITION_BUDGET = 100_000
 _EPISODE_PRIMARY_TRANSITION_BUDGET = 300_000
 _EPISODE_COARSE_TRANSITION_BUDGET = 100_000
+_EPISODE_RESOLUTION_SEARCHES = ((32, 100_000), (40, 150_000))
 _CHARGE_WINDOW_CANDIDATE_LIMIT = 4
 _CHARGE_WINDOW_TRANSITION_BUDGET = 25_000
 _NATIVE_WINDOW_TRANSITION_BUDGET = 2_500
@@ -1005,6 +1006,15 @@ def build_battery_grid_plan(
     coarse_step = max(step, config.capacity_kwh / 8)
     searches = ([(coarse_step, coarse_step, _EPISODE_COARSE_TRANSITION_BUDGET)]
                 if constrained else [])
+    if constrained:
+        # Intermediate resolutions can complete a useful multiwindow plan when
+        # the finer searches exhaust their work limits. Each still keeps exact
+        # energy balances and all physical guards. At most 250,000 extra
+        # transitions; every completed incumbent remains in the comparison.
+        for divisor, budget in _EPISODE_RESOLUTION_SEARCHES:
+            intermediate_step = config.capacity_kwh / divisor
+            if step < intermediate_step < coarse_step:
+                searches.append((intermediate_step, intermediate_step, budget))
     searches += [(step, step, _EPISODE_PRIMARY_TRANSITION_BUDGET if constrained else None),
                  (step, step / 2, _REFINEMENT_TRANSITION_BUDGET)]
     if config.hold_supported:

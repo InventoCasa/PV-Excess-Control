@@ -1,4 +1,4 @@
-"""Re-evaluate a previous charging trajectory against fresh physical inputs."""
+"""Re-evaluate a previous battery trajectory against fresh physical inputs."""
 from dataclasses import replace
 import math
 
@@ -6,14 +6,18 @@ import math
 def replay_continuation(timeline, config, efficiency, initial, previous_plan):
     """Return a fully validated economic candidate, never a runtime charge lease.
 
-    Existing action and power boundaries remain fixed. Fresh measurements,
-    forecasts, tariffs and limits determine every new balance. A failed guard
+    Existing action and power boundaries remain fixed. Future purchase power
+    may decrease to respect fresh energy bounds; active continuation stays
+    exact. Fresh measurements, forecasts, tariffs and limits determine every
+    new balance. A failed guard
     simply excludes this candidate; the normal search and safety stops remain.
-    An existing confirmed minimum is retained without extending its deadline.
+    Future purchases can be reconsidered while idle. An already current charge
+    can only continue after confirmation; an old plan never authorizes a new
+    start. An existing confirmed minimum keeps its original deadline.
     """
     from . import battery_planner as bp
 
-    if (not config.grid_charge_active or previous_plan is None or not previous_plan.valid
+    if (previous_plan is None or not previous_plan.valid
             or not previous_plan.slots or not timeline):
         return None
     previous = previous_plan.slots
@@ -21,8 +25,14 @@ def replay_continuation(timeline, config, efficiency, initial, previous_plan):
         if (len(previous) > 576 or any(
                 row.end <= row.start or row.action not in ("charge", "hold", "self_consumption")
                 for row in previous)
-                or any(left.end != right.start for left, right in zip(previous, previous[1:]))
-                or bp.charge_episode_at(previous_plan, timeline[0].start) is None):
+                or any(left.end != right.start for left, right in zip(previous, previous[1:]))):
+            return None
+        current = next((row for row in previous if row.start <= timeline[0].start < row.end), None)
+        if (current is None or (current.action == "charge") != config.grid_charge_active
+                or config.grid_charge_active and bp.charge_episode_at(previous_plan, timeline[0].start) is None):
+            return None
+        if not any(row.end > timeline[0].start and row.start < timeline[-1].end
+                   and row.grid_charge_kwh > bp._EPS for row in previous):
             return None
         edges = {point for row in previous for point in (row.start, row.end)}
         edges.update(row.grid_charge_available_at for row in previous if row.grid_charge_available_at is not None)
@@ -98,10 +108,23 @@ def replay_continuation(timeline, config, efficiency, initial, previous_plan):
                         return None
                     grid = episode.power_w * hours / 1000 - solar / efficiency
                     debit = min(loss_debt(held, solar, index), future_margin[index])
-                    maximum = min(config.max_charge_power_w * hours / 1000,
-                        config.native_charge_power_w * hours / 1000 - solar / efficiency,
+                    power_maximum = min(config.max_charge_power_w * hours / 1000,
+                        config.native_charge_power_w * hours / 1000 - solar / efficiency)
+                    maximum = min(power_maximum,
                         (min(config.capacity_kwh * config.grid_target_soc / 100,
                              max(0., bounds[index + 1] - debit)) - held.energy) / efficiency)
+                    if not config.grid_charge_active:
+                        # A few newly measured Wh must not discard an otherwise
+                        # useful future schedule. Reduce only energy-bound
+                        # purchases; changed device power limits still reject
+                        # the old trajectory. Quantize downward to an executable
+                        # command and retain all subsequent episode/PV guards.
+                        if (grid > power_maximum + bp._EPS
+                                or abs(bp._executable_grid_energy(row, config, solar / efficiency, grid,
+                                    charging_hours=hours) - grid) > bp._EPS):
+                            return None
+                        grid = bp._executable_grid_energy(row, config, solar / efficiency,
+                            min(grid, maximum), charging_hours=hours)
                     if (grid <= bp._EPS or grid > maximum + bp._EPS
                             or abs(bp._executable_grid_energy(row, config, solar / efficiency, grid,
                                 charging_hours=hours) - grid) > bp._EPS):
@@ -116,6 +139,8 @@ def replay_continuation(timeline, config, efficiency, initial, previous_plan):
             node = candidate
         if node.charge_active and (not node.charge_grid_delivered
                 or node.charge_minimum_until is not None or node.charge_available_at is not None):
+            return None
+        if node.grid_energy <= bp._EPS:
             return None
         return node
     except (ValueError, TypeError, AttributeError, ArithmeticError):

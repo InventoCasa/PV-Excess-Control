@@ -24,6 +24,7 @@ CONFIG = bp.BatteryPlanningConfig(
 @pytest.fixture
 def bounded_windows_only(monkeypatch):
     """Require a supplemental completed candidate after other budgets run out."""
+    monkeypatch.setattr(bp, '_EPISODE_RESOLUTION_SEARCHES', ())
     for name in ('_EPISODE_COARSE_TRANSITION_BUDGET', '_EPISODE_PRIMARY_TRANSITION_BUDGET',
                  '_REFINEMENT_TRANSITION_BUDGET', '_QUANTITY_REFINEMENT_TRANSITION_BUDGET'):
         monkeypatch.setattr(bp, name, 0)

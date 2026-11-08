@@ -2392,7 +2392,7 @@ class BatteryControlMixin:
         return None, _BatteryPlanningRequest(
             key, now, soc, tuple(tariff_info.windows), scenarios.nominal,
             tuple(profile), config, tuple(commitments),
-            self._battery_grid_plan if self._grid_charge_engaged else None,
+            self._battery_grid_plan,
             scenarios.low, scenarios.low_status,
         )
 

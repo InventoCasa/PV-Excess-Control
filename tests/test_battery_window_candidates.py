@@ -95,6 +95,7 @@ def test_executable_cheap_window_survives_competing_partial_charge_paths():
 @pytest.fixture
 def windows_only(monkeypatch):
     """Make the new completed candidates carry the regression's full result."""
+    monkeypatch.setattr(bp, '_EPISODE_RESOLUTION_SEARCHES', ())
     for name in ('_EPISODE_COARSE_TRANSITION_BUDGET', '_EPISODE_PRIMARY_TRANSITION_BUDGET',
                  '_REFINEMENT_TRANSITION_BUDGET', '_QUANTITY_REFINEMENT_TRANSITION_BUDGET'):
         monkeypatch.setattr(bp, name, 0)
