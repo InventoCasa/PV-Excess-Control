@@ -298,6 +298,15 @@ The optional wear allowance defaults to **0 €/kWh**. For example, buying at
 about 0.265 €/kWh of later usable energy. Charging is useful only when it avoids
 more expensive grid purchases after accounting for forecast PV and demand.
 
+The planner also compares additional purchases in existing inexpensive charge
+windows with releasing selected later discharge holds. Each complete candidate
+must cost less after losses and the wear allowance, preserve solar uptake, and
+use its additional energy within the known horizon. It retains the existing
+power, price, capacity, restart and minimum-duration checks. A fuller battery
+can be the result of this comparison; filling to 100% is not a separate goal.
+This bounded comparison improves completed plans without guaranteeing a global
+optimum.
+
 ### Required inputs
 
 Automatic charging requires:

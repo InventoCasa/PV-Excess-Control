@@ -1050,10 +1050,19 @@ def build_battery_grid_plan(
                 )
                 if candidate is not None and (best is None or _prefer_economic_node(candidate, best)):
                     best = candidate
+    from .battery_charge_hold_exchange import improve_charge_hold_exchange
+
+    # Refine the cold result and previous trajectory independently. Selecting
+    # their raw costs first can hide the better completed exchange. Each seed
+    # has at most 64 proposals, so this adds at most 128 complete comparisons.
+    if best is not None:
+        best = improve_charge_hold_exchange(timeline, config, efficiency, initial, best)
     if continuation_plan is not None:
         from .battery_continuation import replay_continuation
 
         candidate = replay_continuation(timeline, config, efficiency, initial, continuation_plan)
+        if candidate is not None:
+            candidate = improve_charge_hold_exchange(timeline, config, efficiency, initial, candidate)
         if candidate is not None and (best is None or _prefer_economic_node(candidate, best)):
             best = candidate
     if best is None:
