@@ -385,6 +385,25 @@ estimated savings relative to an immediate stop; the comparison is reported
 honestly rather than treated as a new profitable purchase.
 The control reason is then `minimum_charge_continuation`.
 
+A previously future charge remains an economic candidate when its start becomes
+current. While unconfirmed it must pass fresh preparation, restart and minimum
+duration checks; the old plan grants no permission to enable the inverter.
+When revalidating that trajectory, its commands before the original confirmed
+minimum deadline remain unchanged. After that deadline, later portions of the
+current episode and later charging episodes
+may reduce their purchases to respect a newly measured energy bound. A small
+capacity excess therefore need not discard the complete remaining schedule.
+
+If inputs change during asynchronous planning, the published invalid plan is
+cleared immediately. Its immutable trajectory remains only a candidate for the
+bounded retry, which must pass all checks with fresh inputs. User stops, missing
+required data and safety limits still take precedence.
+
+Actual SoC is the starting point of each new calculation. Charging power and
+delivery timing remain planning assumptions: an inverter may begin delivering
+later or accept less power near full. A published future SoC is not a guaranteed
+physical deadline or a calibrated prediction of that device response.
+
 At tariff boundaries the controller obtains a coherent provider observation
 when the coordinator's previous snapshot disagrees with the live price. It
 validates unique current-window coverage and uses the full-precision live price

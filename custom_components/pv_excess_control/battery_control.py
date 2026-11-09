@@ -2485,6 +2485,10 @@ class BatteryControlMixin:
             return reason
 
         previous_ev_transaction = getattr(self, "_ev_forecast_transaction", False)
+        # A rejected publication must not erase the economic candidate for this
+        # bounded retry. This immutable value remains local, is revalidated with
+        # every fresh request, and never supplies an actuator permission.
+        continuation = self._battery_grid_plan
         try:
             for _ in range(2):
                 if not self._automatic_battery_planning_requested():
@@ -2496,6 +2500,10 @@ class BatteryControlMixin:
                 reason, request = self._battery_planning_request(tariff_info, power_state)
                 if reason:
                     return reject(reason)
+                if request.continuation_plan is not None:
+                    continuation = request.continuation_plan
+                elif continuation is not None:
+                    request = replace(request, continuation_plan=continuation)
                 self._invalidate_battery_risk_if_changed(request)
                 if not self._battery_plan_needs_refresh(request):
                     return None if self._battery_grid_plan.valid else self._battery_grid_plan.reason

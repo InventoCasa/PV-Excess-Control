@@ -84,10 +84,21 @@ def replay(case, *, config_changes=None, previous=None):
     {'charge_price_limit': .1},
     {'grid_restart_delay_minutes': 30.},
     {'hold_supported': False},
-    {'grid_charge_active': False},
 ])
 def test_current_limits_can_exclude_old_charging_trajectory(continuation_case, limits):
     assert replay(continuation_case, config_changes=limits) is None
+
+
+def test_unconfirmed_current_charge_restarts_planned_preparation(continuation_case):
+    from custom_components.pv_excess_control import battery_planner as bp
+    case = continuation_case
+    result = replay(case, config_changes={
+        'grid_charge_active': False, 'grid_charge_minimum_until': None})
+    assert result is not None
+    first = bp._slots(result)[0]
+    assert first.grid_charge_available_at == case.clock['now'] + timedelta(seconds=30)
+    assert first.start == case.clock['now']
+    assert result.energy == pytest.approx(0., abs=1e-8)
 
 
 def test_new_minimum_deadline_cannot_end_at_old_earlier_boundary(continuation_case):

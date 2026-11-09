@@ -147,9 +147,14 @@ def test_price_reversal_recalculates_economics_instead_of_pinning_old_plan(previ
     assert result.grid_energy_kwh == 0.
 
 
-def test_future_reuse_cannot_restart_an_old_current_charge_without_confirmation(previous_future_plan):
+def test_current_charge_shape_requires_fresh_startup_in_an_idle_candidate(previous_future_plan):
     first = next(row for row in previous_future_plan.slots if row.action == "charge")
-    assert candidate(previous_future_plan, now=first.start) is None
+    now = first.start + timedelta(minutes=2)
+    result = candidate(previous_future_plan, now=now)
+    assert result is not None
+    current = bp._slots(result)[0]
+    assert current.grid_charge_available_at == now + timedelta(seconds=CONFIG.grid_charge_startup_seconds)
+    assert current.start == now
 
 
 def test_idle_coordinator_offers_previous_future_plan_for_fresh_revalidation(economic_case):
