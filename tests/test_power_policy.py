@@ -321,3 +321,102 @@ def test_live_charge_limit_uses_power_units_not_current(unit, expected):
     coord.power_history = [power] * 3
     adjusted, _ = coord._power_for_optimizer(power, [], {})
     assert adjusted.excess_power == expected
+
+
+# --- Balanced: forecast-aware real-time reserve (issue #73) -----------------
+
+from datetime import datetime
+from unittest.mock import patch
+
+from custom_components.pv_excess_control.models import ForecastData
+from custom_components.pv_excess_control.power_policy import forecast_reserve_needed
+
+
+@pytest.mark.parametrize(
+    "remaining,soc,hours,reserving,expected",
+    [
+        (20.0, 30, 6, False, False),  # sunny morning: forecast covers battery + load
+        (3.0, 30, 3, False, True),  # dull day: forecast cannot reach the target
+        (3.0, 80, 3, False, False),  # target already reached
+        (5.1, 50, 2, False, False),  # margin 1.6 kWh > buffer
+        (5.1, 50, 2, True, True),  # hysteresis: margin 1.6 kWh < 2 x buffer
+        (6.5, 50, 2, True, False),  # margin 3.0 kWh releases the reservation
+        (4.0, 50, -1, False, False),  # past target time: no further household load
+    ],
+)
+def test_forecast_reserve_decision(remaining, soc, hours, reserving, expected):
+    # 10 kWh battery, target 75 %, 500 W base load, 1 kWh buffer
+    assert forecast_reserve_needed(remaining, soc, 75, 10, hours, 500, 1.0, reserving) is expected
+
+
+@pytest.mark.parametrize("remaining,soc,capacity", [(None, 50, 10), (5, None, 10), (5, 50, None), (5, 120, 10), (5, 50, 0)])
+def test_forecast_reserve_missing_input_is_undecided(remaining, soc, capacity):
+    assert forecast_reserve_needed(remaining, soc, 75, capacity, 2, 500, 0.5) is None
+
+
+def balanced_coordinator(remaining_kwh, soc=30, status="available"):
+    coord = coordinator(soc=soc)
+    coord.battery_strategy = "balanced"
+    coord.config_entry.data.update(
+        battery_strategy="balanced", battery_target_soc=75,
+        battery_capacity=7.5, battery_target_time="16:00",
+    )
+    coord._forecast_status = status
+    coord._forecast_data = ForecastData(remaining_today_kwh=remaining_kwh) if remaining_kwh is not None else None
+    return coord
+
+
+def _optimizer_input(coord, hour=12):
+    power = coord._collect_power_state()
+    coord.power_history = [power] * 3
+    now = datetime(2026, 11, 13, hour, 0).astimezone()
+    with patch("custom_components.pv_excess_control.coordinator.dt_util.now", return_value=now):
+        return power, *coord._power_for_optimizer(power, [], {})
+
+
+def test_balanced_reserves_charging_when_forecast_is_insufficient():
+    coord = balanced_coordinator(remaining_kwh=3.0)
+    power, adjusted, history = _optimizer_input(coord)
+    assert power.excess_power == 2966
+    assert adjusted.excess_power == 490  # only real export remains for appliances
+    assert all(p.excess_power == 490 for p in history)
+    assert coord._battery_charge_reserve_w == 2476
+    assert coord._battery_priority_status == "measured_charging"
+
+
+def test_balanced_releases_charging_when_forecast_is_sufficient():
+    coord = balanced_coordinator(remaining_kwh=20.0)
+    power, adjusted, history = _optimizer_input(coord)
+    assert adjusted is power
+    assert history == coord.power_history
+    assert coord._battery_priority_status == "forecast_sufficient"
+
+
+@pytest.mark.parametrize("status,remaining", [("unavailable", None), ("pending", None), ("not_configured", None)])
+def test_balanced_without_forecast_keeps_previous_behavior(status, remaining):
+    coord = balanced_coordinator(remaining_kwh=remaining, status=status)
+    power, adjusted, history = _optimizer_input(coord)
+    assert adjusted is power
+    assert history == coord.power_history
+
+
+def test_balanced_missing_soc_with_forecast_falls_back_to_battery_first_safety():
+    coord = balanced_coordinator(remaining_kwh=20.0)
+    power = replace(coord._collect_power_state(), battery_soc=None)
+    coord.power_history = [power] * 3
+    adjusted, history = coord._power_for_optimizer(power, [], {})
+    assert adjusted.excess_power == 0
+    assert all(p.excess_power == 0 for p in history)
+
+
+def test_balanced_reserve_hysteresis_holds_until_margin_is_clear():
+    # 7.5 kWh, SoC 30 -> 3.375 kWh needed; at 12:00 4 h x 0.5 kW = 2 kWh load.
+    coord = balanced_coordinator(remaining_kwh=5.0)  # margin -0.375 -> reserve
+    _, adjusted, _ = _optimizer_input(coord)
+    assert adjusted.excess_power == 490
+    coord._forecast_data = ForecastData(remaining_today_kwh=6.2)  # margin 0.825 < 2 x 0.5
+    _, adjusted, _ = _optimizer_input(coord)
+    assert adjusted.excess_power == 490
+    coord._forecast_data = ForecastData(remaining_today_kwh=6.5)  # margin 1.125 -> release
+    power, adjusted, _ = _optimizer_input(coord)
+    assert adjusted is power

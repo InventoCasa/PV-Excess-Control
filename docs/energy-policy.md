@@ -35,7 +35,25 @@ Below the configured target SoC, Battery First reserves charging power before or
 
 Example: PV minus household load is 2966 W, the battery charges at 2476 W, and SoC is below target. With measured-charge fallback, 490 W remains for appliances. If total surplus is instead 8000 W and the configured charging maximum is 2500 W, 5500 W remains available even before the battery reaches target.
 
-Unknown required battery readings prevent new positive-surplus allocation, but known negative surplus still reaches deficit shedding. Missing current physical balance prevents allocation from stale history. Explicit override, on-only/daily-runtime constraints and minimum-SoC protection retain their existing precedence. Balanced and Appliance First are not redesigned by this update.
+Unknown required battery readings prevent new positive-surplus allocation, but known negative surplus still reaches deficit shedding. Missing current physical balance prevents allocation from stale history. Explicit override, on-only/daily-runtime constraints and minimum-SoC protection retain their existing precedence. Appliance First is unchanged.
+
+## Balanced with a forecast
+
+With a forecast provider, Balanced applies the same real-time reservation as Battery First, but only when the forecast is not enough for both the battery and the house. Every controller cycle compares:
+
+```
+needed_kwh = (target_soc - soc) / 100 * battery_capacity
+usage_kwh  = hours_until_target_time * 0.5 kW
+reserve    = remaining_today_kwh - needed_kwh - usage_kwh < 0.5 kWh
+```
+
+- `reserve` false: appliances get the full surplus, including power that would otherwise charge the battery (as before). On a sunny morning the battery still reaches its target later in the day.
+- `reserve` true: charging power is protected exactly like Battery First (charge cap, live limit, measured charging). The battery priority status shows the usual source; otherwise it shows `forecast_sufficient`.
+- Once reserving, the margin must exceed 1 kWh (twice the buffer) before the reservation is released, so forecast updates do not toggle appliances.
+- After the target time no further house load is counted; reservation continues while the remaining forecast cannot cover the missing SoC.
+- Without an available forecast (not configured, pending or unavailable) Balanced keeps its previous real-time behavior and does not reserve. A missing SoC with an available forecast uses the Battery First safety handling.
+
+The 0.5 kW house load matches the planner's default base load. The planner's own Balanced split is unchanged.
 
 ## Stable tariff support
 

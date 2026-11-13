@@ -23,7 +23,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from .daily_state import nonnegative_number
-from .power_policy import battery_first_budget
+from .power_policy import battery_first_budget, forecast_reserve_needed
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -129,6 +129,8 @@ from .const import (
     CONF_INVERTER_BATTERY_MAX_CHARGE_POWER_ENTITY,
     CONF_BATTERY_MAX_CHARGE_POWER_W,
     CONF_BATTERY_TRICKLE_CHARGE_POWER_W,
+    BALANCED_RESERVE_BASE_LOAD_W,
+    BALANCED_RESERVE_BUFFER_KWH,
     DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W,
 )
 from .energy import create_tariff_provider
@@ -1354,7 +1356,10 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             CONF_BATTERY_SOC, CONF_BATTERY_POWER, CONF_BATTERY_CHARGE_POWER,
             CONF_BATTERY_DISCHARGE_POWER,
         ))
-        if strategy == BatteryStrategy.BATTERY_FIRST and has_battery:
+        reserve_charging = strategy == BatteryStrategy.BATTERY_FIRST
+        if strategy == BatteryStrategy.BALANCED and has_battery:
+            reserve_charging = self._balanced_forecast_reserve(power)
+        if reserve_charging and has_battery:
             running_w = 0.0
             for config in configs:
                 state = states.get(config.id)
@@ -1405,6 +1410,41 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             replace(p, excess_power=p.excess_power - reserve if p.excess_power is not None else None)
             for p in self.power_history
         ]
+
+    def _balanced_forecast_reserve(self, power: PowerState) -> bool:
+        """Return whether Balanced reserves battery charging right now.
+
+        Without an available forecast, Balanced keeps its previous real-time
+        behavior (no reservation). With a forecast, charging is reserved only
+        when the remaining forecast cannot reach the target SoC by the target
+        time; a missing SoC then falls back to the Battery First handling.
+        """
+        was_active = getattr(self, "_balanced_reserve_active", False)
+        forecast = getattr(self, "_forecast_data", None)
+        if getattr(self, "_forecast_status", None) != "available" or forecast is None:
+            self._balanced_reserve_active = False
+            return False
+        data = self.config_entry.data
+        now = dt_util.now()
+        target_time = _parse_time_string(data.get(CONF_BATTERY_TARGET_TIME, "16:00")) or time(16, 0)
+        target_dt = datetime.combine(now.date(), target_time, tzinfo=now.tzinfo)
+        hours_to_target = max((target_dt - now).total_seconds() / 3600.0, 0.0)
+        capacity = data.get(CONF_BATTERY_CAPACITY)
+        needed = forecast_reserve_needed(
+            forecast.remaining_today_kwh,
+            power.battery_soc,
+            float(data.get(CONF_BATTERY_TARGET_SOC, 80)),
+            float(capacity) if capacity else None,
+            hours_to_target,
+            BALANCED_RESERVE_BASE_LOAD_W,
+            BALANCED_RESERVE_BUFFER_KWH,
+            was_active,
+        )
+        active = True if needed is None else needed
+        self._balanced_reserve_active = active
+        if not active:
+            self._battery_priority_status = "forecast_sufficient"
+        return active
 
     # ------------------------------------------------------------------
     # Appliance configuration
