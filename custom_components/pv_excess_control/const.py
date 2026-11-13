@@ -207,6 +207,10 @@ CONF_BATTERY_MAX_CHARGE_POWER_W = "battery_max_charge_power_w"
 CONF_BATTERY_TRICKLE_CHARGE_POWER_W = "battery_trickle_charge_power_w"
 
 DEFAULT_BATTERY_TRICKLE_CHARGE_POWER_W = 100
+# Balanced real-time battery reserve (issue #73). The base load matches the
+# planner default; the buffer absorbs forecast error.
+BALANCED_RESERVE_BASE_LOAD_W = 500.0
+BALANCED_RESERVE_BUFFER_KWH = 0.5
 
 # Current command controls and timestamp history
 CONF_CURRENT_UPDATE_INTERVAL = "current_update_interval"

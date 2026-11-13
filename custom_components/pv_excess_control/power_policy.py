@@ -51,3 +51,38 @@ def battery_first_budget(
     available_solar = max(excess_w + max(running_load_w, 0.0), 0.0)
     reserved = min(limit, available_solar)
     return BatteryBudget(excess_w - reserved, reserved, source)
+
+
+def forecast_reserve_needed(
+    remaining_today_kwh: float | None,
+    battery_soc: float | None,
+    target_soc: float,
+    capacity_kwh: float | None,
+    hours_to_target: float,
+    base_load_w: float,
+    buffer_kwh: float,
+    currently_reserving: bool = False,
+) -> bool | None:
+    """Decide whether Balanced must protect battery charging in real time.
+
+    Charging is reserved only when the remaining PV forecast cannot cover both
+    the energy the battery still needs to reach ``target_soc`` and the expected
+    household load until the target time, plus a buffer. Once reserving, the
+    margin must exceed twice the buffer before appliances get the charging
+    power back, so forecast noise does not toggle loads.
+
+    Returns ``None`` when a required input is missing or invalid; the caller
+    decides the fallback.
+    """
+    values = (remaining_today_kwh, battery_soc, capacity_kwh)
+    if any(v is None or not math.isfinite(v) for v in values):
+        return None
+    if not 0 <= battery_soc <= 100 or capacity_kwh <= 0:
+        return None
+    needed_kwh = max(target_soc - battery_soc, 0.0) / 100.0 * capacity_kwh
+    if needed_kwh <= 0:
+        return False
+    usage_kwh = max(hours_to_target, 0.0) * max(base_load_w, 0.0) / 1000.0
+    margin_kwh = remaining_today_kwh - needed_kwh - usage_kwh
+    threshold = buffer_kwh * 2 if currently_reserving else buffer_kwh
+    return margin_kwh < threshold
