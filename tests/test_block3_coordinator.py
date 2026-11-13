@@ -78,6 +78,39 @@ async def test_successful_write_exposes_elapsed_time_to_optimizer():
     assert cfg.current_update_interval == 300 and cfg.current_min_change == 1
 
 
+async def test_current_setpoint_is_clamped_to_entity_max():
+    """A configured max above the entity's own max must not exceed it (#67)."""
+    coord = ev_coordinator(current="16")
+    coord.hass.states._states["number.amps"] = MockState("16", {"min": 6, "max": 32})
+    await coord._apply_decisions(result(40))
+    assert coord.hass.services.calls == [
+        ("number", "set_value", {"entity_id": "number.amps", "value": 32})
+    ]
+    # Once the entity reports the clamped value, it is not rewritten.
+    coord.hass.services.calls.clear()
+    coord.hass.states._states["number.amps"] = MockState("32", {"min": 6, "max": 32})
+    await coord._apply_decisions(result(40))
+    assert coord.hass.services.calls == []
+
+
+async def test_current_setpoint_above_32a_allowed_by_entity():
+    coord = ev_coordinator(current="16")
+    coord.hass.states._states["number.amps"] = MockState("16", {"min": 6, "max": 48})
+    await coord._apply_decisions(result(40))
+    assert coord.hass.services.calls == [
+        ("number", "set_value", {"entity_id": "number.amps", "value": 40})
+    ]
+
+
+def test_max_current_field_accepts_above_32a():
+    from custom_components.pv_excess_control.config_flow import _appliance_current_schema
+    from custom_components.pv_excess_control.const import CONF_MAX_CURRENT
+
+    schema = _appliance_current_schema({})
+    data = schema({"dynamic_current": True, "current_entity": "number.amps", CONF_MAX_CURRENT: 40.0})
+    assert data[CONF_MAX_CURRENT] == 40.0
+
+
 @pytest.mark.parametrize(
     "field", ["cheap_price_threshold", "battery_charge_price_threshold"]
 )

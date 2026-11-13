@@ -35,7 +35,7 @@ The [0.4.0rc1 candidate notes](docs/release-candidate.md) explain migration and 
 ### EV & Battery Management
 - **EV SoC-Aware Charging** - Considers EV battery level, connection status, and user-defined targets.
 - **Schedule Deadlines** - Set constraints like "EV must be charged by 7am".
-- **Dynamic Current Control** - Variable amperage for EV chargers and wallboxes (6-32 A).
+- **Dynamic Current Control** - Variable amperage for EV chargers and wallboxes (up to 80 A, limited to the current entity's own maximum).
 - **Battery-Aware Optimization** - Three strategies: Battery First, Appliance First, Balanced.
 - **Minimum Battery SoC Protection** - Shed appliances when battery level drops below a configured threshold.
 - **Battery Discharge Protection** - Limit discharge rate when big consumers are running.

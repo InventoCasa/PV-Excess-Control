@@ -34,7 +34,7 @@ Diese Integration ist Open Source, weil ich daran glaube, der Community, die Hom
 ### E-Auto & Batteriemanagement
 - **SoC-basiertes E-Auto Laden** - Berücksichtigt den Batteriestand des E-Autos und den Verbindungsstatus
 - **Zeitplan-Fristen** - Setzen von Bedingungen wie bspw. "E-Auto muss bis 7 Uhr geladen sein".
-- **Dynamische Stromsteuerung** - Variable Ampere-Regelung für E-Auto-Ladegeräte und Wallboxen (6-32 A).
+- **Dynamische Stromsteuerung** - Variable Ampere-Regelung für E-Auto-Ladegeräte und Wallboxen (bis 80 A, begrenzt auf das Maximum der Strom-Entity).
 - **Batteriebewusste Optimierung** - Drei Strategien: Batterie zuerst, Gerät zuerst, Ausgeglichen.
 - **Minimum-SoC Batterie-Schutz** - Schaltet Geräte ab, wenn der Batteriestand unter einen konfigurierten Schwellenwert fällt.
 - **Batterieentladeschutz** - Begrenzt die Entladerate, wenn große Verbraucher laufen.

@@ -34,7 +34,7 @@ Enable **Dynamic Current** for appliances that accept variable amperage:
 |-------|-------------|
 | **Current Entity** | The `number` entity that controls charging amps |
 | **Min Current** | Minimum amps to use (e.g. 6 A — EVSE minimum) |
-| **Max Current** | Maximum amps to use (e.g. 16 A or 32 A) |
+| **Max Current** | Maximum amps to use (e.g. 16 A, 32 A or 40 A; up to 80 A). Setpoints are also limited to the current entity's own `max` attribute |
 
 The optimizer will adjust current up and down every cycle to precisely consume available excess rather than switching on/off.
 
