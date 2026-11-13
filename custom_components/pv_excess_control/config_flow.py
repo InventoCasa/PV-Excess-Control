@@ -1605,8 +1605,10 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
                 if min_c >= max_c:
                     errors[CONF_MIN_CURRENT] = "invalid_current_range"
 
-            if not dynamic and user_input.get(CONF_CHEAP_GRID_TARGET_CURRENT) is not None:
-                errors[CONF_CHEAP_GRID_TARGET_CURRENT] = "cheap_grid_target_current_requires_dynamic"
+            if not dynamic:
+                # Only meaningful for dynamic current; a pre-filled value must
+                # not block the step (#68). It is dropped from the stored data below.
+                user_input = {k: v for k, v in user_input.items() if k != CONF_CHEAP_GRID_TARGET_CURRENT}
 
             if not errors:
                 self._data.update(user_input)
@@ -1798,8 +1800,10 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
                 if min_c >= max_c:
                     errors[CONF_MIN_CURRENT] = "invalid_current_range"
 
-            if not dynamic and user_input.get(CONF_CHEAP_GRID_TARGET_CURRENT) is not None:
-                errors[CONF_CHEAP_GRID_TARGET_CURRENT] = "cheap_grid_target_current_requires_dynamic"
+            if not dynamic:
+                # Only meaningful for dynamic current; a pre-filled value must
+                # not block the step (#68). It is dropped from the stored data below.
+                user_input = {k: v for k, v in user_input.items() if k != CONF_CHEAP_GRID_TARGET_CURRENT}
 
             if not errors:
                 self._data.update(user_input)

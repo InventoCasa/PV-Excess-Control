@@ -1118,14 +1118,14 @@ class TestCheapGridTargetCurrent:
         assert flow._data[CONF_CHEAP_GRID_TARGET_CURRENT] == 14.0
 
     @pytest.mark.asyncio
-    async def test_cheap_grid_target_current_rejected_for_non_dynamic_appliance(self):
-        """Setting cheap_grid_target_current on a non-dynamic appliance fails validation."""
+    async def test_cheap_grid_target_current_ignored_for_non_dynamic_appliance(self):
+        """A pre-filled cheap-window current must not block a non-dynamic appliance (#68)."""
         from custom_components.pv_excess_control.const import CONF_CHEAP_GRID_TARGET_CURRENT
 
         flow = _make_subentry_flow()
         flow._data = dict(VALID_BASIC_INPUT)
+        flow._data[CONF_CHEAP_GRID_TARGET_CURRENT] = 16.0  # stale value from an earlier dynamic config
 
-        # Submit the current step with dynamic current disabled but cheap_grid_target_current set
         result = await flow.async_step_current(
             user_input={
                 CONF_DYNAMIC_CURRENT: False,
@@ -1133,7 +1133,29 @@ class TestCheapGridTargetCurrent:
             }
         )
 
-        # Should be rejected with a form error
         assert result["type"] == "form"
-        assert result["step_id"] == "current"
-        assert CONF_CHEAP_GRID_TARGET_CURRENT in result["errors"]
+        assert result["step_id"] == "constraints"
+        assert CONF_CHEAP_GRID_TARGET_CURRENT not in flow._data
+
+    @pytest.mark.asyncio
+    async def test_cheap_grid_target_current_ignored_on_reconfigure_non_dynamic(self):
+        """Reconfigure: switching dynamic current off with a pre-filled value proceeds (#68)."""
+        from custom_components.pv_excess_control.const import CONF_CHEAP_GRID_TARGET_CURRENT
+
+        flow = TestReconfigure._make_reconfigure_flow(None, {
+            CONF_APPLIANCE_NAME: "Charger",
+            CONF_APPLIANCE_ENTITY: "switch.charger",
+            CONF_APPLIANCE_PRIORITY: 500,
+            CONF_NOMINAL_POWER: 3680,
+            CONF_PHASES: 1,
+            CONF_DYNAMIC_CURRENT: True,
+            CONF_CHEAP_GRID_TARGET_CURRENT: 16.0,
+        })
+        await flow.async_step_reconfigure(user_input=None)
+        result = await flow.async_step_reconfigure_current(
+            user_input={CONF_DYNAMIC_CURRENT: False, CONF_CHEAP_GRID_TARGET_CURRENT: 16.0}
+        )
+
+        assert result["type"] == "form"
+        assert result["step_id"] == "reconfigure_constraints"
+        assert CONF_CHEAP_GRID_TARGET_CURRENT not in flow._data

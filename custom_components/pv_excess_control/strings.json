@@ -404,7 +404,6 @@
         "invalid_runtime_range": "Minimum daily runtime must be less than or equal to maximum daily runtime.",
         "missing_max_grid_power": "Maximum grid power is required when grid supplementation is enabled.",
         "suggest_big_consumer": "This appliance draws 3000W or more. Consider enabling 'Big Consumer' to prevent battery discharge when active. Submit again to keep current setting.",
-        "cheap_grid_target_current_requires_dynamic": "Cheap-window target current is only available for dynamic-current appliances. Enable dynamic_current or leave this field empty.",
         "circular_dependency": "Circular dependency: the selected appliance already depends on this one.",
         "helper_only_with_requires": "An appliance cannot be both a helper and have its own dependency. Either clear 'Requires Appliance' or uncheck 'Run Only as Helper'.",
         "helper_only_with_gate": "Helper-only appliances cannot have their own enable condition or start delay. Configure these on the dependent appliance.",
