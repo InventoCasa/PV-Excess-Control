@@ -224,6 +224,26 @@ def _entity_state_dict(hass: HomeAssistant, entity_id: str) -> dict | None:
     }
 
 
+def _clamp_to_entity_range(hass: HomeAssistant, entity_id: str, value: float) -> float:
+    """Clamp a setpoint to the target entity's declared min/max, if any.
+
+    Prevents service-call rejections when the configured current range is
+    wider than what the number entity accepts (#67).
+    """
+    state = hass.states.get(entity_id)
+    if state is None:
+        return value
+    for key, bound in (("min", max), ("max", min)):
+        raw = state.attributes.get(key)
+        try:
+            limit = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(limit):
+            value = bound(value, limit)
+    return value
+
+
 def _parse_time_string(value: str | None) -> time | None:
     """Parse a time string like '16:00' into a time object."""
     if value is None:
@@ -1966,7 +1986,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         appliance_config.current_entity
                         and decision.target_current is not None
                     ):
-                        target = decision.target_current
+                        target = _clamp_to_entity_range(
+                            self.hass, appliance_config.current_entity, decision.target_current,
+                        )
                         observed = _parse_sensor_float(self.hass, appliance_config.current_entity)
                         last_target = self._last_applied_current.get(decision.appliance_id)
                         disconnected = _parse_sensor_bool(self.hass, appliance_config.ev_connected_entity) is False

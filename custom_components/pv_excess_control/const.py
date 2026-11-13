@@ -20,7 +20,9 @@ DEFAULT_DYNAMIC_ON_THRESHOLD = 50  # W buffer before starting dynamic current ap
 MIN_PRIORITY = 1
 MAX_PRIORITY = 1000
 MIN_CURRENT = 0.0
-MAX_CURRENT = 32.0
+# Upper bound of the Max Current field. Real limits come from the user's
+# configuration and the current entity's own max attribute (#67).
+MAX_CURRENT = 80.0
 MIN_PHASES = 1
 MAX_PHASES = 3
 
